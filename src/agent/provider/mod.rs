@@ -9,7 +9,7 @@ pub use protocol::*;
 pub use repository::{ModelRepository, RuntimeConfig};
 pub use transport::ModelClient;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum ModelError {
     #[error("Invalid model configuration: {0}")]
     Invalid(&'static str),

@@ -1,7 +1,9 @@
 //! Basic text conversations over the native model stream. No tools or UI permissions yet.
+pub use super::turns::{History, Turn, TurnState};
 use super::{
     provider::{self, ChatMessage, ChatRequest, ModelClient, ModelError, ModelRepository},
-    Payload, Repository, Target, TaskRequest, TaskStatus,
+    turns::Turns,
+    Payload, Repository, Target, TaskStatus,
 };
 use crate::store::Store;
 use serde::{Deserialize, Serialize};
@@ -32,6 +34,12 @@ pub enum Error {
     Stopped,
     #[error("Agent 日志操作失败")]
     Storage,
+    #[error("请求 ID 已被用于不同的内容")]
+    Conflict,
+    #[error("生成期间上下文已改变，旧回复未提交")]
+    ContextChanged,
+    #[error("上次请求已失败或中断；请查看历史，重新发送需使用新请求 ID")]
+    Recorded(String),
 }
 pub type Result<T> = std::result::Result<T, Error>;
 impl From<ModelError> for Error {
@@ -55,13 +63,17 @@ impl From<super::Error> for Error {
     }
 }
 impl Error {
-    pub fn code(&self) -> &'static str {
+    pub fn code(&self) -> &str {
         match self {
             Self::Model(ModelError::Cancelled) => "AGENT_CANCELLED",
             Self::Model(ModelError::Timeout) => "MODEL_TIMEOUT",
             Self::Model(ModelError::Incomplete) => "MODEL_INCOMPLETE",
             Self::Model(ModelError::BudgetExceeded) => "MODEL_CONTEXT_LIMIT",
             Self::Model(ModelError::KeyMissing | ModelError::Credentials) => "MODEL_CREDENTIALS",
+            Self::Model(ModelError::ResponseTooLarge) => "MODEL_RESPONSE_LIMIT",
+            Self::Model(ModelError::Response) => "MODEL_PROTOCOL_FAILED",
+            Self::Model(ModelError::ToolProtocol) => "MODEL_TOOL_PROTOCOL_FAILED",
+            Self::Model(ModelError::Http(_)) => "MODEL_HTTP_ERROR",
             Self::Model(_) => "MODEL_REQUEST_FAILED",
             Self::NotFound => "AGENT_NOT_FOUND",
             Self::Busy => "AGENT_BUSY",
@@ -71,6 +83,9 @@ impl Error {
             Self::HistoryLimit => "AGENT_HISTORY_LIMIT",
             Self::Stopped => "BACKEND_UNAVAILABLE",
             Self::Storage => "AGENT_STORAGE_FAILED",
+            Self::Conflict => "AGENT_REQUEST_CONFLICT",
+            Self::ContextChanged => "AGENT_CONTEXT_CHANGED",
+            Self::Recorded(code) => code,
         }
     }
     pub fn status(&self) -> u16 {
@@ -83,8 +98,16 @@ impl Error {
             Self::Model(ModelError::Cancelled) => 409,
             Self::Model(ModelError::Timeout) => 504,
             Self::HistoryLimit | Self::Model(ModelError::BudgetExceeded) => 413,
+            Self::Model(ModelError::ResponseTooLarge) => 413,
             Self::Model(_) => 502,
             Self::Storage => 500,
+            Self::Conflict | Self::ContextChanged => 409,
+            Self::Recorded(code) => match code.as_str() {
+                "MODEL_TIMEOUT" => 504,
+                "AGENT_INTERRUPTED" | "AGENT_CANCELLED" | "AGENT_CONTEXT_CHANGED" => 409,
+                "MODEL_RESPONSE_LIMIT" | "MODEL_CONTEXT_LIMIT" | "AGENT_HISTORY_LIMIT" => 413,
+                _ => 502,
+            },
         }
     }
 }
@@ -103,6 +126,8 @@ pub struct Attachment {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Request {
+    #[serde(default = "new_request_id")]
+    pub request_id: String,
     pub agent_id: String,
     pub user_id: String,
     pub session_id: String,
@@ -110,6 +135,9 @@ pub struct Request {
     pub message: String,
     #[serde(default)]
     pub attachments: Vec<Attachment>,
+}
+fn new_request_id() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -119,20 +147,50 @@ pub enum StreamEvent {
     Error { content: String, code: String },
 }
 type ActiveKey = (String, String);
+struct Active {
+    request: String,
+    token: CancellationToken,
+    started: Arc<std::sync::atomic::AtomicBool>,
+}
 pub struct Manager {
     store: Arc<Store>,
     stop: CancellationToken,
-    active: Mutex<HashMap<ActiveKey, CancellationToken>>,
+    active: Mutex<HashMap<ActiveKey, Active>>,
 }
-struct Turn<'a> {
+struct Running<'a> {
     manager: &'a Manager,
     key: ActiveKey,
     token: CancellationToken,
+    heartbeat: CancellationToken,
+    request: Request,
+    owner: String,
+    partial: Arc<Mutex<String>>,
+    finished: bool,
 }
-impl Drop for Turn<'_> {
+impl Drop for Running<'_> {
     fn drop(&mut self) {
         self.token.cancel();
+        self.heartbeat.cancel();
         self.manager.active.lock().unwrap().remove(&self.key);
+        if !self.finished {
+            let turns = Turns::new(self.manager.store.clone());
+            let request = self.request.clone();
+            let owner = self.owner.clone();
+            let partial = self.partial.lock().unwrap().clone();
+            // A dropped future is not a successful reply. Crash recovery also has a durable lease fallback.
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn_blocking(move || {
+                    let _ = turns.finish(
+                        &request,
+                        &owner,
+                        TurnState::Interrupted,
+                        &partial,
+                        Some("AGENT_INTERRUPTED"),
+                        None,
+                    );
+                });
+            }
+        }
     }
 }
 async fn worker<T: Send + 'static>(
@@ -141,6 +199,38 @@ async fn worker<T: Send + 'static>(
     tokio::task::spawn_blocking(action)
         .await
         .map_err(|_| Error::Storage)?
+}
+fn validate(request: &Request) -> Result<()> {
+    for id in [
+        &request.agent_id,
+        &request.user_id,
+        &request.session_id,
+        &request.request_id,
+    ] {
+        super::model::identifier(id).map_err(|_| Error::Invalid)?;
+    }
+    if request.request_id.len() > 64 {
+        return Err(Error::Invalid);
+    }
+    Payload::UserMessage {
+        text: request.message.clone(),
+    }
+    .validate()
+    .map_err(|_| Error::Invalid)?;
+    if !request.attachments.is_empty() {
+        return Err(Error::Unsupported);
+    }
+    Ok(())
+}
+fn recorded(turn: &Turn) -> Error {
+    match turn.state {
+        TurnState::Running => Error::Busy,
+        _ => Error::Recorded(
+            turn.error_code
+                .clone()
+                .unwrap_or_else(|| "AGENT_INTERRUPTED".into()),
+        ),
+    }
 }
 impl Manager {
     pub fn new(store: Arc<Store>, stop: CancellationToken) -> Self {
@@ -152,11 +242,14 @@ impl Manager {
     }
     pub fn shutdown(&self) {
         self.stop.cancel();
-        for token in self.active.lock().unwrap().values() {
-            token.cancel();
+        for active in self.active.lock().unwrap().values() {
+            active.token.cancel();
         }
     }
     pub async fn list(&self, user: String) -> Result<Vec<AgentConfig>> {
+        if self.stop.is_cancelled() {
+            return Err(Error::Stopped);
+        }
         let store = self.store.clone();
         worker(move || {
             Ok(ModelRepository::new(store)
@@ -177,34 +270,129 @@ impl Manager {
             return Err(Error::Stopped);
         }
         let store = self.store.clone();
+        let stop = self.stop.clone();
         worker(move || {
-            let profile = ModelRepository::new(store.clone()).get(&agent, &user)?;
-            if !profile.ready {
+            if stop.is_cancelled() {
+                return Err(Error::Stopped);
+            }
+            if !ModelRepository::new(store.clone())
+                .get(&agent, &user)?
+                .ready
+            {
                 return Err(ModelError::KeyMissing.into());
             }
             Ok(Repository::new(store).create_session(&agent, &user)?.id)
         })
         .await
     }
-    /// A true receipt means the currently active turn was signalled, not that provider computation ended.
-    pub async fn stop_chat(&self, agent: String, user: String, session: String) -> Result<bool> {
+    pub async fn receipt(&self, request: Request) -> Result<Option<Turn>> {
+        validate(&request)?;
+        let turns = Turns::new(self.store.clone());
+        worker(move || turns.receipt(&request)).await
+    }
+    pub async fn history(
+        &self,
+        agent: String,
+        user: String,
+        session: String,
+        after: u64,
+        limit: usize,
+    ) -> Result<History> {
+        let turns = Turns::new(self.store.clone());
+        worker(move || turns.history(&agent, &user, &session, after, limit)).await
+    }
+    pub async fn events(
+        &self,
+        agent: String,
+        user: String,
+        session: String,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<super::Event>> {
+        if !(1..=50).contains(&limit) {
+            return Err(Error::Invalid);
+        }
         let store = self.store.clone();
-        let check_session = session.clone();
-        let check_user = user.clone();
         worker(move || {
-            let s = Repository::new(store).session(&check_session, &check_user)?;
-            if s.agent_id != agent {
+            let repo = Repository::new(store);
+            if repo.session(&session, &user)?.agent_id != agent {
+                return Err(Error::NotFound);
+            }
+            Ok(repo.events(&session, &user, after, limit)?)
+        })
+        .await
+    }
+    pub async fn sessions(
+        &self,
+        agent: String,
+        user: String,
+        after: String,
+        limit: usize,
+    ) -> Result<Vec<super::Session>> {
+        if !(1..=20).contains(&limit) {
+            return Err(Error::Invalid);
+        }
+        let store = self.store.clone();
+        worker(move|| {
+            let db=store.database.lock().map_err(|_|Error::Storage)?;
+            let cursor=if after.is_empty(){None} else {
+                Some(db.query_row("SELECT created_at FROM agent_sessions WHERE id=?1 AND user_id=?2 AND agent_id=?3",rusqlite::params![after,user,agent],|r|r.get::<_,i64>(0)).map_err(|_|Error::NotFound)?)
+            };
+            let mut stmt=db.prepare("SELECT id FROM agent_sessions WHERE user_id=?1 AND agent_id=?2 AND (?3 IS NULL OR created_at<?3 OR (created_at=?3 AND id<?4)) ORDER BY created_at DESC,id DESC LIMIT ?5").map_err(|_|Error::Storage)?;
+            let ids=stmt.query_map(rusqlite::params![user,agent,cursor,after,limit],|r|r.get::<_,String>(0)).map_err(|_|Error::Storage)?
+                .collect::<std::result::Result<Vec<_>,_>>().map_err(|_|Error::Storage)?;
+            ids.into_iter().map(|id|super::repository::read_session(&db,&id,&user).map_err(Error::from)).collect()
+        }).await
+    }
+    /// Prefer stop_request: a delayed receipt for an old request must not stop a new turn.
+    pub async fn stop_chat(&self, agent: String, user: String, session: String) -> Result<bool> {
+        self.stop_request(agent, user, session, None).await
+    }
+    pub async fn stop_request(
+        &self,
+        agent: String,
+        user: String,
+        session: String,
+        request: Option<String>,
+    ) -> Result<bool> {
+        let store = self.store.clone();
+        let who = user.clone();
+        let id = session.clone();
+        let expected = agent.clone();
+        worker(move || {
+            if Repository::new(store).session(&id, &who)?.agent_id != expected {
                 return Err(Error::NotFound);
             }
             Ok(())
         })
         .await?;
-        let active = self.active.lock().unwrap();
-        if let Some(token) = active.get(&(user, session)) {
+        // Preparing work has no turn row yet. Cancel its exact token before waiting on SQLite.
+        let preparing = {
+            let active = self.active.lock().unwrap();
+            active
+                .get(&(user.clone(), session.clone()))
+                .filter(|a| {
+                    request.as_ref().is_none_or(|id| a.request == *id)
+                        && !a.started.load(std::sync::atomic::Ordering::Acquire)
+                })
+                .map(|a| a.token.clone())
+        };
+        if let Some(token) = &preparing {
             token.cancel();
+        }
+        let turns = Turns::new(self.store.clone());
+        let who = user.clone();
+        let id = session.clone();
+        let stopped = worker(move || turns.stop(&agent, &who, &id, request.as_deref())).await?;
+        if let Some(id) = stopped {
+            if let Some(active) = self.active.lock().unwrap().get(&(user, session)) {
+                if active.request == id {
+                    active.token.cancel();
+                }
+            }
             Ok(true)
         } else {
-            Ok(false)
+            Ok(preparing.is_some())
         }
     }
     pub async fn chat<F, Fut>(
@@ -224,17 +412,16 @@ impl Manager {
         if cancel.is_cancelled() {
             return Err(ModelError::Cancelled.into());
         }
-        for id in [&request.agent_id, &request.user_id, &request.session_id] {
-            super::model::identifier(id).map_err(|_| Error::Invalid)?;
-        }
-        super::model::text_value(&request.message, 16000).map_err(|_| Error::Invalid)?;
-        Payload::UserMessage {
-            text: request.message.clone(),
-        }
-        .validate()
-        .map_err(|_| Error::Invalid)?;
-        if !request.attachments.is_empty() {
-            return Err(Error::Unsupported);
+        validate(&request)?;
+        // Immutable receipts do not require the old model credentials or a live SSH terminal.
+        if let Some(turn) = self.receipt(request.clone()).await? {
+            if turn.state == TurnState::Completed {
+                return send(StreamEvent::Done {
+                    content: turn.result_text.ok_or(Error::Storage)?,
+                })
+                .await;
+            }
+            return Err(recorded(&turn));
         }
         if request.terminal_session_id
             != target
@@ -247,111 +434,233 @@ impl Manager {
         if let Some(target) = &target {
             target.validate().map_err(|_| Error::Invalid)?;
         }
-        let store = self.store.clone();
-        let r = request.clone();
-        let runtime = worker(move || {
-            let s = Repository::new(store.clone()).session(&r.session_id, &r.user_id)?;
-            if s.agent_id != r.agent_id {
-                return Err(Error::NotFound);
-            }
-            Ok(ModelRepository::new(store).runtime(&r.agent_id, &r.user_id)?)
-        })
-        .await?;
-        let config = runtime.config.clone();
-        let client = ModelClient::new(runtime)?;
         let token = self.stop.child_token();
         let key = (request.user_id.clone(), request.session_id.clone());
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
         {
             let mut active = self.active.lock().unwrap();
             if active.contains_key(&key) || active.len() >= 32 {
                 return Err(Error::Busy);
             }
-            active.insert(key.clone(), token.clone());
+            active.insert(
+                key.clone(),
+                Active {
+                    request: request.request_id.clone(),
+                    token: token.clone(),
+                    started: started.clone(),
+                },
+            );
         }
-        let _turn = Turn {
+        let owner = uuid::Uuid::new_v4().to_string();
+        let partial = Arc::new(Mutex::new(String::new()));
+        let heartbeat = CancellationToken::new();
+        let mut running = Running {
             manager: self,
             key,
             token: token.clone(),
+            heartbeat: heartbeat.clone(),
+            request: request.clone(),
+            owner: owner.clone(),
+            partial: partial.clone(),
+            finished: true,
         };
-        let turn_id = uuid::Uuid::new_v4().to_string();
         let store = self.store.clone();
         let r = request.clone();
-        let id = turn_id.clone();
-        let setup_stop = token.clone();
+        let prepare_stop = token.clone();
         let caller_stop = cancel.clone();
-        let (revision,chat)=worker(move|| {
-            if setup_stop.is_cancelled() || caller_stop.is_cancelled() {return Err(ModelError::Cancelled.into());}
-            let repo=Repository::new(store);
-            let mut s=repo.session(&r.session_id,&r.user_id)?;
-            if s.checkpoint_id.is_some() { return Err(Error::HistoryLimit); }
-            if s.task.as_ref().is_some_and(|t|t.target!=target) { return Err(Error::TargetMismatch); }
-            let events=repo.events(&s.id,&s.user_id,0,200)?;
-            if events.len()>=200 { return Err(Error::HistoryLimit); }
+        let target_for_admission = target.clone();
+        let (runtime,chat,revision)=worker(move|| {
+            if prepare_stop.is_cancelled()||caller_stop.is_cancelled(){return Err(ModelError::Cancelled.into());}
+            let repo=Repository::new(store.clone());let s=repo.session(&r.session_id,&r.user_id)?;
+            if s.agent_id!=r.agent_id{return Err(Error::NotFound);}
+            if s.checkpoint_id.is_some(){return Err(Error::HistoryLimit);}
+            if s.task.as_ref().is_some_and(|t|t.target!=target){return Err(Error::TargetMismatch);}
+            let events=repo.events(&s.id,&s.user_id,0,200)?;if events.len()>=200{return Err(Error::HistoryLimit);}
+            let unfinished= {
+                let db=store.database.lock().map_err(|_|Error::Storage)?;
+                let mut stmt=db.prepare("SELECT user_event_id FROM agent_chat_turns WHERE session_id=?1 AND state!='completed'").map_err(|_|Error::Storage)?;
+                let ids=stmt.query_map([&s.id],|r|r.get::<_,u64>(0)).map_err(|_|Error::Storage)?;
+                ids.collect::<std::result::Result<std::collections::HashSet<_>,_>>().map_err(|_|Error::Storage)?
+            };
             let needs_task=s.task.as_ref().is_none_or(|t|t.status!=TaskStatus::Active);
-            let goal=if needs_task {r.message.clone()} else {s.task.as_ref().unwrap().goal.clone()};
-            let constraints=s.task.as_ref().map(|t|t.constraints.clone()).unwrap_or_default();
-            let task_state=serde_json::json!({"goal":goal,"constraints":constraints,"target":target});
-            let mut messages=vec![ChatMessage::System { content:format!(
-                "你是 ShellPilot 的文本助手。本阶段没有命令执行工具；不要声称执行过命令或读取过服务器。\n可信任务快照（不产生执行授权）：{task_state}") }];
+            let goal=if needs_task{r.message.as_str()}else{s.task.as_ref().unwrap().goal.as_str()};
+            let task_state=serde_json::json!({"goal":goal,"constraints":s.task.as_ref().map(|t|t.constraints.as_slice()).unwrap_or(&[]),"target":target});
+            let mut messages=vec![ChatMessage::System {content:format!("你是 ShellPilot 的文本助手。本阶段没有命令执行工具；不要声称执行过命令或读取过服务器。\n可信任务快照（不产生执行授权）：{task_state}")}];
+            // Only completed exchanges are used as model history. Failed input/partial text remain in raw evidence.
+            let mut pending=Vec::new();
             for e in events {
+                if unfinished.contains(&e.id){continue;}
                 match e.payload {
-                    Payload::UserMessage{text}=>messages.push(ChatMessage::User{content:text}),
-                    Payload::AssistantMessage{text}=>messages.push(ChatMessage::Assistant{content:Some(text),tool_calls:vec![]}),
-                    Payload::ToolCall{..}|Payload::ToolResult{..}=>return Err(Error::Unsupported),_=>{}
+                    Payload::UserMessage{text}=>pending.push(ChatMessage::User{content:text}),
+                    Payload::AssistantMessage{text}=>{messages.append(&mut pending);messages.push(ChatMessage::Assistant{content:Some(text),tool_calls:vec![]});},
+                    Payload::Cancelled{..}=>pending.clear(),
+                    Payload::TaskStarted{..}=>pending.clear(),
+                    Payload::ToolCall{..}|Payload::ToolResult{..}=>return Err(Error::Unsupported),
                 }
             }
             messages.push(ChatMessage::User{content:r.message.clone()});
-            let chat=ChatRequest {messages,tools:vec![]};
-            provider::prepare_request(&config,&chat)?;
-            if needs_task {
-                repo.start_task(&s.id,&s.user_id,s.revision,&format!("{id}:task"),TaskRequest {
-                    goal,constraints,target })?;
-                s=repo.session(&s.id,&s.user_id)?;
-            }
-            repo.append(&s.id,&s.user_id,s.revision,&format!("{id}:user"),Payload::UserMessage{text:r.message})?;
-            Ok((repo.session(&s.id,&s.user_id)?.revision,chat))
+            let runtime=ModelRepository::new(store).runtime(&r.agent_id,&r.user_id)?;
+            let chat=ChatRequest{messages,tools:vec![]};provider::prepare_request(&runtime.config,&chat)?;
+            Ok((runtime,chat,s.revision))
         }).await?;
-        let result = tokio::select! {biased; _=cancel.cancelled()=>Err(ModelError::Cancelled),
-        result=client.stream(&chat,&token,|content| {
-            let future=send(StreamEvent::Text{content});
-            async move {future.await.map_err(|error|match error {Error::Model(error)=>error,_=>ModelError::Cancelled})}
-        })=>result };
-        let store = self.store.clone();
+        let turns = Turns::new(self.store.clone());
         let r = request.clone();
-        let id = turn_id.clone();
-        match result {
-            Ok(completion) => {
-                let text = completion.message.content.ok_or(Error::Invalid)?;
-                let saved = text.clone();
-                worker(move || {
-                    Repository::new(store).append(
-                        &r.session_id,
-                        &r.user_id,
-                        revision,
-                        &format!("{id}:assistant"),
-                        Payload::AssistantMessage { text: saved },
-                    )?;
-                    Ok(())
+        let who = owner.clone();
+        let requested_target = target_for_admission;
+        let admission = worker(move || turns.begin(&r, requested_target, &who, revision)).await?;
+        if !admission.1 {
+            let turn = admission.0;
+            if turn.state == TurnState::Completed {
+                return send(StreamEvent::Done {
+                    content: turn.result_text.ok_or(Error::Storage)?,
                 })
-                .await?;
-                send(StreamEvent::Done { content: text }).await
+                .await;
             }
-            Err(error) => {
-                worker(move || {
-                    Repository::new(store).append(
-                        &r.session_id,
-                        &r.user_id,
-                        revision,
-                        &format!("{id}:cancelled"),
-                        Payload::Cancelled {
-                            reason: "本轮生成未完整完成；不视为成功".into(),
-                        },
-                    )?;
-                    Ok(())
-                })
-                .await?;
-                Err(error.into())
-            }
+            return Err(recorded(&turn));
         }
+        running.finished = false;
+        started.store(true, std::sync::atomic::Ordering::Release);
+        let turns = Turns::new(self.store.clone());
+        let r = request.clone();
+        let who = owner.clone();
+        let lease_stop = heartbeat.clone();
+        let request_stop = token.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {biased;_=lease_stop.cancelled()=>break,_=tokio::time::sleep(std::time::Duration::from_secs(1))=>{}}
+                let turns = turns.clone();
+                let r = r.clone();
+                let who = who.clone();
+                if !matches!(
+                    worker(move || turns.checkpoint_partial(&r, &who, None)).await,
+                    Ok(true)
+                ) {
+                    request_stop.cancel();
+                    break;
+                }
+            }
+        });
+        let client = ModelClient::new(runtime)?;
+        let turns = Turns::new(self.store.clone());
+        let mut persisted = 0usize;
+        let mut last_save = std::time::Instant::now();
+        let result = tokio::select! {biased;_=cancel.cancelled()=>Err(ModelError::Cancelled),
+        result=client.stream(&chat,&token,|content| {
+            let current={let mut text=partial.lock().unwrap();text.push_str(&content);text.clone()};
+            let save=persisted==0||current.len().saturating_sub(persisted)>=1024||last_save.elapsed()>=std::time::Duration::from_millis(250);
+            if save{persisted=current.len();last_save=std::time::Instant::now();}
+            let future=send(StreamEvent::Text{content});let turns=turns.clone();let r=request.clone();let who=owner.clone();
+            async move {
+                if save && !matches!(worker(move||turns.checkpoint_partial(&r,&who,Some(&current))).await,Ok(true)){return Err(ModelError::Cancelled);}
+                future.await.map_err(|e|match e{Error::Model(error)=>error,_=>ModelError::Cancelled})
+            }
+        })=>result};
+        let (state, code, text) = match &result {
+            Ok(c) => (
+                TurnState::Completed,
+                None,
+                c.message.content.clone().ok_or(Error::Invalid)?,
+            ),
+            Err(error) => {
+                let e = Error::from(error.clone());
+                (
+                    if matches!(error, ModelError::Cancelled) {
+                        TurnState::Cancelled
+                    } else {
+                        TurnState::Failed
+                    },
+                    Some(e.code().to_owned()),
+                    partial.lock().unwrap().clone(),
+                )
+            }
+        };
+        // The persistent stop flag and completion commit share a SQLite write transaction.
+        let turns = Turns::new(self.store.clone());
+        let r = request.clone();
+        let who = owner.clone();
+        let external_cancel = cancel.clone();
+        let internal_cancel = token.clone();
+        let completion = result.as_ref().ok().cloned();
+        let turn = worker(move || {
+            let cancelled = external_cancel.is_cancelled() || internal_cancel.is_cancelled();
+            let (state, code) = if cancelled && state == TurnState::Completed {
+                (TurnState::Cancelled, Some("AGENT_CANCELLED".into()))
+            } else {
+                (state, code)
+            };
+            turns.finish(&r, &who, state, &text, code.as_deref(), completion.as_ref())
+        })
+        .await?;
+        running.finished = true;
+        heartbeat.cancel();
+        if turn.state == TurnState::Completed {
+            send(StreamEvent::Done {
+                content: turn.result_text.ok_or(Error::Storage)?,
+            })
+            .await
+        } else if let Err(error) = result {
+            let error: Error = error.into();
+            if turn.error_code.as_deref() == Some(error.code()) {
+                Err(error)
+            } else {
+                Err(recorded(&turn))
+            }
+        } else {
+            Err(recorded(&turn))
+        }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    #[tokio::test]
+    async fn preparing_stop_checks_agent_scope_before_signalling_the_exact_token() {
+        let store = Arc::new(Store::in_memory().unwrap());
+        let session = Repository::new(store.clone())
+            .create_session("right", "default")
+            .unwrap();
+        let manager = Manager::new(store, CancellationToken::new());
+        let token = CancellationToken::new();
+        manager.active.lock().unwrap().insert(
+            ("default".into(), session.id.clone()),
+            Active {
+                request: "preparing".into(),
+                token: token.clone(),
+                started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
+        assert!(matches!(
+            manager
+                .stop_request(
+                    "wrong".into(),
+                    "default".into(),
+                    session.id.clone(),
+                    Some("preparing".into())
+                )
+                .await,
+            Err(Error::NotFound)
+        ));
+        assert!(!token.is_cancelled());
+        assert!(!manager
+            .stop_request(
+                "right".into(),
+                "default".into(),
+                session.id.clone(),
+                Some("old-request".into())
+            )
+            .await
+            .unwrap());
+        assert!(!token.is_cancelled());
+        assert!(manager
+            .stop_request(
+                "right".into(),
+                "default".into(),
+                session.id,
+                Some("preparing".into())
+            )
+            .await
+            .unwrap());
+        assert!(token.is_cancelled());
     }
 }

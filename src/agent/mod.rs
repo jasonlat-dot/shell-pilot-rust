@@ -4,6 +4,7 @@ pub mod chat;
 pub mod model;
 pub mod provider;
 mod repository;
+mod turns;
 pub use model::*;
 pub use repository::Repository;
 

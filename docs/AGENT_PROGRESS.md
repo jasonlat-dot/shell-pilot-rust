@@ -31,7 +31,7 @@
 ### B. 模型配置与基本对话
 - [x] B1 模型适配器与配置：供应商能力、模型窗口、API 地址/密钥安全保存、基础参数校验。OpenAI 兼容 Chat Completions 非流式适配与回环测试完成；前端配置入口待 B4。
 - [x] B2 对接 agent 配置列表、create_session、chat_stream 和 stop_chat；保留现有前端事件协议。基础文本流式对话与本地 IPC/Channel 测试完成，UI 入口仍待 B4。
-- [ ] B3 流式取消/超时/错误、同会话并发隔离、历史与恢复，不将 EOF 当成功。
+- [x] B3 流式取消/超时/错误、同会话并发隔离、历史与恢复，不将 EOF 当成功。持久轮次、请求幂等、停止/完成事务排序及租约恢复已实现并通过回环测试；可见历史面板留给 B4。
 - [ ] B4 前端模型设置和 Rust AI 入口；只有后端功能已验证后才启用。
 - [ ] B5 真实回环模型协议联调，前端解析与停止/恢复回归。
 
@@ -60,9 +60,9 @@
 
 ## 当前进度与下一项
 
-A0–A6、B1、B2 已完成各自基础阶段，保留用户手动勾选的 A6；真实 SSH 执行去重的最终联验仍待 D3。B2 已接通就绪模型列表、持久会话、文本 SSE 到 Tauri Channel 和停止操作。本轮 Rust 43 项、原生 IPC 7 项、前端 27 项通过；TypeScript 和 Rust Clippy 检查通过。
+A0–A6、B1–B3 已完成各自基础阶段，保留用户手动勾选的 A6；真实 SSH 执行去重仍待 D3。B3 已实现 schema 6 持久轮次、请求重放、针对 requestId 的停止、事务化终态、历史分页与租约恢复。当前验证：Rust 56 项、原生 IPC 9 项、前端 32 项和 TypeScript 检查通过；Rust Clippy 检查通过。
 
-下一项 B3：补齐流式错误/超时矩阵、请求/轮次幂等、同会话停止与完成竞态、跨会话并发、历史与重启恢复。B2 已有基础取消/超时、活动会话互斥与 EOF 拒绝，但完整 B3 仍未完成。继续使用本地 IPC/Channel；模型设置和前端 AI 面板仍待 B4，自动压缩待 C，SSH 工具与审批待 D。本轮不打包、不提交。
+下一项 B4：前端模型设置与基础文本 AI 面板入口，使用 B1 的安全配置及 B3 原生历史状态。继续使用本地 IPC/Channel，不重新引入 HTTP 后端；自动压缩待 C，SSH 工具与审批待 D，附件待 E。AI 面板仍保持禁用，本轮不打包、不提交。
 详细验证结果和下一步会在每个完成项后记录。
 
 ## 验证与完成记录
@@ -201,3 +201,18 @@ A0–A6、B1、B2 已完成各自基础阶段，保留用户手动勾选的 A6�
 - 静态检查：cargo clippy --offline --lib --test agent_chat -- -D warnings 通过；修改 Rust 文件 rustfmt/针对性格式检查通过。桌面 cargo clippy --manifest-path src-tauri/Cargo.toml --offline --lib --tests 通过，既有 chat_history 排序及旧 backend_process 测试进程警告保留，无新 Agent 警告。
 - 环境与修正：一次静态检查的自动授权超时，普通沙箱重试因父目录配置访问失败；正常权限重试成功。Clippy 指出测试锁跨 await，已改为明确作用域后通过。没有改用户凭据或连接真实供应商/远端。
 - 文档：AGENT_CHAT.md 记录原生接口、事件、参数、日志和边界；客户端 docs/agent-ipc.md 指向该文档。下一项 B3，保持 B3/B4/B5 未勾选；未做完整 GUI、真实模型、全量测试或安装包。
+
+### B3：2026-10-14 完成
+
+- 用户要求：接通 B3；网络中断后继续同一任务，保留已有修改。未运行被自动授权超时拒绝的首次检查；恢复后重试编译成功。客户端原有 icon.icns 修改保留，未参与本轮操作。
+- 数据：006_agent_turns.sql、src/agent/turns.rs；Store 加载 schema 6，保留旧事件/输出/模型表。请求准入与用户事件同事务；终态、完整回复、usage 与原始事件同事务提交，单会话 running 唯一索引保护跨 Manager 并发。
+- 会话：src/agent/chat.rs 增加 requestId、持久收据、原生历史/会话/事件分页；完成重放不需要原模型配置或密钥，不调用模型。失败/取消/中断重放返回记录，不自动重新生成。新请求可明确继续，同目标和用户约束保持绑定。
+- 停止：requestId 精确匹配，准备阶段先复核用户/Agent 再信号取消；已准入轮次的停止标记与完成提交由 SQLite 排序。停止先到不提交成功，完成先到不反写取消；旧停止请求不影响下一轮。跨 Manager 通过心跳观察取消标记。
+- 恢复：首个/有界增量保存部分文本；future Drop 安排 interrupted 写入，心跳每秒续租、30 秒过期。下一次 receipt/history/admission 回收过期轮次，不抢占新鲜租约、不盲目重试、不接受旧 owner 的迟到成功。上下文新版本不被旧回复覆盖。
+- 流：保留明确 stop+[DONE] 才成功，新增状态化首帧前后超时、HTTP/协议/usage/容量错误。失败部分文本可回查，模型历史只纳入完整轮次；旧 B2 原始记录保留，可通过 events 读取。检查点重建和自动压缩仍待 C。
+- 客户端：Agent API 新增 sessions/history/events；App 为每次生成固定 requestId，停止携带同一 ID。Channel 检查请求关联/序号，去重、缺帧拒绝并屏蔽结束后的回调；原生订阅 Drop 清理自己的状态。AI 面板未开放，B4 再接模型设置和可见原生历史。
+- 测试：cargo test --offline --lib agent::，6/6；cargo test --offline --test agent_chat 最终 15/15；原有 agent_models 18、agent_context 17 通过（schema 断言更新为 6），共 56 项。核心包括停止/完成顺序、幂等重放、错误主机/用户/Agent、跨会话/Manager、租约过期及真实 SQLite 关闭重开、future Drop、错误/超时和成功后的接收失败。
+- 客户端验证：cargo test --manifest-path src-tauri/Cargo.toml --offline --lib backend_ipc::tests -- --test-threads=1，9/9；node --import tsx --test tests/agent-ipc.test.ts tests/ipc-transport.test.ts tests/chat-attachments.test.ts，最终 32/32；TypeScript --noEmit 通过。补充结构化 native done 的 JSON 原文重读回归，避免旧包装解析改变模型文本。
+- 静态检查：Rust clippy --offline --lib --test agent_chat -- -D warnings 通过；桌面 clippy --manifest-path src-tauri/Cargo.toml --offline --lib --tests 通过，仅报告既有聊天排序和旧进程测试警告；修改的 Rust 文件格式检查通过。
+- 边界：租约测试人为设为过期以模拟崩溃时间，再关闭重开数据库；硬崩溃可能丢失尚未持久的少量增量。没有真实模型/GUI/用户远端/打包或全量回归。原有 A6/B1/B2 勾选保留，B3 勾选，下一项 B4。
+- 文档：AGENT_TURNS.md 记录请求身份、终态排序、历史接口、恢复宽限和验证命令；AGENT_CHAT.md / 客户端 agent-ipc.md 更新续接指向。

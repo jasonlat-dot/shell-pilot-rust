@@ -358,7 +358,7 @@ fn event_by_request(db: &Connection, id: &str, request: &str) -> Result<Option<E
     db.query_row("SELECT id,session_id,task_id,request_id,payload,created_at FROM agent_events WHERE session_id=?1 AND request_id=?2",
         params![id,request],read_event_row).optional()?.map(decode_event).transpose()
 }
-fn insert_event(
+pub(super) fn insert_event(
     db: &Connection,
     id: &str,
     task_id: Option<&str>,
@@ -384,7 +384,7 @@ fn ensure_revision(session: &Session, expected: u64) -> Result<()> {
         Ok(())
     }
 }
-fn next_revision(revision: u64) -> Result<u64> {
+pub(super) fn next_revision(revision: u64) -> Result<u64> {
     revision
         .checked_add(1)
         .filter(|value| *value <= i64::MAX as u64)

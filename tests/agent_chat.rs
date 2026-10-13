@@ -24,6 +24,8 @@ struct Mock {
     bodies: Arc<Mutex<Vec<Value>>>,
     stream: Vec<u8>,
     delay: Duration,
+    status: axum::http::StatusCode,
+    content_type: String,
 }
 struct Fixture {
     store: Arc<Store>,
@@ -61,18 +63,35 @@ async fn handler(State(mock): State<Mock>, Json(body): Json<Value>) -> axum::res
         tokio::time::sleep(mock.delay).await;
     });
     axum::response::Response::builder()
-        .header("content-type", "text/event-stream")
+        .status(mock.status)
+        .header("content-type", mock.content_type)
         .body(body)
         .unwrap()
 }
 impl Fixture {
     async fn new(stream: String, delay: Duration) -> Self {
+        Self::response(
+            stream,
+            delay,
+            axum::http::StatusCode::OK,
+            "text/event-stream",
+        )
+        .await
+    }
+    async fn response(
+        stream: String,
+        delay: Duration,
+        status: axum::http::StatusCode,
+        content_type: &str,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}/v1/", listener.local_addr().unwrap());
         let mock = Mock {
             bodies: Arc::new(Mutex::new(vec![])),
             stream: stream.into_bytes(),
             delay,
+            status,
+            content_type: content_type.into(),
         };
         let router = Router::new()
             .route("/v1/chat/completions", post(handler))
@@ -119,6 +138,7 @@ impl Fixture {
     }
     async fn request(&self) -> Request {
         Request {
+            request_id: uuid::Uuid::new_v4().to_string(),
             agent_id: "agent".into(),
             user_id: "default".into(),
             session_id: self
@@ -177,6 +197,7 @@ async fn list_create_stream_and_next_turn_preserve_protocol_and_saved_history() 
         Payload::AssistantMessage { .. }
     ));
     r.message = "继续解释".into();
+    r.request_id = uuid::Uuid::new_v4().to_string();
     f.manager
         .chat(r, None, &CancellationToken::new(), |_| async { Ok(()) })
         .await
@@ -246,6 +267,7 @@ async fn eof_even_after_finish_reason_is_error_and_not_saved_as_success() {
         ));
         let mut retry = r;
         retry.message = "retry explanation".into();
+        retry.request_id = uuid::Uuid::new_v4().to_string();
         assert!(matches!(
             f.manager
                 .chat(retry, None, &CancellationToken::new(), |_| async { Ok(()) })
@@ -406,6 +428,7 @@ async fn wrong_agent_target_and_attachments_are_rejected_before_model_request() 
         connection_id: "host-2".into(),
         terminal_session_id: "pty-1".into(),
     };
+    r.request_id = uuid::Uuid::new_v4().to_string();
     assert!(matches!(
         f.manager
             .chat(r, Some(other), &CancellationToken::new(), |_| async {
@@ -490,4 +513,380 @@ async fn escaping_cannot_overflow_the_persistent_assistant_event_or_channel_fram
         .events(&id)
         .iter()
         .any(|e| matches!(e.payload, Payload::AssistantMessage { .. })));
+}
+
+#[tokio::test]
+async fn completed_request_replay_survives_model_deletion_without_another_network_call() {
+    let f = Fixture::new(stream(), Duration::ZERO).await;
+    let r = f.request().await;
+    f.manager
+        .chat(r.clone(), None, &CancellationToken::new(), |_| async {
+            Ok(())
+        })
+        .await
+        .unwrap();
+    ModelRepository::new(f.store.clone())
+        .delete("agent", "default", 1)
+        .unwrap();
+    let output = Arc::new(Mutex::new(vec![]));
+    f.manager
+        .chat(r.clone(), None, &CancellationToken::new(), |e| {
+            output.lock().unwrap().push(e);
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+    assert_eq!(output.lock().unwrap().len(), 1);
+    assert!(matches!(
+        output.lock().unwrap()[0],
+        StreamEvent::Done { .. }
+    ));
+    assert_eq!(f.mock.bodies.lock().unwrap().len(), 1);
+    let mut conflict = r.clone();
+    conflict.message = "changed input".into();
+    assert!(matches!(
+        f.manager
+            .chat(conflict, None, &CancellationToken::new(), |_| async {
+                Ok(())
+            })
+            .await,
+        Err(Error::Conflict)
+    ));
+    let history = f
+        .manager
+        .history(
+            "agent".into(),
+            "default".into(),
+            r.session_id.clone(),
+            0,
+            20,
+        )
+        .await
+        .unwrap();
+    assert_eq!(history.turns.len(), 1);
+    assert_eq!(
+        history.turns[0].state,
+        shellpilot_server::agent::chat::TurnState::Completed
+    );
+    assert_eq!(
+        f.manager
+            .sessions("agent".into(), "default".into(), String::new(), 20)
+            .await
+            .unwrap()[0]
+            .id,
+        r.session_id
+    );
+}
+#[tokio::test]
+async fn failed_request_replay_does_not_auto_retry_and_retains_partial_evidence() {
+    let f = Fixture::new(chunk(Some("partial🙂"), None), Duration::ZERO).await;
+    let r = f.request().await;
+    assert_eq!(
+        f.manager
+            .chat(r.clone(), None, &CancellationToken::new(), |_| async {
+                Ok(())
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        "MODEL_INCOMPLETE"
+    );
+    assert_eq!(
+        f.manager
+            .chat(r.clone(), None, &CancellationToken::new(), |_| async {
+                Ok(())
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        "MODEL_INCOMPLETE"
+    );
+    assert_eq!(f.mock.bodies.lock().unwrap().len(), 1);
+    let history = f
+        .manager
+        .history(
+            "agent".into(),
+            "default".into(),
+            r.session_id.clone(),
+            0,
+            20,
+        )
+        .await
+        .unwrap();
+    assert_eq!(history.turns[0].partial_text, "partial🙂");
+    assert!(history.turns[0].result_text.is_none());
+    assert_eq!(
+        history.turns[0].state,
+        shellpilot_server::agent::chat::TurnState::Failed
+    );
+}
+#[tokio::test]
+async fn independent_sessions_and_managers_do_not_share_cancellation_or_reexecute_active_requests()
+{
+    let f = Fixture::new(chunk(Some("partial"), None), Duration::from_secs(30)).await;
+    let a = f.request().await;
+    let b = f.request().await;
+    let a_id = a.session_id.clone();
+    let b_id = b.session_id.clone();
+    let second = Arc::new(Manager::new(f.store.clone(), CancellationToken::new()));
+    let (sender, mut events) = tokio::sync::mpsc::channel(4);
+    let manager = f.manager.clone();
+    let running_a = a.clone();
+    let one = sender.clone();
+    let task_a = tokio::spawn(async move {
+        manager
+            .chat(running_a, None, &CancellationToken::new(), |e| {
+                let sender = one.clone();
+                async move { sender.send(e).await.map_err(|_| Error::Stopped) }
+            })
+            .await
+    });
+    let manager = second.clone();
+    let running_b = b.clone();
+    let task_b = tokio::spawn(async move {
+        manager
+            .chat(running_b, None, &CancellationToken::new(), |e| {
+                let sender = sender.clone();
+                async move { sender.send(e).await.map_err(|_| Error::Stopped) }
+            })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut duplicate = a.clone();
+    duplicate.request_id = uuid::Uuid::new_v4().to_string();
+    assert!(matches!(
+        second
+            .chat(duplicate, None, &CancellationToken::new(), |_| async {
+                Ok(())
+            })
+            .await,
+        Err(Error::Busy)
+    ));
+    // Persisted cancellation can reach a turn owned by another Manager via its heartbeat.
+    assert!(second
+        .stop_request(
+            "agent".into(),
+            "default".into(),
+            a_id.clone(),
+            Some(a.request_id)
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), task_a)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err()
+            .code(),
+        "AGENT_CANCELLED"
+    );
+    assert!(!task_b.is_finished());
+    assert_eq!(
+        second
+            .history("agent".into(), "default".into(), b_id.clone(), 0, 20)
+            .await
+            .unwrap()
+            .turns[0]
+            .state,
+        shellpilot_server::agent::chat::TurnState::Running
+    );
+    second
+        .stop_request("agent".into(), "default".into(), b_id, Some(b.request_id))
+        .await
+        .unwrap();
+    task_b.await.unwrap().unwrap_err();
+    assert_eq!(f.mock.bodies.lock().unwrap().len(), 2);
+}
+#[tokio::test]
+async fn aborting_a_future_recovers_partial_as_interrupted_instead_of_completing_or_replaying() {
+    let f = Fixture::new(chunk(Some("partial"), None), Duration::from_secs(30)).await;
+    let r = f.request().await;
+    let manager = f.manager.clone();
+    let request = r.clone();
+    let (sender, mut output) = tokio::sync::mpsc::channel(1);
+    let run = tokio::spawn(async move {
+        manager
+            .chat(request, None, &CancellationToken::new(), |e| {
+                let sender = sender.clone();
+                async move { sender.send(e).await.map_err(|_| Error::Stopped) }
+            })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), output.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    run.abort();
+    let _ = run.await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let history = f
+                .manager
+                .history(
+                    "agent".into(),
+                    "default".into(),
+                    r.session_id.clone(),
+                    0,
+                    20,
+                )
+                .await
+                .unwrap();
+            if history.turns[0].state == shellpilot_server::agent::chat::TurnState::Interrupted {
+                assert_eq!(history.turns[0].partial_text, "partial");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        f.manager
+            .chat(r, None, &CancellationToken::new(), |_| async { Ok(()) })
+            .await
+            .unwrap_err()
+            .code(),
+        "AGENT_INTERRUPTED"
+    );
+    assert_eq!(f.mock.bodies.lock().unwrap().len(), 1);
+}
+#[tokio::test]
+async fn before_and_after_first_delta_timeouts_keep_failed_turns_and_do_not_retry() {
+    for data in [String::new(), chunk(Some("partial"), None)] {
+        let f = Fixture::new(data, Duration::from_secs(30)).await;
+        let repo = ModelRepository::new(f.store.clone());
+        let mut profile = repo.get("agent", "default").unwrap();
+        profile.config.timeout_seconds = 1;
+        repo.save(
+            "agent",
+            "default",
+            1,
+            ModelConfigUpdate {
+                config: profile.config,
+                api_key: KeyChange::Keep,
+            },
+        )
+        .unwrap();
+        let r = f.request().await;
+        assert_eq!(
+            f.manager
+                .chat(r.clone(), None, &CancellationToken::new(), |_| async {
+                    Ok(())
+                })
+                .await
+                .unwrap_err()
+                .code(),
+            "MODEL_TIMEOUT"
+        );
+        assert_eq!(
+            f.manager.receipt(r.clone()).await.unwrap().unwrap().state,
+            shellpilot_server::agent::chat::TurnState::Failed
+        );
+        assert_eq!(
+            f.manager
+                .chat(r, None, &CancellationToken::new(), |_| async { Ok(()) })
+                .await
+                .unwrap_err()
+                .code(),
+            "MODEL_TIMEOUT"
+        );
+        assert_eq!(f.mock.bodies.lock().unwrap().len(), 1);
+    }
+}
+#[tokio::test]
+async fn protocol_http_content_type_and_usage_errors_are_redacted_and_never_persisted_as_completed()
+{
+    let invalid_usage = format!(
+        "{}{}data: {}\n\ndata: [DONE]\n\n",
+        chunk(Some("x"), None),
+        chunk(None, Some("stop")),
+        json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":1}})
+    );
+    for (data, status, kind) in [
+        (
+            "secret-echo".to_owned(),
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "text/event-stream",
+        ),
+        (stream(), axum::http::StatusCode::OK, "application/json"),
+        (
+            "data: {broken\n\n".into(),
+            axum::http::StatusCode::OK,
+            "text/event-stream",
+        ),
+        (
+            "data: [DONE]\n\n".into(),
+            axum::http::StatusCode::OK,
+            "text/event-stream",
+        ),
+        (
+            invalid_usage,
+            axum::http::StatusCode::OK,
+            "text/event-stream",
+        ),
+    ] {
+        let f = Fixture::response(data, Duration::ZERO, status, kind).await;
+        let r = f.request().await;
+        let error = f
+            .manager
+            .chat(r.clone(), None, &CancellationToken::new(), |_| async {
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().contains("secret-echo"));
+        assert_eq!(
+            f.manager.receipt(r).await.unwrap().unwrap().state,
+            shellpilot_server::agent::chat::TurnState::Failed
+        );
+    }
+}
+#[tokio::test]
+async fn delivery_failure_after_complete_commit_does_not_retroactively_cancel_the_reply() {
+    let f = Fixture::new(stream(), Duration::ZERO).await;
+    let r = f.request().await;
+    let error = f
+        .manager
+        .chat(
+            r.clone(),
+            None,
+            &CancellationToken::new(),
+            |event| async move {
+                if matches!(event, StreamEvent::Done { .. }) {
+                    Err(Error::Stopped)
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "BACKEND_UNAVAILABLE");
+    assert!(!f
+        .manager
+        .stop_request(
+            "agent".into(),
+            "default".into(),
+            r.session_id.clone(),
+            Some(r.request_id.clone())
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        f.manager.receipt(r.clone()).await.unwrap().unwrap().state,
+        shellpilot_server::agent::chat::TurnState::Completed
+    );
+    f.manager
+        .chat(r, None, &CancellationToken::new(), |_| async { Ok(()) })
+        .await
+        .unwrap();
+    assert_eq!(f.mock.bodies.lock().unwrap().len(), 1);
 }

@@ -131,11 +131,12 @@ impl ModelClient {
                     }
                     let chunk: Chunk =
                         serde_json::from_str(&frame).map_err(|_| ModelError::Response)?;
+                    let supplied_usage = chunk.usage.is_some();
                     if let Some(value) = chunk.usage {
                         usage = Some(value);
                     }
                     if chunk.choices.is_empty() {
-                        if !finished || usage.is_none() {
+                        if !finished || !supplied_usage {
                             return Err(ModelError::Response);
                         }
                         continue;

@@ -2,7 +2,7 @@
 
 本阶段完成模型配置、安全保存 API Key、请求预算与 OpenAI 兼容 Chat Completions 协议适配。它是桌面应用内部的 Rust 库，不启动后端监听端口。这里的 API 地址是模型服务地址。
 
-当前没有前端模型设置页面，也没有开放 Rust AI 面板入口。B2 已接通基础文本对话 IPC/Channel，见 [AGENT_CHAT.md](AGENT_CHAT.md)；B3 继续补齐流式恢复，B4 再接设置页面。不要用本文件的配置示例判断当前客户端已能聊天。
+当前没有前端模型设置页面，也没有开放 Rust AI 面板入口。B2 已接通基础文本对话 IPC/Channel，见 [AGENT_CHAT.md](AGENT_CHAT.md)；B3 已接通持久轮次与恢复，见 [AGENT_TURNS.md](AGENT_TURNS.md)，B4 再接设置页面。不要用本文件的配置示例判断当前客户端已能聊天。
 
 ## 文件与入口
 
@@ -95,7 +95,7 @@ Windows 复用现有 DPAPI，加密范围绑定当前 Windows 账户以及用户
 
 成功返回一个 assistant choice，接收 `stop` 或 `tool_calls` 结束原因。`length`、`content_filter` 等不被当成完整成功；空 choices、损坏 JSON、未声明工具、错误调用参数或矛盾 usage 返回错误。原始 provider 错误正文不透传，只返回状态码，避免它回显密钥或提示词。网络错误也不附带 URL 或第三方诊断正文。
 
-客户端关闭重定向和自动重试；取消后不继续读取响应。取消/超时只代表本地请求停止，不保证供应商已经中止计费或计算。B2 已实现基础 SSE、结束标记与会话互斥，B3 继续补齐并发/轮次恢复；`complete` 仍是非流式接口，不能把它当作 `chat_stream`。
+客户端关闭重定向和自动重试；取消后不继续读取响应。取消/超时只代表本地请求停止，不保证供应商已经中止计费或计算。B2/B3 已实现 SSE、结束标记、会话互斥及持久轮次恢复；`complete` 仍是非流式接口，不能把它当作 `chat_stream`。
 
 ## 运行简单测试
 
