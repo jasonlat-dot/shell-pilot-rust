@@ -26,10 +26,10 @@
 - [x] A3 请求预算器：模型窗口、输出/系统/工具/媒体/安全预留、UTF-8 估算、完整工具组选择和硬上限。
 - [x] A4 检查点持久化：结构化目标/约束/证据/待办，版本快照与比较提交，压缩中用户变更/取消不能被覆盖。
 - [x] A5 工具完整输出存储与按范围回查；只将有界结果投入模型窗口。
-- [x] A6 内核测试：多会话、错误主机、任务继续、重复副作用、超限、过期检查点、重启与保留原始证据。内核组合回归已通过；真实 SSH 执行副作用去重的最终联验依赖 D3，暂不勾选整项。
+- [x] A6 内核测试：多会话、错误主机、任务继续、重复副作用、超限、过期检查点、重启与保留原始证据。内核组合回归已通过，用户已手动确认勾选；真实 SSH 执行副作用去重的最终联验仍归 D3。
 
 ### B. 模型配置与基本对话
-- [ ] B1 模型适配器与配置：供应商能力、模型窗口、API 地址/密钥安全保存、基础参数校验。
+- [x] B1 模型适配器与配置：供应商能力、模型窗口、API 地址/密钥安全保存、基础参数校验。OpenAI 兼容 Chat Completions 非流式适配与回环测试完成；前端配置入口待 B4。
 - [ ] B2 对接 agent 配置列表、create_session、chat_stream 和 stop_chat；保留现有前端事件协议。
 - [ ] B3 流式取消/超时/错误、同会话并发隔离、历史与恢复，不将 EOF 当成功。
 - [ ] B4 前端模型设置和 Rust AI 入口；只有后端功能已验证后才启用。
@@ -60,9 +60,9 @@
 
 ## 当前进度与下一项
 
-A0–A5 已完成。A6 内核组合验证已补齐，并新增应用可信任务/SSH 目标绑定的工具调用准入与历史绑定恢复接口；本轮 40 项 Agent 测试和前端 TypeScript 检查通过。A6 的真实 SSH 执行去重不能用模拟计数器代替，最终联验仍待 D3，因此整项保持未勾选。
+A0–A6 已完成内核阶段，保留用户手动勾选的 A6；真实 SSH 执行去重的最终联验仍待 D3。B1 已完成模型配置/能力/窗口校验、Windows DPAPI 密钥保存、原生请求和响应适配。本轮模型 18 项＋原 Agent 40 项，共 58 项通过；桌面原生集成另有 5 项通过，Clippy 无警告。
 
-下一项可继续 B1 模型适配与配置；A6 的 D3 联验依赖不阻塞模型配置和基本对话开发。B2/B3 必须使用本地 IPC/Channel，不重新引入 HTTP 后端或独立进程。模型适配、AI 对话、真实语义压缩和前端 AI 入口尚未接通。
+下一项 B2：对接 agent 配置列表、create_session、chat_stream 和 stop_chat，保留现有前端事件协议。B2/B3 必须使用本地 IPC/Channel，不重新引入 HTTP 后端或独立进程。B1 模型请求已可通过库接口调用，但 AI 对话循环、流式会话、真实语义压缩和前端 AI 入口尚未接通。模型配置界面仍待 B4；本轮不打包、不提交。
 详细验证结果和下一步会在每个完成项后记录。
 
 ## 验证与完成记录
@@ -170,4 +170,18 @@ A0–A5 已完成。A6 内核组合验证已补齐，并新增应用可信任务
 - 前端：在客户端目录执行 node node_modules/typescript/bin/tsc --noEmit，退出码 0。未修改前端业务或开放 AI 功能。
 - 格式化：rustfmt --edition 2021 --config skip_children=true src/agent/mod.rs src/agent/model.rs src/agent/repository.rs tests/agent_kernel.rs 成功。
 - 环境与修正：首次沙箱运行的两项临时数据库重开测试因 Windows 路径权限失败，正常用户权限重跑通过。新组合测试中的跨会话输出拒绝断言修正为既有 NotFound 语义，未改变输出存储的错误约定。
-- 边界：重复执行计数是模拟派发，未执行真实 SSH 命令，不能宣称 D3 已完成。未跑全量 Rust/Tauri 测试、完整 GUI、真实模型或打包。A6 整项暂不勾选，下一步 B1；D3 接通后回补真实执行器联验。
+- 边界：重复执行计数是模拟派发，未执行真实 SSH 命令，不能宣称 D3 已完成。未跑全量 Rust/Tauri 测试、完整 GUI、真实模型或打包。随后用户已手动确认 A6 内核阶段勾选；D3 接通后回补真实执行器联验。
+
+### B1：2026-10-13 完成
+
+- 用户要求：继续 B1，做简单测试，完成后像 A1–A5 一样回填勾选；保留用户手动勾选的 A6。仍不打包、不提交、不使用真实密钥/模型或用户 SSH 服务器。
+- 代码：src/agent/provider/{config,repository,protocol,transport,mod}.rs；migrations/005_agent_models.sql；Store 初始化加载 schema 5；tests/agent_models.rs。客户端 src-tauri/Cargo.lock 仅同步内嵌库新增的 reqwest 依赖。
+- 配置：供应商协议、显式能力、模型 ID/上下文窗口、输出与安全预留、参数支持、URL/代理前缀、超时与响应大小校验。按用户隔离、每用户最多 32 项、乐观版本保存/删除。不根据模型名称推断能力和窗口。
+- 密钥：Windows DPAPI 加密，绑定 Windows 账户与用户/模型配置 ID；公开数据只有是否配置/就绪标志。keep/set/clear 分开，携带旧密钥更改 API 基础 URL 必须明确替换或清除；运行配置不序列化，Debug/错误不泄露密钥。非 Windows 不降级为明文存储。
+- 协议：OpenAI 兼容 Chat Completions 文本与 function 工具的非流式请求；完整历史工具组与 A3 预算校验；超限拒绝，返回压缩提示和响应 usage。关闭重定向与自动重试、响应逐块限额、整体超时与取消；HTTP 错误正文不透传，截断/过滤/无效响应不判完整成功。没有工具执行或模型授权。
+- 测试命令（Rust 项目目录）：cargo test --offline --test agent_models --test agent_context --test agent_kernel --test agent_outputs。首轮 17+17+6+17 共 57/57 通过；补充无 Content-Length 分块限额/读取超时并调整 IPv6 回环代理判断后，cargo test --offline --test agent_models 最终 18/18 通过；既有 40 项无后续业务改动。
+- 静态检查：cargo clippy --offline --lib --test agent_models -- -D warnings 通过；对新增/修改模块和测试执行 rustfmt，并做针对性格式检查。
+- 桌面兼容（客户端目录）：cargo test --manifest-path src-tauri/Cargo.toml --offline --lib rust_preview_tests -- --test-threads=1，5/5 通过。验证同进程库和既有本地 SFTP 桥，不连接用户服务器；未运行其余 9 项。
+- 环境：首次离线编译缺少新增依赖 want，联网下载依赖后测试均离线执行；测试在正常 Windows 用户权限下运行，避免已有沙箱临时路径 canonicalize 权限问题。测试服务仅回环监听，产品库不新增监听端口。
+- 说明：AGENT_MODELS.md 记录配置字段、密钥动作、调用入口、协议边界与测试命令。模型能力与窗口尚未通过真实供应商探测；token 估算仍为启发式，usage 持续校准/媒体预算留给后续阶段。
+- 续接：B1 已勾选，下一项 B2；B3 流式取消/结束与恢复、B4 模型设置和 AI 入口继续保持待办。未做真实模型/完整 GUI/全量 Rust 回归或安装包。较早的 A6 未勾选文字为当时记录，以顶部清单及当前进度为准。

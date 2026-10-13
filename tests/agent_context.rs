@@ -405,7 +405,7 @@ fn restart_restores_checkpoint_raw_events_and_uncertain_actions() {
         schema
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        4
+        5
     );
 }
 #[test]
