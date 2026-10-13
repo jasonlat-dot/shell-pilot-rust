@@ -11,6 +11,8 @@ pub enum Error {
     NotFound,
     #[error("Agent context changed; take a new snapshot")]
     Stale,
+    #[error("Tool call does not match its bound task and SSH target")]
+    TargetMismatch,
     #[error("Agent operation conflicts with an existing event")]
     Conflict,
     #[error("Invalid Agent context: {0}")]

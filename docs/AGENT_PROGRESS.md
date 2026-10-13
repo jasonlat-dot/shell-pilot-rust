@@ -11,8 +11,8 @@
 - Java 参考：E:/project/AIShellTerminal/ai-ssh-terminal-server，保留原实现
 - Codex 参考：E:/project/ai-ssh/artifacts/codex-reference，提交 f82e36592278a0a782fb0d0fc97e5fa10e832ac2
 - 安装包：E:/project/ShellPilot/releases，最新 0.4.0；页签切换修复在源码，尚未打进安装包。
-- PowerShell；Git 位于 C:/Program Files/Git/cmd/git.exe，Cargo 位于 C:/Users/kingdee/.cargo/bin/cargo.exe。
-- Node 24：C:/Users/kingdee/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node.exe。
+- PowerShell；Git 位于 C:/Program Files/Git/cmd/git.exe，当前 Cargo 位于 C:/Users/Administrator/.cargo/bin/cargo.exe。
+- 当前 Node 位于 D:/softs/nodejs/node.exe。旧电脑的运行时路径只作为历史记录。
 - 保留各仓库已有未提交变更；不连接用户远端、不执行实际变更命令来做测试。
 - SSH 任务绑定目标，切换 UI 页签不能改变在途任务目标。权限来自可信应用状态，模型摘要不产生权限。
 - 当前主要验证是临时目录/回环协议测试；真实模型、完整 GUI 和用户远端验证单独记录。
@@ -26,7 +26,7 @@
 - [x] A3 请求预算器：模型窗口、输出/系统/工具/媒体/安全预留、UTF-8 估算、完整工具组选择和硬上限。
 - [x] A4 检查点持久化：结构化目标/约束/证据/待办，版本快照与比较提交，压缩中用户变更/取消不能被覆盖。
 - [x] A5 工具完整输出存储与按范围回查；只将有界结果投入模型窗口。
-- [ ] A6 内核测试：多会话、错误主机、任务继续、重复副作用、超限、过期检查点、重启与保留原始证据。
+- [ ] A6 内核测试：多会话、错误主机、任务继续、重复副作用、超限、过期检查点、重启与保留原始证据。内核组合回归已通过；真实 SSH 执行副作用去重的最终联验依赖 D3，暂不勾选整项。
 
 ### B. 模型配置与基本对话
 - [ ] B1 模型适配器与配置：供应商能力、模型窗口、API 地址/密钥安全保存、基础参数校验。
@@ -60,7 +60,9 @@
 
 ## 当前进度与下一项
 
-A1–A4 内核已实现；17 项专门测试、后端全量 77 项测试、Clippy 与 fmt 通过；桌面桥到真实 Rust 服务的 3 项联调也已通过。A5 完整工具输出存储与范围回查已完成；下一项 A6 为内核综合验证，再进入 B1 模型适配与配置。模型适配、AI 对话、真实语义压缩和前端 AI 入口尚未接通。
+A0–A5 已完成。A6 内核组合验证已补齐，并新增应用可信任务/SSH 目标绑定的工具调用准入与历史绑定恢复接口；本轮 40 项 Agent 测试和前端 TypeScript 检查通过。A6 的真实 SSH 执行去重不能用模拟计数器代替，最终联验仍待 D3，因此整项保持未勾选。
+
+下一项可继续 B1 模型适配与配置；A6 的 D3 联验依赖不阻塞模型配置和基本对话开发。B2/B3 必须使用本地 IPC/Channel，不重新引入 HTTP 后端或独立进程。模型适配、AI 对话、真实语义压缩和前端 AI 入口尚未接通。
 详细验证结果和下一步会在每个完成项后记录。
 
 ## 验证与完成记录
@@ -155,3 +157,17 @@ A1–A4 内核已实现；17 项专门测试、后端全量 77 项测试、Clipp
 ### 2026-10-13：移除旧独立 HTTP 启动入口
 
 用户要求应用作为整体，无独立后端部署。删除 src/main.rs，移除 Cargo [[bin]] 并设置 autobins=false；本项目只作为 shellpilot_server 业务库供 Tauri 引用。cargo build --lib/cargo test 可独立编译或测试库，无需运行前端。库内历史 HTTP 协议测试适配保留，但不提供独立可执行程序。README 和客户端说明已更新；按要求未编译/测试/启动/打包/提交。
+
+### A6 内核组合验证与任务绑定补强：2026-10-13
+
+用户最新要求：回到 Agent 主线，本轮做简单测试。此前“只改代码、不运行测试”的限制不再适用于本轮；仍不打包、不提交、不连接用户服务器或真实模型。
+
+- 代码：src/agent/model.rs 新增 ToolBinding，绑定由应用可信快照构造，不从模型参数推导执行权限。src/agent/repository.rs 新增 append_tool_call 与 tool_call_binding。
+- 准入：在同一 SQLite 事务内核对当前活动 taskId/connectionId/terminalSessionId。模型参数中出现路由字段时也必须匹配绑定；错误任务、主机或终端均原子拒绝，不追加事件或改变版本。
+- 恢复：通过原始 TaskStarted 事件读取旧调用目标，不使用当前 UI 页签或新任务目标。重放请求返回 inserted=false 的原始回执，目标绑定不匹配则拒绝。该回执和历史绑定均不是执行授权；D2/D3 还需检查实时 SSH 状态与可信用户授权。
+- tests/agent_kernel.rs 新增 6 个组合场景：错误任务/主机/终端与模型路由参数、并发重复请求和重启回执、切换目标后的迟到完整输出与检查点恢复、取消/新约束/过期检查点、跨会话与用户输出隔离、小模型窗口完整工具组与必需输入超限。
+- 验证命令：cargo test --manifest-path E:/project/AIShellTerminal/ai-ssh-terminal-server-rust/Cargo.toml --offline --test agent_kernel --test agent_context --test agent_outputs。结果：6+17+17，共 40/40 通过。
+- 前端：在客户端目录执行 node node_modules/typescript/bin/tsc --noEmit，退出码 0。未修改前端业务或开放 AI 功能。
+- 格式化：rustfmt --edition 2021 --config skip_children=true src/agent/mod.rs src/agent/model.rs src/agent/repository.rs tests/agent_kernel.rs 成功。
+- 环境与修正：首次沙箱运行的两项临时数据库重开测试因 Windows 路径权限失败，正常用户权限重跑通过。新组合测试中的跨会话输出拒绝断言修正为既有 NotFound 语义，未改变输出存储的错误约定。
+- 边界：重复执行计数是模拟派发，未执行真实 SSH 命令，不能宣称 D3 已完成。未跑全量 Rust/Tauri 测试、完整 GUI、真实模型或打包。A6 整项暂不勾选，下一步 B1；D3 接通后回补真实执行器联验。

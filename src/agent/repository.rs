@@ -110,15 +110,76 @@ impl Repository {
         request_id: &str,
         payload: Payload,
     ) -> Result<AppendReceipt> {
+        self.append_inner(id, user_id, expected_revision, request_id, payload, None)
+    }
+    /// Atomic bound-call admission. A replay is a receipt, never an execution permit.
+    /// The executor must additionally verify live SSH identity and trusted authorization.
+    pub fn append_tool_call(
+        &self,
+        id: &str,
+        user_id: &str,
+        expected_revision: u64,
+        request_id: &str,
+        binding: &ToolBinding,
+        payload: Payload,
+    ) -> Result<AppendReceipt> {
+        binding.validate_call(&payload)?;
+        self.append_inner(
+            id,
+            user_id,
+            expected_revision,
+            request_id,
+            payload,
+            Some(binding),
+        )
+    }
+    /// Recover the immutable original target, not the currently selected task or UI tab.
+    /// This is historical identity, not proof that a stopped task may execute again.
+    pub fn tool_call_binding(&self, id: &str, user_id: &str, call_id: &str) -> Result<ToolBinding> {
+        model::identifier(call_id)?;
+        self.db(|db| {
+            let tx = db.transaction()?;
+            read_session(&tx, id, user_id)?;
+            let task_id: String = tx.query_row(
+                "SELECT task_id FROM agent_events WHERE session_id=?1 AND call_id=?2 AND kind='tool_call'",
+                params![id, call_id], |row| row.get(0),
+            ).optional()?.ok_or(Error::NotFound)?;
+            let binding = recorded_binding(&tx, id, &task_id)?;
+            tx.commit()?;
+            Ok(binding)
+        })
+    }
+    fn append_inner(
+        &self,
+        id: &str,
+        user_id: &str,
+        expected_revision: u64,
+        request_id: &str,
+        payload: Payload,
+        binding: Option<&ToolBinding>,
+    ) -> Result<AppendReceipt> {
         model::identifier(request_id)?;
         payload.validate()?;
         self.db(|db| {
             let tx = db.transaction()?;
             let session = read_session(&tx, id, user_id)?;
             if let Some(event) = event_by_request(&tx, id, request_id)? {
+                if let Some(binding) = binding {
+                    let task_id = event.task_id.as_deref().ok_or(Error::TargetMismatch)?;
+                    if recorded_binding(&tx, id, task_id)? != *binding {
+                        return Err(Error::TargetMismatch);
+                    }
+                }
                 return if event.payload == payload { Ok(AppendReceipt { event, inserted: false }) } else { Err(Error::Conflict) };
             }
             ensure_revision(&session, expected_revision)?;
+            if let Some(binding) = binding {
+                let task = session.task.as_ref().ok_or(Error::TargetMismatch)?;
+                if task.status != TaskStatus::Active || task.id != binding.task_id
+                    || task.target.as_ref() != Some(&binding.target) {
+                    return Err(Error::TargetMismatch);
+                }
+            }
             let mut task_id = session.task.as_ref().map(|task| task.id.clone());
             match &payload {
                 Payload::ToolCall { call_id, .. } => {
@@ -218,6 +279,22 @@ impl Repository {
             tx.commit()?; Ok(result)
         })
     }
+}
+fn recorded_binding(db: &Connection, session_id: &str, task_id: &str) -> Result<ToolBinding> {
+    let payload: String = db.query_row(
+        "SELECT payload FROM agent_events WHERE session_id=?1 AND task_id=?2 AND kind='task_started'",
+        params![session_id, task_id], |row| row.get(0),
+    ).optional()?.ok_or(Error::TargetMismatch)?;
+    let Payload::TaskStarted { task } = serde_json::from_str(&payload)? else {
+        return Err(Error::ToolProtocol);
+    };
+    if task.id != task_id {
+        return Err(Error::TargetMismatch);
+    }
+    Ok(ToolBinding {
+        task_id: task.id,
+        target: task.target.ok_or(Error::TargetMismatch)?,
+    })
 }
 pub(super) fn read_session(db: &Connection, id: &str, user_id: &str) -> Result<Session> {
     let row: Option<(String,u64,Option<String>,Option<String>)> = db.query_row(

@@ -5,8 +5,8 @@ Rust 新项目与两个原项目并列，未替换 Java 源码。
 
 ## 架构
 
-React/xterm -> 现有 HTTP API -> Axum/Tokio -> Rust 应用服务 -> SQLite / russh / 后续模型 HTTP。
-保持 HTTP 协议兼容；Rust Preview 已将服务库接入 Tauri 主进程，后续继续补齐功能。
+React/xterm -> Tauri invoke/Channel -> 同进程 Rust 业务库 -> SQLite / russh / 后续模型 HTTP。
+桌面运行不提供本地 HTTP 监听、远程后端配置或独立 server 二进制。库内历史 HTTP 适配仅作为回归参考，不是当前部署或前端调用方式。
 
 ## 状态
 
@@ -52,4 +52,6 @@ MySQL 尚不自动读取；一次性迁移需处理 Java 凭据加密格式、�
 
 客户端 test-rust-ui 的 src-tauri/src/embedded_backend.rs 已适配 bundled_backend_* 命令和内嵌库生命周期，前端已使用 Rust 服务设置页和动态地址。原 Java 启动器源码保留作参考，试用版编译不使用它。
 
-当前试用版依赖兄弟目录的 shellpilot_server crate，绑定 127.0.0.1:0 并调用 serve，安装资源仅包含说明与后端许可证。试用版已移除 JRE/JAR/MySQL 运行依赖，正式替代全部 Java 功能仍需完成阶段 5。
+当前源码依赖兄弟目录的 shellpilot_server crate，由 Tauri 直接初始化 Services::native，无 HTTP 监听端口；安装资源仅包含说明与后端许可证。src/main.rs 与独立二进制声明已移除。旧试用安装包的动态端口验证属于历史记录，当前源码尚未重新打包。正式替代全部 Java 功能仍需完成阶段 5。
+
+2026-10-13：A6 内核组合测试与任务目标绑定接口已补强，40 项针对 Agent 的测试和前端 TypeScript 检查通过。真实 SSH 执行去重的联验仍依赖 D3；下一步为 B1 模型适配与配置，保持 AI 入口关闭。

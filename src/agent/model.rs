@@ -223,3 +223,51 @@ pub struct TaskRequest {
     pub constraints: Vec<String>,
     pub target: Option<Target>,
 }
+
+/// Authored by the application from a trusted task snapshot, never by model arguments.
+/// This identifies the target; it does not grant permission to execute a command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolBinding {
+    pub task_id: String,
+    pub target: Target,
+}
+impl ToolBinding {
+    pub fn from_snapshot(snapshot: &Snapshot) -> Result<Self> {
+        let task = snapshot
+            .session
+            .task
+            .as_ref()
+            .ok_or(Error::TargetMismatch)?;
+        if task.status != TaskStatus::Active {
+            return Err(Error::TargetMismatch);
+        }
+        Ok(Self {
+            task_id: task.id.clone(),
+            target: task.target.clone().ok_or(Error::TargetMismatch)?,
+        })
+    }
+    pub(crate) fn validate_call(&self, payload: &Payload) -> Result<()> {
+        identifier(&self.task_id)?;
+        self.target.validate()?;
+        let Payload::ToolCall { arguments, .. } = payload else {
+            return Err(Error::ToolProtocol);
+        };
+        // Routing fields, if present, must agree with the application-owned binding.
+        for (name, expected) in [
+            ("taskId", self.task_id.as_str()),
+            ("connectionId", self.target.connection_id.as_str()),
+            (
+                "terminalSessionId",
+                self.target.terminal_session_id.as_str(),
+            ),
+        ] {
+            if arguments
+                .get(name)
+                .is_some_and(|value| value.as_str() != Some(expected))
+            {
+                return Err(Error::TargetMismatch);
+            }
+        }
+        Ok(())
+    }
+}
