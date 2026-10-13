@@ -1,6 +1,6 @@
 # Rust SSH Agent 实施清单与续接入口
 
-更新日期：2026-10-14。状态：阶段 5 实施中，基础文本对话 IPC 已接通，前端 AI 面板尚未启用。
+更新日期：2026-10-14。状态：阶段 5 实施中，模型设置、基础文本 AI 面板和原生历史已启用。
 用户要求：参考 Codex CLI 优化上下文和工具决策；先列清单，每完成一项更新标记，供换窗口后续接。当前不打包。需要修改前端的阶段同步修改 test-rust-ui。
 源码参考与设计依据：[CODEX_AGENT_REFERENCE.md](CODEX_AGENT_REFERENCE.md)。本文件是进度唯一入口，完成标记必须有代码与验证证据，不以“已设计”替代“已实现”。
 
@@ -32,7 +32,7 @@
 - [x] B1 模型适配器与配置：供应商能力、模型窗口、API 地址/密钥安全保存、基础参数校验。OpenAI 兼容 Chat Completions 非流式适配与回环测试完成；前端配置入口待 B4。
 - [x] B2 对接 agent 配置列表、create_session、chat_stream 和 stop_chat；保留现有前端事件协议。基础文本流式对话与本地 IPC/Channel 测试完成，UI 入口仍待 B4。
 - [x] B3 流式取消/超时/错误、同会话并发隔离、历史与恢复，不将 EOF 当成功。持久轮次、请求幂等、停止/完成事务排序及租约恢复已实现并通过回环测试；可见历史面板留给 B4。
-- [ ] B4 前端模型设置和 Rust AI 入口；只有后端功能已验证后才启用。
+- [x] B4 前端模型设置和 Rust AI 入口；已在 B1–B3 后端测试基础上启用文本对话、模型切换及原生历史，配置桥和前端回归通过。
 - [ ] B5 真实回环模型协议联调，前端解析与停止/恢复回归。
 
 ### C. 检查点压缩
@@ -60,10 +60,21 @@
 
 ## 当前进度与下一项
 
-A0–A6、B1–B3 已完成各自基础阶段，保留用户手动勾选的 A6；真实 SSH 执行去重仍待 D3。B3 已实现 schema 6 持久轮次、请求重放、针对 requestId 的停止、事务化终态、历史分页与租约恢复。当前验证：Rust 56 项、原生 IPC 9 项、前端 32 项和 TypeScript 检查通过；Rust Clippy 检查通过。
+A0–A6、B1–B4 已完成各自基础阶段，保留用户手动勾选的 A6；真实 SSH 执行去重仍待 D3。B4 已启用模型设置、基础文本对话和 B3 原生历史。最新验证：原生 IPC 11 项、前端 37 项、TypeScript 和生产构建通过，Clippy 无新增告警；B3 的 Rust 56 项证据保留，本轮未重复完整后端测试。
 
-下一项 B4：前端模型设置与基础文本 AI 面板入口，使用 B1 的安全配置及 B3 原生历史状态。继续使用本地 IPC/Channel，不重新引入 HTTP 后端；自动压缩待 C，SSH 工具与审批待 D，附件待 E。AI 面板仍保持禁用，本轮不打包、不提交。
+下一项 B5：模型协议联调与前端停止/恢复回归，补足实际桌面交互验证。继续使用本地 IPC/Channel，不重新引入 HTTP 后端；自动压缩待 C，SSH 工具与审批待 D，附件待 E。本轮不打包、不提交。
 详细验证结果和下一步会在每个完成项后记录。
+
+### B4：2026-10-14 完成
+
+- 前端：`ModelSettings.tsx`、`api/models.ts` 提供模型配置创建/编辑/删除、Key 保留/替换/清除、窗口/输出/超时和可选参数；保存立即生效，无需 `.env`。`RustBackendSettingsDialog.tsx` 增加模型分类，`App.tsx` 启用基础文本 AI 面板、配置选择及文本引用。
+- 原生：`backend_ipc.rs` 新增按用户和配置 revision 隔离的模型 CRUD；复用 B1 ModelRepository，DPAPI/数据库放在 spawn_blocking；错误码和状态明确，模型密钥不回传。产品无 HTTP 监听端口。
+- 历史：使用 B3 数据库会话/轮次，支持会话及消息分页，拒绝不前进、超长或版本改变的分页；完整、失败、取消、中断、仍生成分别显示。活动历史自动刷新且可按 requestId 停止；继续旧会话使用原目标，终端页签切换不能修改目标。
+- 边界：面板明确为文本对话，聊天附件入口禁用，纯文本粘贴不转上传附件；不开放工具执行、审批或自动压缩。生成期间限制模型修改和切换；删除配置不删除历史。
+- 验证：客户端 `node --import tsx --test tests/agent-history.test.ts tests/agent-ipc.test.ts tests/ipc-transport.test.ts tests/chat-attachments.test.ts`，37/37；`cargo test --manifest-path src-tauri/Cargo.toml --offline --lib backend_ipc::tests -- --test-threads=1`，11/11；TypeScript 与 Vite 生产构建通过。Clippy 无新增告警，保留既有 sort_by_key/zombie_processes 告警；Rust 修改文件格式化通过。
+- 环境：普通沙箱 Tauri 宏编译因 Windows 路径访问失败，改在正常 Windows 权限下离线验证后通过。未使用真实模型 Key、未连接用户服务器、未做完整 GUI 验收或安装包。
+- 文档：[客户端模型设置教程](../../ai-ssh-terminal-client/docs/agent-model-settings.md)，同步 AGENT_MODELS.md 与客户端 agent-ipc.md。
+- 下一项 B5。较早记录里的“B4 待办 / AI 面板禁用”属于当时阶段，以顶部清单和本段为准。保留 A6 手动勾选，不提交 Git。
 
 ## 验证与完成记录
 

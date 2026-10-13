@@ -2,7 +2,7 @@
 
 本阶段完成模型配置、安全保存 API Key、请求预算与 OpenAI 兼容 Chat Completions 协议适配。它是桌面应用内部的 Rust 库，不启动后端监听端口。这里的 API 地址是模型服务地址。
 
-当前没有前端模型设置页面，也没有开放 Rust AI 面板入口。B2 已接通基础文本对话 IPC/Channel，见 [AGENT_CHAT.md](AGENT_CHAT.md)；B3 已接通持久轮次与恢复，见 [AGENT_TURNS.md](AGENT_TURNS.md)，B4 再接设置页面。不要用本文件的配置示例判断当前客户端已能聊天。
+B4 已接通前端“设置 → 模型设置”和基础文本 AI 面板，使用本适配器的加密配置；使用说明见 [模型设置教程](../../ai-ssh-terminal-client/docs/agent-model-settings.md)。B2 基础文本 IPC/Channel 见 [AGENT_CHAT.md](AGENT_CHAT.md)，B3 持久轮次与恢复见 [AGENT_TURNS.md](AGENT_TURNS.md)。当前不提供工具执行、聊天附件或自动压缩。
 
 ## 文件与入口
 
