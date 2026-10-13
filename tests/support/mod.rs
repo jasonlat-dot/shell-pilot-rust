@@ -26,6 +26,7 @@ pub struct Stats {
     pub channels: AtomicUsize,
     pub shells: AtomicUsize,
     pub sizes: Mutex<Vec<(u32, u32)>>,
+    pub rejected_channels: AtomicUsize,
 }
 #[derive(Clone, Default)]
 pub struct Spec {
@@ -33,6 +34,7 @@ pub struct Spec {
     pub open_delay: Duration,
     pub reject_pty: bool,
     pub reject_shell: bool,
+    pub max_sessions: Option<usize>,
 }
 struct TestServer {
     stats: Arc<Stats>,
@@ -98,6 +100,17 @@ impl server::Handler for TestHandler {
         reply: server::ChannelOpenHandle,
         _: &mut Session,
     ) -> Result<(), Self::Error> {
+        if self
+            .spec
+            .max_sessions
+            .is_some_and(|limit| self.channels.len() >= limit)
+        {
+            self.stats.rejected_channels.fetch_add(1, Ordering::SeqCst);
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        }
         self.channels.insert(channel.id());
         self.stats.channels.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(self.spec.open_delay).await;

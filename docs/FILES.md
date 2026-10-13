@@ -42,8 +42,10 @@ SQLite schema 版本 2 自动创建 file_assets 表，保留现有连接配置�
 
 ## 配置
 
-桌面“客户端设置”的 Rust 服务页支持启用附件、限额 20..102400 MiB、保留 0..3650 天、链接 1..10080 分钟。保存后需重启内置服务，旧链接和当前 SSH/SFTP 会话随之失效。
-rust-backend.json 使用 fileStorageEnabled、maxStorageMiB、fileRetentionDays、downloadLinkMinutes；旧版配置缺字段时兼容默认值。
+桌面“客户端设置”的本地工作区支持启用附件、限额 20..102400 MiB、保留 0..3650 天。保存后需重新初始化工作区，当前 SSH/SFTP 会话随之断开。
+rust-backend.json 使用 fileStorageEnabled、maxStorageMiB、fileRetentionDays；旧版配置缺字段时兼容默认值，旧 serverPort/downloadLinkMinutes 忽略。
+
+桌面附件不需要 HTTP 监听端口，通过 Manager::new_native 生成实例绑定的 IPC 引用，下载按钮使用文件 ID 和原实例身份打开原生保存对话框。没有 HTTP 签名或下载链接有效期。重新初始化后仍保留存储数据，重新读取元数据/列表获得新实例引用。上方签名链接和下载响应头的说明适用于独立 HTTP server。
 
 独立 server 环境变量：
 

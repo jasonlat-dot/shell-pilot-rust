@@ -127,6 +127,7 @@ impl ConnectionRequest {
 }
 
 // Only the SSH adapter uses this type; never serialize it as an HTTP response.
+#[derive(Clone)]
 pub struct Credentials {
     pub password: Option<String>,
     pub private_key: Option<String>,

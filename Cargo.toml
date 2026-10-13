@@ -4,13 +4,10 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "ShellPilot embedded Rust backend"
+autobins = false
 
 [lib]
 name = "shellpilot_server"
-
-[[bin]]
-name = "shellpilot-server"
-path = "src/main.rs"
 
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }

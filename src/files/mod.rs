@@ -161,6 +161,7 @@ pub struct Manager {
     lease: Mutex<Option<std::fs::File>>,
     key: [u8; 32],
     base_url: String,
+    native: bool,
     valid: bool,
     uploads: Arc<Semaphore>,
     downloads: Arc<Semaphore>,
@@ -170,7 +171,14 @@ pub struct Manager {
     stop: CancellationToken,
 }
 impl Manager {
+    /// Instance-scoped references are consumed only by trusted desktop IPC.
+    pub fn new_native(store: Arc<Store>, settings: Settings, instance: uuid::Uuid) -> Arc<Self> {
+        Self::create(store, settings, format!("ipc://builtin/{instance}"), true)
+    }
     pub fn new(store: Arc<Store>, settings: Settings, base_url: String) -> Arc<Self> {
+        Self::create(store, settings, base_url, false)
+    }
+    fn create(store: Arc<Store>, settings: Settings, base_url: String, native: bool) -> Arc<Self> {
         let mut key = [0u8; 32];
         let url_valid = url::Url::parse(&base_url).is_ok_and(|url| {
             url.scheme() == "http"
@@ -185,7 +193,7 @@ impl Manager {
                         .is_ok_and(|ip| ip.is_loopback())
                 })
         });
-        let valid = settings.validate().is_ok() && getrandom::fill(&mut key).is_ok() && url_valid;
+        let valid = settings.validate().is_ok() && getrandom::fill(&mut key).is_ok() && (native || url_valid);
         let manager = Arc::new(Self {
             root_path: store.data_directory.as_ref().map(|p| p.join("attachments")),
             store,
@@ -194,6 +202,7 @@ impl Manager {
             settings,
             key,
             base_url: base_url.trim_end_matches('/').into(),
+            native,
             valid,
             root: OnceCell::new(),
             lease: Mutex::new(None),
@@ -210,7 +219,7 @@ impl Manager {
                 .cleanup_interval
                 .max(Duration::from_millis(10));
             tokio::spawn(async move {
-                // Delay startup recovery until the HTTP host has been assembled.
+                // Delay startup recovery until application services have been assembled.
                 tokio::select! {_=token.cancelled()=>return,_=tokio::time::sleep(Duration::from_millis(100))=>{}}
                 loop {
                     let Some(manager) = weak.upgrade() else { break };
@@ -318,24 +327,104 @@ impl Manager {
         mut multipart: Multipart,
         permit: OwnedSemaphorePermit,
     ) -> Result<UploadedFile> {
+        let (metadata_tx, metadata_rx) = tokio::sync::oneshot::channel();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Result<Bytes>>(2);
+        tokio::spawn(async move {
+            let mut metadata_tx = Some(metadata_tx);
+            let produce = async {
+                let mut field = multipart
+                    .next_field()
+                    .await?
+                    .ok_or_else(|| Error::invalid("缺少 file 字段"))?;
+                if field.name() != Some("file") {
+                    return Err(Error::invalid("请求只能包含一个 file 字段"));
+                }
+                let name = field
+                    .file_name()
+                    .ok_or_else(|| Error::invalid("缺少文件名"))?
+                    .to_owned();
+                let content_type = model::content_type(field.content_type());
+                metadata_tx
+                    .take()
+                    .unwrap()
+                    .send(Ok((name, content_type)))
+                    .map_err(|_| Error::cancelled())?;
+                while let Some(chunk) = field.chunk().await? {
+                    sender
+                        .send(Ok(chunk))
+                        .await
+                        .map_err(|_| Error::cancelled())?;
+                }
+                drop(field);
+                if multipart.next_field().await?.is_some() {
+                    return Err(Error::invalid(
+                        "请求只能包含一个 file 字段，不接受 userId 或额外文件",
+                    ));
+                }
+                Ok::<(), Error>(())
+            };
+            tokio::select! {biased; _=sender.closed()=>{}, result=produce=>{
+                if let Err(error)=result {
+                    if let Some(metadata_tx)=metadata_tx.take() {let _=metadata_tx.send(Err(error.clone()));}
+                    let _=sender.send(Err(error)).await;
+                }
+            }}
+        });
+        let metadata = self
+            .wait(async {
+                metadata_rx
+                    .await
+                    .map_err(|_| Error::invalid("附件请求不完整或 file 字段无效"))?
+            })
+            .await?;
+        let stream =
+            async_stream::stream! {while let Some(chunk)=receiver.recv().await {yield chunk;}};
+        self.upload_stream(metadata.0, metadata.1, stream, permit)
+            .await
+    }
+    /// Native desktop input: stream from a file handle, preserving the same limits and commit guards.
+    pub async fn upload_reader<R>(
+        self: Arc<Self>,
+        name: String,
+        content_type: String,
+        reader: R,
+    ) -> Result<UploadedFile>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
+        self.enabled()?;
+        let permit = self
+            .uploads
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::busy())?;
+        let stream = futures_util::StreamExt::map(
+            tokio_util::io::ReaderStream::with_capacity(reader, 65536),
+            |chunk| chunk.map_err(|_| Error::unavailable()),
+        );
+        tokio::spawn(async move { self.upload_stream(name, content_type, stream, permit).await })
+            .await
+            .map_err(|_| Error::failed())?
+    }
+    async fn upload_stream<S>(
+        self: Arc<Self>,
+        name: String,
+        content_type: String,
+        stream: S,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<UploadedFile>
+    where
+        S: futures_util::Stream<Item = Result<Bytes>> + Send,
+    {
+        use futures_util::StreamExt;
         let root = self.root().await?.clone();
-        let mut field = self
-            .wait(async { Ok(multipart.next_field().await?) })
-            .await?
-            .ok_or_else(|| Error::invalid("缺少 file 字段"))?;
-        if field.name() != Some("file") {
-            return Err(Error::invalid("请求只能包含一个 file 字段"));
-        }
-        let (name, extension) = model::file_name(
-            field
-                .file_name()
-                .ok_or_else(|| Error::invalid("缺少文件名"))?,
-        )?;
+        let (name, extension) = model::file_name(&name)?;
+        futures_util::pin_mut!(stream);
         let id = uuid::Uuid::new_v4().to_string();
         let asset = model::Asset {
             id: id.clone(),
             file_name: name,
-            content_type: model::content_type(field.content_type()),
+            content_type: model::content_type(Some(&content_type)),
             object_key: format!("{id}.{extension}"),
             size: self.settings.max_file_bytes,
             sha256: String::new(),
@@ -362,7 +451,7 @@ impl Manager {
         );
         let mut hash = Sha256::new();
         let mut size = 0u64;
-        while let Some(chunk) = self.wait(async { Ok(field.chunk().await?) }).await? {
+        while let Some(chunk) = self.wait(async { stream.next().await.transpose() }).await? {
             size = size
                 .checked_add(chunk.len() as u64)
                 .filter(|n| *n <= self.settings.max_file_bytes)
@@ -378,16 +467,6 @@ impl Manager {
                     .map_err(|_| Error::unavailable())?;
                 Digest::update(&mut hash, bytes);
             }
-        }
-        drop(field);
-        if self
-            .wait(async { Ok(multipart.next_field().await?) })
-            .await?
-            .is_some()
-        {
-            return Err(Error::invalid(
-                "请求只能包含一个 file 字段，不接受 userId 或额外文件",
-            ));
         }
         if size == 0 {
             return Err(Error::invalid("不能上传空文件"));
@@ -432,6 +511,19 @@ impl Manager {
             .checked_add(self.settings.download_ttl.as_secs() as i64)
             .ok_or_else(Error::config)?;
         let expires = chrono::DateTime::from_timestamp(seconds, 0).ok_or_else(Error::config)?;
+        if self.native {
+            return Ok(UploadedFile {
+                file_id: asset.id.clone(),
+                file_name: asset.file_name.clone(),
+                content_type: asset.content_type.clone(),
+                size: asset.size,
+                sha256: asset.sha256.clone(),
+                status: asset.status.clone(),
+                download_url: format!("{}/files/{}", self.base_url, asset.id),
+                // Retained for wire compatibility; native handles don't use signed-link expiry.
+                url_expires_at: expires,
+            });
+        }
         let signature = self.signature(&asset.object_key, &asset.file_name, expires.timestamp())?;
         let query = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("storageId", model::STORAGE_ID)

@@ -1,39 +1,38 @@
-# ShellPilot Rust Server
+# ShellPilot Rust 业务库
+
+内置 IPC 交互说明见兄弟客户端 [docs/ipc-transport.md](../ai-ssh-terminal-client/docs/ipc-transport.md)。桌面业务仅使用 invoke/Channel，应用不提供远程后端配置；本项目仅提供 Rust 库，没有独立 HTTP 程序入口。
 
 Agent 重构当前进度与新窗口续接：见 [docs/AGENT_PROGRESS.md](docs/AGENT_PROGRESS.md)。
 
 Java 服务端的分阶段 Rust 重构，目标是随 Tauri 桌面客户端打包，移除 JRE 和独立 MySQL 服务依赖。当前已实现连接配置管理、原生 SSH 终端、SFTP 文件管理/传输及本地文件/附件存储。AI Agent 尚未迁移。客户端 test-rust-ui 分支现已将本库直接嵌入 Tauri，并生成独立的 Rust Preview 0.4.0 Windows 安装包。
 
-## 开发与运行
+## 开发与使用
 
 Windows 需要 Rust stable MSVC 和 Visual Studio C++ Build Tools / Windows SDK。
 
+本项目作为 `shellpilot_server` 库使用，`src/main.rs` 和 Cargo 的独立二进制声明已移除，`autobins = false`。不再使用 `cargo run` 启动 HTTP 服务，也不再生成新的 `shellpilot-server.exe`。
+
+可在本项目目录单独编译或测试业务库，无需启动前端：
+
 ~~~powershell
+cargo build --lib
 cargo test
 cargo clippy --all-targets -- -D warnings
-cargo run
 ~~~
 
-从兄弟目录 ai-ssh-terminal-client 的 test-rust-ui 分支也可运行：
+这些是供开发者执行的命令，本轮按用户要求未实际执行。
+
+运行桌面应用，在兄弟客户端目录执行：
 
 ~~~powershell
-npm run dev:rust-server
-npm run build:rust-server
+npm run tauri dev
 ~~~
 
-默认监听 http://127.0.0.1:8889，避免与 Java 8888 端口冲突。客户端中新增自定义后端地址 http://127.0.0.1:8889，可使用 SSH 连接管理和终端。根路径 / 不是网页；健康检查在 /api/health。
+客户端 `src-tauri/Cargo.toml` 通过路径依赖引用本库。Tauri 初始化 `Services::native`，前端通过 invoke/Channel 进入 Tauri Rust 桥，再直接调用本库函数。桌面业务不监听本地 HTTP 端口，不提供远程后端配置。
 
-数据保存在 %LOCALAPPDATA%\ShellPilot\rust-server\shellpilot.sqlite3。覆盖配置：
+数据目录由桌面设置管理，默认 SQLite 与附件位于 `%LOCALAPPDATA%\com.jasonlat.shellpilot.rust-preview\backend-data`。数据与原 Java 版相互独立，尚无 MySQL 数据导入工具。
 
-~~~powershell
-$env:SHELLPILOT_PORT = '8890'
-$env:SHELLPILOT_DATA_DIR = 'E:\project\ShellPilot\rust-data'
-cargo run
-~~~
-
-两个后端数据相互独立，尚无 MySQL 数据导入工具。
-
-## 已迁移接口
+## 历史 HTTP 协议回归参考（非程序启动入口）
 
 | 方法 | 路径 | 功能 |
 |---|---|---|
@@ -51,15 +50,15 @@ cargo run
 | POST | /api/v1/ssh/terminal/resize | sessionId/cols/rows |
 | POST | /api/v1/ssh/terminal/close?sessionId=... | 关闭独立 shell 通道，幂等 |
 
-沿用客户端 camelCase 字段和 {code, info, data} 响应，成功码 SUCCESS_0000。错误同时使用 HTTP 4xx/5xx；现有客户端支持这些错误响应。查询和响应不返回 password/privateKey。
+下表对应库内保留的历史协议测试适配，不是当前桌面调用链或可启动的服务。桌面调用使用 IPC 和直接函数调用；数据字段沿用 camelCase，查询和响应不返回 password/privateKey。
 
-参数错误 S0002，连接不存在 S0001，会话不存在或已关闭 S0003。SSH 错误分别为 SSH_CONNECT_CANCELLED、SSH_CONNECT_TIMEOUT、SSH_AUTH_FAILED、SSH_HOST_KEY_REJECTED、SSH_TRANSPORT_FAILED、SSH_BUSY。
+参数错误 S0002，连接不存在 S0001，会话不存在或已关闭 S0003。SSH 错误分别为 SSH_CONNECT_CANCELLED、SSH_CONNECT_TIMEOUT、SSH_AUTH_FAILED、SSH_HOST_KEY_REJECTED、SSH_TRANSPORT_FAILED、SSH_CHANNEL_OPEN_REJECTED、SSH_BUSY。
 
 ## SSH 行为
 
 - 使用 russh 进行原生 SSH，不调用系统 ssh.exe，也不启动 JVM。
 - 密码或 OpenSSH/PEM 私钥认证；密钥算法支持 Ed25519、ECDSA nistp256/384/521 和 RSA-SHA2。禁用 RSA/SHA-1 主机签名降级。
-- 一个 connectionId 复用一条已认证传输，每个 sessionId 是独立 PTY/shell 通道。关闭或取消单个窗口不会正常关闭其他窗口。
+- 一个 connectionId 使用有界的已认证传输池，默认每条传输最多 8 个窗口、每个配置最多 32 条缓存传输；每个 sessionId 是独立 PTY/shell 通道。服务器拒绝已有传输上的新通道时，记录观察到的容量并在新传输上最多重试一次，发生在 PTY/shell/startupCommand 之前。关闭或取消单个窗口不会正常关闭其他窗口。
 - PTY 类型 xterm-256color；初始 120 列、24 行，尺寸允许 1..4096，支持 window-change。
 - connectTimeout 默认 10 秒（允许 1..300），覆盖 DNS/TCP、SSH 密钥交换、认证和 PTY/shell 设置；同连接的配置和建连由生命周期锁串行处理。
 - keepaliveInterval 默认 60 秒，0 关闭保活；连续 3 次无响应关闭传输。
@@ -81,20 +80,17 @@ SQLite 随程序构建。密码/私钥使用 Windows 用户级 DPAPI 加密为 B
 
 数据库只能由对应 Windows 用户环境解密；复制到另一机器/账号不能直接恢复凭据。非 Windows 平台目前拒绝存储有凭据的连接，不回退明文。缺省 userId 使用 default，匹配客户端；与 Java 创建接口的历史 defaultUser 有差异。
 
-仅允许回环监听和已列出的 Tauri/Vite 来源。userId 筛选不是身份认证，当前面向单用户桌面应用，不支持作为多人远程服务。日志不记录请求凭据，数据库操作使用阻塞工作线程和事务。
+当前由单用户桌面应用持有业务服务实例。userId 筛选不是身份认证，不支持作为多人远程服务。日志不记录请求凭据，数据库操作使用阻塞工作线程和事务。
 
 ## 嵌入与打包
 
-同一 crate 输出 shellpilot-server.exe 和 shellpilot_server 库。公开 serve(listener, Arc<Store>, shutdown) 入口支持宿主绑定动态端口 0、发布实际端口和管理退出。TerminalManager 同样可以由 Tauri 直接持有。
+本项目只输出 `shellpilot_server` 库。客户端通过 Cargo 路径依赖将它编译进 `shellpilot-rust-preview.exe`，无需 JRE/JAR 或独立后端 exe。
 
-~~~powershell
-cargo build --release
-~~~
+试用版拥有独立应用标识和数据目录，业务、健康检查和附件保存使用 IPC，无本地 HTTP 监听端口。支持本地工作区自动初始化、停止、重新初始化与数据设置。SSH/SFTP 直接连接目标服务器；AI 对话和模型附件处理尚未迁移。
 
-输出 target/release/shellpilot-server.exe，可独立运行。
-客户端 test-rust-ui 分支的 npm run bundle:nsis 则将本库编进 shellpilot-rust-preview.exe，安装包无需 JRE/JAR 或独立后端 exe。
-试用版拥有独立应用标识和数据目录，默认绑定 127.0.0.1:0，支持自动启动、停止、重启和设置；内置模式已启用 SFTP 文件管理及独立附件管理；AI 对话和聊天模型附件处理尚未迁移。
-安装说明在兄弟客户端的 docs/RUST_PREVIEW_INSTALL.md，详细迁移清单见 docs/MIGRATION.md。
+客户端目录中的 `npm run bundle:nsis` 可生成安装包，但修改业务代码后的开发验证只需重新运行 `npm run tauri dev`。
+
+安装说明见兄弟客户端的 docs/RUST_PREVIEW_INSTALL.md，详细迁移清单见 docs/MIGRATION.md。以下旧二进制与 HTTP 验证记录是历史证据，不代表当前源码仍提供独立程序。
 
 ## 验证范围
 
@@ -141,3 +137,8 @@ src/agent 已加入 SQLite 会话/任务/原始事件日志、目标与约束快
 新增 SQLite 原始字节分块捕获、SHA256 与按范围回查；工具结果保存有界预览和经校验的输出引用，检查点后仍可回查完整证据。取消/失败清理未发布数据，已引用证据保持不可删除。
 数据库迁移到 schema 4，保留旧 ToolResult 格式；具体接口、配额与恢复边界见 docs/AGENT_OUTPUTS.md，当前进度见 docs/AGENT_PROGRESS.md。
 本项仍是内部库能力，模型与前端 AI 入口尚未接通。
+2026-10-13 移除桌面内置 HTTP 监听：本轮只改源码与文档，用户自行运行验证，未编译、测试或打包。随后已移除独立二进制入口，当前只输出业务库。
+
+桌面当前版本不提供远程后端模式。SSH/SFTP 直接连接目标服务器，未来 Agent 由本地 Rust 调用模型 API。移除远程后端的此次改动按用户要求仅改源码，尚未编译测试。
+
+2026-10-13：清除旧独立 HTTP 程序入口，删除 src/main.rs 和 Cargo [[bin]]，禁用自动二进制发现。本轮未编译、测试、打包或提交 Git。

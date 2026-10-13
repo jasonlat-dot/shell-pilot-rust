@@ -19,7 +19,10 @@ use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
     collections::HashMap,
-    sync::{atomic::Ordering, Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore};
@@ -33,6 +36,8 @@ pub struct TerminalSettings {
     pub poll_wait: Duration,
     pub idle_timeout: Duration,
     pub buffer_bytes: usize,
+    pub channels_per_transport: usize,
+    pub transports_per_connection: usize,
 }
 impl Default for TerminalSettings {
     fn default() -> Self {
@@ -40,6 +45,8 @@ impl Default for TerminalSettings {
             poll_wait: Duration::from_secs(25),
             idle_timeout: Duration::from_secs(1800),
             buffer_bytes: 1024 * 1024,
+            channels_per_transport: 8,
+            transports_per_connection: 32,
         }
     }
 }
@@ -84,7 +91,7 @@ impl Transport {
         limit: Duration,
         slot: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<russh::ChannelStream<client::Msg>, Error> {
-        let mut opening = open_channel(self.clone(), limit, slot).await?;
+        let mut opening = open_channel(self.clone(), limit, slot, None).await?;
         let channel = opening.0.as_mut().unwrap();
         let setup = async {
             channel
@@ -128,9 +135,23 @@ impl Drop for Transport {
         }
     }
 }
+struct PooledTransport {
+    transport: Arc<Transport>,
+    slots: Arc<Semaphore>,
+    total_slots: usize,
+    observed_limit: AtomicUsize,
+}
+impl PooledTransport {
+    fn active(&self) -> usize {
+        self.total_slots - self.slots.available_permits()
+    }
+    fn available(&self) -> bool {
+        !self.transport.is_closed() && self.active() < self.observed_limit.load(Ordering::SeqCst)
+    }
+}
 #[derive(Default)]
 struct Runtime {
-    transport: Option<Arc<Transport>>,
+    transports: Vec<Arc<PooledTransport>>,
 }
 struct Attempt {
     token: CancellationToken,
@@ -150,12 +171,17 @@ impl Drop for AttemptGuard {
         }
     }
 }
-struct OpeningChannel(Option<Channel<client::Msg>>);
+struct OpeningChannel(
+    Option<Channel<client::Msg>>,
+    Option<tokio::sync::OwnedSemaphorePermit>,
+);
 impl Drop for OpeningChannel {
     fn drop(&mut self) {
+        let lease = self.1.take();
         if let (Some(channel), Ok(runtime)) = (self.0.take(), tokio::runtime::Handle::try_current())
         {
             runtime.spawn(async move {
+                let _lease = lease;
                 let _ = tokio::time::timeout(Duration::from_secs(1), channel.close()).await;
             });
         }
@@ -190,6 +216,8 @@ impl TerminalManager {
     }
     pub fn with_settings(store: Arc<Store>, mut settings: TerminalSettings) -> Self {
         settings.buffer_bytes = settings.buffer_bytes.max(4);
+        settings.channels_per_transport = settings.channels_per_transport.clamp(1, 64);
+        settings.transports_per_connection = settings.transports_per_connection.clamp(1, 256);
         Self {
             store,
             runtimes: Mutex::new(HashMap::new()),
@@ -217,6 +245,31 @@ impl TerminalManager {
         tokio::task::spawn_blocking(move || action(&store))
             .await
             .map_err(|_| Error::Worker)?
+    }
+    async fn pooled_transport(
+        &self,
+        runtime: &mut Runtime,
+        connection: &Connection,
+        credentials: &Credentials,
+        fresh: bool,
+    ) -> Result<Arc<PooledTransport>, Error> {
+        runtime
+            .transports
+            .retain(|entry| !entry.transport.is_closed() && entry.active() > 0);
+        if let Some(entry) = runtime.transports.iter().find(|entry| !fresh && entry.available()) {
+            return Ok(entry.clone());
+        }
+        if runtime.transports.len() >= self.settings.transports_per_connection {
+            return Err(Error::Busy);
+        }
+        let entry = Arc::new(PooledTransport {
+            transport: Arc::new(authenticate(connection, credentials.clone()).await?),
+            slots: Arc::new(Semaphore::new(self.settings.channels_per_transport)),
+            total_slots: self.settings.channels_per_transport,
+            observed_limit: AtomicUsize::new(self.settings.channels_per_transport),
+        });
+        runtime.transports.push(entry.clone());
+        Ok(entry)
     }
     fn prune(&self) {
         self.sessions.lock().unwrap().retain(|_, session| {
@@ -300,29 +353,46 @@ impl TerminalManager {
                 .blocking(move |store| Ok((store.get(&id)?, store.credentials(&id)?)))
                 .await?;
             let setup = async {
-                if runtime
-                    .transport
-                    .as_ref()
-                    .is_some_and(|t| t.handle().is_closed())
-                {
-                    runtime.transport = None;
-                }
-                if runtime.transport.is_none() {
-                    runtime.transport =
-                        Some(Arc::new(authenticate(&connection, credentials).await?));
-                }
-                let transport = runtime.transport.as_ref().unwrap().clone();
-                let opening_slot = self
-                    .opening_slots
-                    .clone()
-                    .try_acquire_owned()
-                    .map_err(|_| Error::Busy)?;
-                let mut opening = open_channel(
-                    transport.clone(),
-                    Duration::from_secs(u64::from(connection.connect_timeout)),
-                    opening_slot,
-                )
-                .await?;
+                let (entry, mut opening) = {
+                    let mut opened = None;
+                    for attempt in 0..2 {
+                        let entry = self
+                            .pooled_transport(&mut runtime, &connection, &credentials, attempt > 0)
+                            .await?;
+                        let channel_slot = entry
+                            .slots
+                            .clone()
+                            .try_acquire_owned()
+                            .map_err(|_| Error::Busy)?;
+                        let opening_slot = self
+                            .opening_slots
+                            .clone()
+                            .try_acquire_owned()
+                            .map_err(|_| Error::Busy)?;
+                        match open_channel(
+                            entry.transport.clone(),
+                            Duration::from_secs(u64::from(connection.connect_timeout)),
+                            opening_slot,
+                            Some(channel_slot),
+                        )
+                        .await
+                        {
+                            Ok(opening) => {
+                                opened = Some((entry, opening));
+                                break;
+                            }
+                            Err(Error::ChannelRejected) if attempt == 0 && entry.active() > 0 => {
+                                entry
+                                    .observed_limit
+                                    .fetch_min(entry.active(), Ordering::SeqCst);
+                                // Only channel creation is retried, before PTY/shell/startupCommand.
+                                // Existing windows stay on their authenticated transport.
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    opened.ok_or(Error::ChannelRejected)?
+                };
                 let mut initial = Vec::new();
                 let channel = opening.0.as_mut().unwrap();
                 channel
@@ -343,6 +413,7 @@ impl TerminalManager {
                         .await
                         .map_err(|_| Error::Ssh)?;
                 }
+                let channel_slot = opening.1.take().unwrap();
                 let (reader, writer) = opening.0.take().unwrap().split();
                 let writer = Arc::new(writer);
                 let mut opening_writer = OpeningWriter(Some(writer.clone()));
@@ -383,15 +454,11 @@ impl TerminalManager {
                     let _slot = slot;
 
                     run_reader(session, reader, writer, attempt_token, settings).await;
+                    drop(channel_slot);
                     let mut runtime = reader_runtime.lock().await;
-                    if runtime
-                        .transport
-                        .as_ref()
-                        .is_some_and(|cached| Arc::ptr_eq(cached, &transport))
-                        && Arc::strong_count(&transport) == 2
-                    {
-                        runtime.transport = None;
-                    }
+                    runtime
+                        .transports
+                        .retain(|cached| !Arc::ptr_eq(cached, &entry) || entry.active() > 0);
                 });
                 Ok(OpenResult {
                     session_id,
@@ -399,12 +466,16 @@ impl TerminalManager {
                     initial_output,
                 })
             };
-            tokio::time::timeout(
+            let result = tokio::time::timeout(
                 Duration::from_secs(u64::from(connection.connect_timeout)),
                 setup,
             )
             .await
-            .map_err(|_| Error::ConnectTimeout)?
+            .map_err(|_| Error::ConnectTimeout)?;
+            runtime
+                .transports
+                .retain(|entry| !entry.transport.is_closed() && entry.active() > 0);
+            result
         };
         let result = tokio::select! {
             biased;
@@ -466,6 +537,13 @@ impl TerminalManager {
             })
     }
     pub async fn read(&self, id: &str) -> ReadResult {
+        self.read_limited(id, usize::MAX).await
+    }
+    /// IPC emits bounded UTF-8 frames and leaves the rest in the session's bounded buffer.
+    pub async fn read_chunk(&self, id: &str) -> ReadResult {
+        self.read_limited(id, 65536).await
+    }
+    async fn read_limited(&self, id: &str, limit: usize) -> ReadResult {
         let Ok(session) = self.session(id) else {
             return ReadResult::new(
                 "DISCONNECTED",
@@ -493,7 +571,11 @@ impl TerminalManager {
                     return ReadResult::new("REPLACED", "".into(), connected, false, None);
                 }
                 if !output.text.is_empty() {
-                    let text = std::mem::take(&mut output.text);
+                    let mut end = output.text.len().min(limit);
+                    while !output.text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    let text = output.text.drain(..end).collect();
                     let overflow = std::mem::take(&mut output.overflow);
                     return ReadResult::new("DATA", text, connected, overflow, None);
                 }
@@ -567,7 +649,7 @@ impl TerminalManager {
             ));
         }
         self.blocking(move |s| s.delete(&id)).await?;
-        runtime.transport = None;
+        runtime.transports.clear();
         Ok(())
     }
     pub async fn update_connection(&self, request: ConnectionRequest) -> Result<Connection, Error> {
@@ -580,7 +662,7 @@ impl TerminalManager {
         let result = self.blocking(move |s| s.save(request, true)).await?;
         // Existing channels own their transport and continue; newly opened
         // windows use the new credentials/configuration.
-        runtime.transport = None;
+        runtime.transports.clear();
         Ok(result)
     }
     pub async fn shutdown(&self) {
@@ -599,8 +681,8 @@ impl TerminalManager {
             .cloned()
             .collect::<Vec<_>>();
         for runtime in runtimes {
-            if let Some(transport) = runtime.lock().await.transport.take() {
-                let _ = transport._network.0.shutdown(std::net::Shutdown::Both);
+            for entry in runtime.lock().await.transports.drain(..) {
+                entry.transport.shutdown();
             }
         }
     }
@@ -616,8 +698,8 @@ impl Drop for TerminalManager {
         }
         for runtime in self.runtimes.get_mut().unwrap().values() {
             if let Ok(runtime) = runtime.try_lock() {
-                if let Some(transport) = runtime.transport.as_ref() {
-                    let _ = transport._network.0.shutdown(std::net::Shutdown::Both);
+                for entry in &runtime.transports {
+                    entry.transport.shutdown();
                 }
             }
         }
@@ -748,19 +830,26 @@ async fn open_channel(
     transport: Arc<Transport>,
     limit: Duration,
     slot: tokio::sync::OwnedSemaphorePermit,
+    channel_slot: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<OpeningChannel, Error> {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let _slot = slot;
+        let mut channel_slot = channel_slot;
         let result =
             match tokio::time::timeout(limit, transport.handle().channel_open_session()).await {
-                Ok(Ok(channel)) => Ok(OpeningChannel(Some(channel))),
+                Ok(Ok(channel)) => Ok(OpeningChannel(Some(channel), channel_slot.take())),
+                Ok(Err(russh::Error::ChannelOpenFailure(
+                    russh::ChannelOpenFailure::AdministrativelyProhibited
+                    | russh::ChannelOpenFailure::ResourceShortage,
+                ))) => Err(Error::ChannelRejected),
                 Ok(Err(_)) => Err(Error::Ssh),
                 Err(_) => {
                     let _ = transport._network.0.shutdown(std::net::Shutdown::Both);
                     Err(Error::ConnectTimeout)
                 }
             };
+        drop(channel_slot);
         // Failed delivery drops the guard and closes an already confirmed channel.
         let _ = sender.send(result);
     });

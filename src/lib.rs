@@ -4,6 +4,7 @@ pub mod files;
 mod http;
 pub mod model;
 mod secrets;
+pub mod services;
 pub mod sftp;
 pub mod store;
 pub mod terminal;
@@ -31,21 +32,41 @@ pub async fn serve_with_file_settings(
             "desktop backend must bind to loopback",
         ));
     }
-    let terminals = std::sync::Arc::new(terminal::TerminalManager::new(store.clone()));
-    let sftp = sftp::Manager::new(store.clone());
-    let files = files::Manager::new(
-        store.clone(),
+    let services = services::Services::new(
+        store,
         file_settings,
         format!("http://{}", listener.local_addr()?),
     );
-    let router =
-        http::router_with_all_services(store, terminals.clone(), sftp.clone(), files.clone());
-    axum::serve(listener, router)
+    serve_services(listener, services, shutdown).await
+}
+
+/// Optional HTTP adapter; the desktop holds the same services for direct IPC calls.
+pub async fn serve_services(
+    listener: tokio::net::TcpListener,
+    services: std::sync::Arc<services::Services>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    if !listener.local_addr()?.ip().is_loopback() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "desktop backend must bind to loopback",
+        ));
+    }
+    let router = http::router_with_all_services(
+        services.store.clone(),
+        services.terminals.clone(),
+        services.sftp.clone(),
+        services.files.clone(),
+    );
+    let shutting_down = services.clone();
+    let result = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             shutdown.await;
-            files.shutdown().await;
-            sftp.shutdown();
-            terminals.shutdown().await;
+            shutting_down.shutdown().await;
         })
-        .await
+        .await;
+    if !services.stop.is_cancelled() {
+        services.shutdown().await;
+    }
+    result
 }

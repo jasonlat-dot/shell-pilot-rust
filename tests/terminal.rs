@@ -245,6 +245,7 @@ async fn output_is_bounded_and_idle_sessions_close_without_reconnection() {
         poll_wait: Duration::from_millis(100),
         idle_timeout: Duration::from_millis(200),
         buffer_bytes: 128,
+        ..Default::default()
     });
     let terminal = manager
         .connect(open(&connection.connection_id))
@@ -686,4 +687,142 @@ async fn shutdown_wakes_long_poll_and_cancels_pending_connections() {
         Some(DisconnectReason::ClientClosed)
     );
     eventually(|| fixture.stats.channels.load(Ordering::SeqCst) == 0).await;
+}
+
+#[tokio::test]
+async fn pooled_connections_open_twenty_four_windows_under_openssh_ten_session_limit() {
+    let fixture = Fixture::new(Spec {
+        max_sessions: Some(10),
+        ..Default::default()
+    })
+    .await;
+    let (manager, connection) = fixture.manager(TerminalSettings::default());
+    let mut windows = Vec::new();
+    for index in 0..24 {
+        let opened = manager
+            .connect(open(&connection.connection_id))
+            .await
+            .unwrap();
+        manager
+            .write(&opened.session_id, format!("window-{index}\n"))
+            .await
+            .unwrap();
+        output_contains(&manager, &opened.session_id, &format!("window-{index}")).await;
+        windows.push(opened);
+    }
+    assert_eq!(fixture.stats.connections.load(Ordering::SeqCst), 3);
+    assert_eq!(fixture.stats.rejected_channels.load(Ordering::SeqCst), 0);
+    assert!(windows
+        .iter()
+        .all(|window| manager.connected(&window.session_id).connected));
+    manager.close(&windows[0].session_id);
+    eventually(|| fixture.stats.channels.load(Ordering::SeqCst) == 23).await;
+    let replacement = manager
+        .connect(open(&connection.connection_id))
+        .await
+        .unwrap();
+    assert!(manager.connected(&replacement.session_id).connected);
+    assert_eq!(fixture.stats.connections.load(Ordering::SeqCst), 3);
+    manager.shutdown().await;
+    eventually(|| fixture.stats.live_connections.load(Ordering::SeqCst) == 0).await;
+}
+
+#[tokio::test]
+async fn lower_server_limits_are_learned_without_reexecuting_a_startup_command() {
+    let fixture = Fixture::new(Spec {
+        max_sessions: Some(2),
+        ..Default::default()
+    })
+    .await;
+    let (store, mut connection) = fixture.saved(false);
+    let mut updated = fixture.request(false);
+    updated.connection_id = Some(connection.connection_id.clone());
+    updated.startup_command = Some("startup-once".into());
+    connection = store.save(updated, true).unwrap();
+    let manager = TerminalManager::new(store);
+    let mut windows = Vec::new();
+    for _ in 0..7 {
+        let opened = manager
+            .connect(open(&connection.connection_id))
+            .await
+            .unwrap();
+        let mut output = opened.initial_output.clone();
+        output.push_str(&output_contains(&manager, &opened.session_id, "startup-once").await);
+        assert_eq!(output.matches("startup-once").count(), 1);
+        windows.push(opened);
+    }
+    assert_eq!(fixture.stats.connections.load(Ordering::SeqCst), 4);
+    assert_eq!(fixture.stats.rejected_channels.load(Ordering::SeqCst), 3);
+    assert_eq!(fixture.stats.shells.load(Ordering::SeqCst), 7);
+    manager
+        .write(&windows[0].session_id, "still-usable".into())
+        .await
+        .unwrap();
+    output_contains(&manager, &windows[0].session_id, "still-usable").await;
+    manager.shutdown().await;
+    eventually(|| fixture.stats.live_connections.load(Ordering::SeqCst) == 0).await;
+}
+
+#[tokio::test]
+async fn pooled_transport_failure_is_isolated_and_pool_limit_is_explicit() {
+    let fixture = Fixture::new(Spec {
+        max_sessions: Some(10),
+        ..Default::default()
+    })
+    .await;
+    let (manager, connection) = fixture.manager(TerminalSettings {
+        channels_per_transport: 2,
+        transports_per_connection: 2,
+        ..Default::default()
+    });
+    let mut windows = Vec::new();
+    for _ in 0..4 {
+        windows.push(
+            manager
+                .connect(open(&connection.connection_id))
+                .await
+                .unwrap(),
+        );
+    }
+    assert!(matches!(
+        manager.connect(open(&connection.connection_id)).await,
+        Err(Error::Busy)
+    ));
+    manager
+        .write(&windows[0].session_id, "__disconnect__".into())
+        .await
+        .unwrap();
+    eventually(|| {
+        !manager.connected(&windows[0].session_id).connected
+            && !manager.connected(&windows[1].session_id).connected
+    })
+    .await;
+    assert!(manager.connected(&windows[2].session_id).connected);
+    manager
+        .write(&windows[2].session_id, "other-transport".into())
+        .await
+        .unwrap();
+    output_contains(&manager, &windows[2].session_id, "other-transport").await;
+    assert!(manager
+        .connect(open(&connection.connection_id))
+        .await
+        .is_ok());
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn server_rejecting_all_channels_returns_specific_error_with_no_reauthentication_loop() {
+    let fixture = Fixture::new(Spec {
+        max_sessions: Some(0),
+        ..Default::default()
+    })
+    .await;
+    let (manager, connection) = fixture.manager(TerminalSettings::default());
+    assert!(matches!(
+        manager.connect(open(&connection.connection_id)).await,
+        Err(Error::ChannelRejected)
+    ));
+    assert_eq!(fixture.stats.connections.load(Ordering::SeqCst), 1);
+    manager.shutdown().await;
+    eventually(|| fixture.stats.live_connections.load(Ordering::SeqCst) == 0).await;
 }

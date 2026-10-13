@@ -31,6 +31,8 @@ pub enum Error {
     HostKey,
     #[error("SSH 传输、PTY 或 shell 操作失败")]
     Ssh,
+    #[error("SSH 服务器拒绝新会话通道，可能达到会话数或资源限制")]
+    ChannelRejected,
     #[error("终端会话或连接请求达到上限")]
     Busy,
     #[error("storage worker unavailable")]
@@ -96,6 +98,11 @@ impl IntoResponse for Error {
                 StatusCode::BAD_GATEWAY,
                 "SSH_TRANSPORT_FAILED",
                 "SSH 传输、PTY 或 shell 操作失败",
+            ),
+            Self::ChannelRejected => failure(
+                StatusCode::BAD_GATEWAY,
+                "SSH_CHANNEL_OPEN_REJECTED",
+                "SSH 服务器拒绝新会话通道，可能达到会话数或资源限制",
             ),
             Self::Busy => failure(
                 StatusCode::TOO_MANY_REQUESTS,
