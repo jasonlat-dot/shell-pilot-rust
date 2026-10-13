@@ -310,9 +310,20 @@ fn schema_upgrade_preserves_existing_agent_sessions() {
         .unwrap();
     db.execute_batch(include_str!("../migrations/004_agent_outputs.sql"))
         .unwrap();
+    db.execute_batch(include_str!("../migrations/005_agent_models.sql"))
+        .unwrap();
+    db.execute_batch(include_str!("../migrations/006_agent_turns.sql"))
+        .unwrap();
+    db.execute("INSERT INTO agent_model_profiles(id,user_id,revision,config_json,updated_at) VALUES('legacy-profile','alice',3,?1,0)", [serde_json::to_string(&config()).unwrap()]).unwrap();
     db.execute("INSERT INTO agent_sessions(id,user_id,agent_id,created_at) VALUES('existing','alice','ssh-agent',0)",[]).unwrap();
     drop(db);
     let store = Arc::new(Store::open(&path).unwrap());
+    let legacy = ModelRepository::new(store.clone())
+        .get("legacy-profile", "alice")
+        .unwrap();
+    assert_eq!(legacy.display_name, "legacy-profile");
+    assert_eq!(legacy.revision, 3);
+    assert_eq!(legacy.config.model, "test-model");
     assert_eq!(
         Repository::new(store.clone())
             .session("existing", "alice")
@@ -327,7 +338,7 @@ fn schema_upgrade_preserves_existing_agent_sessions() {
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        6
+        7
     );
     assert_eq!(
         db.query_row("SELECT count(*) FROM agent_sessions", [], |r| r
@@ -335,6 +346,128 @@ fn schema_upgrade_preserves_existing_agent_sessions() {
             .unwrap(),
         1
     );
+}
+
+#[test]
+fn profile_names_preserve_identity_sessions_and_survive_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("names.sqlite");
+    let store = Arc::new(Store::open(&path).unwrap());
+    let repo = ModelRepository::new(store.clone());
+    let original = repo
+        .save(
+            "legacy-model",
+            "alice",
+            0,
+            update(config(), KeyChange::Keep),
+        )
+        .unwrap();
+    assert_eq!(original.display_name, "legacy-model");
+    let session = Repository::new(store.clone())
+        .create_session("legacy-model", "alice")
+        .unwrap();
+    let renamed = repo
+        .save_named(
+            "legacy-model",
+            "alice",
+            1,
+            update(config(), KeyChange::Keep),
+            Some(" 日常问答 "),
+        )
+        .unwrap();
+    assert_eq!(renamed.id, original.id);
+    assert_eq!(renamed.display_name, "日常问答");
+    assert_eq!(renamed.revision, 2);
+    assert_eq!(repo.list("alice").unwrap().len(), 1);
+    assert_eq!(
+        Repository::new(store.clone())
+            .session(&session.id, "alice")
+            .unwrap()
+            .agent_id,
+        original.id
+    );
+    assert!(matches!(
+        repo.save_named(
+            "legacy-model",
+            "alice",
+            1,
+            update(config(), KeyChange::Keep),
+            Some("过期修改")
+        ),
+        Err(ModelError::Stale)
+    ));
+    for invalid in ["", "\n", "bad\nname"] {
+        assert!(matches!(
+            repo.save_named(
+                "legacy-model",
+                "alice",
+                2,
+                update(config(), KeyChange::Keep),
+                Some(invalid)
+            ),
+            Err(ModelError::Invalid(_))
+        ));
+    }
+    let saved = repo
+        .save(
+            "legacy-model",
+            "alice",
+            2,
+            update(config(), KeyChange::Keep),
+        )
+        .unwrap();
+    assert_eq!(saved.display_name, "日常问答"); // Older callers cannot reset the label.
+    assert!(repo.list("bob").unwrap().is_empty());
+    drop(repo);
+    drop(store);
+    let reopened = ModelRepository::new(Arc::new(Store::open(&path).unwrap()));
+    assert_eq!(
+        reopened.get("legacy-model", "alice").unwrap().display_name,
+        "日常问答"
+    );
+    reopened.delete("legacy-model", "alice", 3).unwrap();
+    let recreated = reopened
+        .save(
+            "legacy-model",
+            "alice",
+            0,
+            update(config(), KeyChange::Keep),
+        )
+        .unwrap();
+    assert_eq!(recreated.display_name, "legacy-model");
+}
+
+#[cfg(windows)]
+#[test]
+fn renaming_profile_keeps_encrypted_key_usable() {
+    let store = Arc::new(Store::in_memory().unwrap());
+    let repo = ModelRepository::new(store);
+    let saved = repo
+        .save(
+            "stable-id",
+            "alice",
+            0,
+            update(
+                config(),
+                KeyChange::Set {
+                    value: SecretKey::new(TEST_KEY).unwrap(),
+                },
+            ),
+        )
+        .unwrap();
+    let renamed = repo
+        .save_named(
+            &saved.id,
+            "alice",
+            saved.revision,
+            update(config(), KeyChange::Keep),
+            Some("新名称"),
+        )
+        .unwrap();
+    assert!(renamed.api_key_configured);
+    assert!(!serde_json::to_string(&renamed).unwrap().contains(TEST_KEY));
+    // Runtime decrypts with the original ID-bound entropy after renaming.
+    assert!(ModelClient::new(repo.runtime("stable-id", "alice").unwrap()).is_ok());
 }
 #[cfg(windows)]
 #[test]

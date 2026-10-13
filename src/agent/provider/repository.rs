@@ -36,12 +36,23 @@ fn row(db: &Connection, id: &str, user: &str) -> Result<Option<Row>> {
     Ok(db.query_row("SELECT revision,config_json,api_key FROM agent_model_profiles WHERE user_id=?1 AND id=?2",
         params![user,id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?)
 }
-fn view(id: &str, row: Row) -> Result<ModelProfile> {
+fn display_name(db: &Connection, id: &str, user: &str) -> Result<String> {
+    Ok(db
+        .query_row(
+            "SELECT display_name FROM agent_model_names WHERE user_id=?1 AND profile_id=?2",
+            params![user, id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| id.to_owned()))
+}
+fn view(id: &str, row: Row, display_name: String) -> Result<ModelProfile> {
     let (revision, json, key) = row;
     let config: ModelConfig = serde_json::from_str(&json).map_err(|_| ModelError::Database)?;
     let config = config.normalized()?;
     Ok(ModelProfile {
         id: id.into(),
+        display_name,
         revision,
         ready: !config.require_api_key || key.is_some(),
         config,
@@ -60,7 +71,11 @@ impl ModelRepository {
             .database
             .lock()
             .map_err(|_| ModelError::Database)?;
-        view(id, row(&db, id, user)?.ok_or(ModelError::NotFound)?)
+        view(
+            id,
+            row(&db, id, user)?.ok_or(ModelError::NotFound)?,
+            display_name(&db, id, user)?,
+        )
     }
     pub fn list(&self, user: &str) -> Result<Vec<ModelProfile>> {
         checked_id(user)?;
@@ -75,7 +90,8 @@ impl ModelRepository {
         })?;
         rows.map(|r| {
             let (id, row) = r?;
-            view(&id, row)
+            let name = display_name(&db, &id, user)?;
+            view(&id, row, name)
         })
         .collect()
     }
@@ -87,8 +103,30 @@ impl ModelRepository {
         expected_revision: u64,
         update: ModelConfigUpdate,
     ) -> Result<ModelProfile> {
+        self.save_named(id, user, expected_revision, update, None)
+    }
+    /// Label and configuration share one revision/transaction; identity never changes.
+    pub fn save_named(
+        &self,
+        id: &str,
+        user: &str,
+        expected_revision: u64,
+        update: ModelConfigUpdate,
+        name: Option<&str>,
+    ) -> Result<ModelProfile> {
         checked_id(id)?;
         checked_id(user)?;
+        let name = name.map(str::trim);
+        if name.is_some_and(|name| {
+            name.is_empty()
+                || name.len() > 256
+                || name.chars().count() > 64
+                || name.chars().any(char::is_control)
+        }) {
+            return Err(ModelError::Invalid(
+                "configuration name must contain 1 to 64 printable characters",
+            ));
+        }
         let config = update.config.normalized()?;
         let json = serde_json::to_string(&config).map_err(|_| ModelError::Database)?;
         let mut db = self
@@ -139,7 +177,14 @@ impl ModelRepository {
             .ok_or(ModelError::Stale)?;
         tx.execute("INSERT INTO agent_model_profiles(id,user_id,revision,config_json,api_key,updated_at) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(user_id,id) DO UPDATE SET revision=excluded.revision,config_json=excluded.config_json,api_key=excluded.api_key,updated_at=excluded.updated_at",
             params![id,user,next,json,key,chrono::Utc::now().timestamp()])?;
-        let result = view(id, row(&tx, id, user)?.ok_or(ModelError::Database)?)?;
+        if let Some(name) = name {
+            tx.execute("INSERT INTO agent_model_names(user_id,profile_id,display_name) VALUES(?1,?2,?3) ON CONFLICT(user_id,profile_id) DO UPDATE SET display_name=excluded.display_name", params![user,id,name])?;
+        }
+        let result = view(
+            id,
+            row(&tx, id, user)?.ok_or(ModelError::Database)?,
+            display_name(&tx, id, user)?,
+        )?;
         tx.commit()?;
         Ok(result)
     }
@@ -157,6 +202,10 @@ impl ModelRepository {
             return Err(ModelError::Stale);
         }
         tx.execute(
+            "DELETE FROM agent_model_names WHERE user_id=?1 AND profile_id=?2",
+            params![user, id],
+        )?;
+        tx.execute(
             "DELETE FROM agent_model_profiles WHERE user_id=?1 AND id=?2 AND revision=?3",
             params![user, id, expected_revision],
         )?;
@@ -172,7 +221,7 @@ impl ModelRepository {
             .lock()
             .map_err(|_| ModelError::Database)?;
         let (revision, json, key) = row(&db, id, user)?.ok_or(ModelError::NotFound)?;
-        let profile = view(id, (revision, json, None))?;
+        let profile = view(id, (revision, json, None), id.to_owned())?;
         let api_key = key
             .map(|key| {
                 let plain = secrets::unprotect(&key, &entropy(user, id))

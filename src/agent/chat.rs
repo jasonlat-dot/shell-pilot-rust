@@ -116,6 +116,7 @@ impl Error {
 pub struct AgentConfig {
     pub agent_id: String,
     pub agent_name: String,
+    pub model_name: String,
     pub agent_desc: String,
 }
 #[derive(Clone, Debug, Deserialize)]
@@ -258,7 +259,8 @@ impl Manager {
                 .filter(|p| p.ready)
                 .map(|p| AgentConfig {
                     agent_id: p.id,
-                    agent_name: p.config.model.clone(),
+                    agent_name: p.display_name,
+                    model_name: p.config.model.clone(),
                     agent_desc: format!("基础文本对话 · {}", p.config.model),
                 })
                 .collect())

@@ -209,6 +209,7 @@ pub struct ModelConfigUpdate {
 #[serde(rename_all = "camelCase")]
 pub struct ModelProfile {
     pub id: String,
+    pub display_name: String,
     pub revision: u64,
     pub config: ModelConfig,
     pub api_key_configured: bool,

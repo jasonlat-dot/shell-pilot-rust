@@ -17,6 +17,8 @@ B4 已接通前端“设置 → 模型设置”和基础文本 AI 面板，使�
 
 `ModelRepository::save(id, user, expected_revision, update)` 创建或更新配置。创建时 revision 为 0；更新/删除传入最近读取的 revision，版本冲突返回 `Stale`。`get`/`list` 只返回公开配置，模型列表按用户隔离，每个用户最多 32 项。
 
+配置显示名称与内部 ID 分离：schema 7 的 `agent_model_names` 保存名称，旧配置没有名称记录时回退到原 ID。`save_named(id,user,revision,update,Some(name))` 在同一事务里保存名称和配置；原有 `save` 调用保留显示名称。改名不改变 ID、密钥加密绑定或会话所属配置。名称去除两端空白，限 1–64 个非控制字符。IPC POST `agent/models` 可携带顶层 `displayName`；响应返回 `id` 与 `displayName`，Agent 列表显示配置名称并额外返回 `modelName`。
+
 `runtime(id, user)` 只供原生代码获取运行配置，`ModelClient::new(runtime)` 创建模型客户端。数据库方法是同步方法，后续 IPC 主机应放在阻塞工作线程中调用。不要把 `RuntimeConfig` 传回前端或放进 Agent 事件日志。
 
 ## 配置示例与参数
