@@ -1,6 +1,6 @@
 # Rust SSH Agent 实施清单与续接入口
 
-更新日期：2026-10-13。状态：阶段 5 开始实施，尚未启用 Rust AI 对话。
+更新日期：2026-10-14。状态：阶段 5 实施中，基础文本对话 IPC 已接通，前端 AI 面板尚未启用。
 用户要求：参考 Codex CLI 优化上下文和工具决策；先列清单，每完成一项更新标记，供换窗口后续接。当前不打包。需要修改前端的阶段同步修改 test-rust-ui。
 源码参考与设计依据：[CODEX_AGENT_REFERENCE.md](CODEX_AGENT_REFERENCE.md)。本文件是进度唯一入口，完成标记必须有代码与验证证据，不以“已设计”替代“已实现”。
 
@@ -30,7 +30,7 @@
 
 ### B. 模型配置与基本对话
 - [x] B1 模型适配器与配置：供应商能力、模型窗口、API 地址/密钥安全保存、基础参数校验。OpenAI 兼容 Chat Completions 非流式适配与回环测试完成；前端配置入口待 B4。
-- [ ] B2 对接 agent 配置列表、create_session、chat_stream 和 stop_chat；保留现有前端事件协议。
+- [x] B2 对接 agent 配置列表、create_session、chat_stream 和 stop_chat；保留现有前端事件协议。基础文本流式对话与本地 IPC/Channel 测试完成，UI 入口仍待 B4。
 - [ ] B3 流式取消/超时/错误、同会话并发隔离、历史与恢复，不将 EOF 当成功。
 - [ ] B4 前端模型设置和 Rust AI 入口；只有后端功能已验证后才启用。
 - [ ] B5 真实回环模型协议联调，前端解析与停止/恢复回归。
@@ -60,9 +60,9 @@
 
 ## 当前进度与下一项
 
-A0–A6 已完成内核阶段，保留用户手动勾选的 A6；真实 SSH 执行去重的最终联验仍待 D3。B1 已完成模型配置/能力/窗口校验、Windows DPAPI 密钥保存、原生请求和响应适配。本轮模型 18 项＋原 Agent 40 项，共 58 项通过；桌面原生集成另有 5 项通过，Clippy 无警告。
+A0–A6、B1、B2 已完成各自基础阶段，保留用户手动勾选的 A6；真实 SSH 执行去重的最终联验仍待 D3。B2 已接通就绪模型列表、持久会话、文本 SSE 到 Tauri Channel 和停止操作。本轮 Rust 43 项、原生 IPC 7 项、前端 27 项通过；TypeScript 和 Rust Clippy 检查通过。
 
-下一项 B2：对接 agent 配置列表、create_session、chat_stream 和 stop_chat，保留现有前端事件协议。B2/B3 必须使用本地 IPC/Channel，不重新引入 HTTP 后端或独立进程。B1 模型请求已可通过库接口调用，但 AI 对话循环、流式会话、真实语义压缩和前端 AI 入口尚未接通。模型配置界面仍待 B4；本轮不打包、不提交。
+下一项 B3：补齐流式错误/超时矩阵、请求/轮次幂等、同会话停止与完成竞态、跨会话并发、历史与重启恢复。B2 已有基础取消/超时、活动会话互斥与 EOF 拒绝，但完整 B3 仍未完成。继续使用本地 IPC/Channel；模型设置和前端 AI 面板仍待 B4，自动压缩待 C，SSH 工具与审批待 D。本轮不打包、不提交。
 详细验证结果和下一步会在每个完成项后记录。
 
 ## 验证与完成记录
@@ -185,3 +185,19 @@ A0–A6 已完成内核阶段，保留用户手动勾选的 A6；真实 SSH 执�
 - 环境：首次离线编译缺少新增依赖 want，联网下载依赖后测试均离线执行；测试在正常 Windows 用户权限下运行，避免已有沙箱临时路径 canonicalize 权限问题。测试服务仅回环监听，产品库不新增监听端口。
 - 说明：AGENT_MODELS.md 记录配置字段、密钥动作、调用入口、协议边界与测试命令。模型能力与窗口尚未通过真实供应商探测；token 估算仍为启发式，usage 持续校准/媒体预算留给后续阶段。
 - 续接：B1 已勾选，下一项 B2；B3 流式取消/结束与恢复、B4 模型设置和 AI 入口继续保持待办。未做真实模型/完整 GUI/全量 Rust 回归或安装包。较早的 A6 未勾选文字为当时记录，以顶部清单及当前进度为准。
+
+### B2：2026-10-14 完成
+
+- 用户要求：接通 B2，做简单测试并给 commit note；继续回填完成标记，不替用户提交 Git。A6/B1 已有勾选保持不变。
+- Rust：src/agent/chat.rs 提供按用户/配置创建会话、就绪模型列表、活动生成和停止；src/agent/provider/stream.rs 提供字节级 SSE 文本适配；Services 管理同进程 Agent 生命周期，不新增产品监听端口。
+- 桌面：backend_ipc.rs 对接 GET query_ai_agent_config_list、POST create_session/stop_chat，以及 builtin_agent_subscribe/builtin_agent_ack。目标来自存活 SSH 终端与 Store 所属用户，不能由模型或前端额外 routing 参数指定。
+- 前端：src/api/agent.ts 改用 invoke/Channel，沿用 text/done/error 事件与 parseStreamEvent，逐帧确认、取消只针对对应 streamId；保留 App.tsx 的 Rust AI 面板禁用逻辑，模型设置仍待 B4。
+- 持久化：复用 schema 5 的 A2 原始日志与模型配置。用户消息先入库，完整 assistant 入库后才发 done；异常写取消记录，不把部分文本当完整成功。同会话只允许一个活动生成；旧目标与用户约束重新注入模型请求。
+- 边界：文本与回复 16000 UTF-8 字节、回复 JSON 编码 60000 字节、SSE 行/帧 64 KiB，网络响应上限与整体超时沿用 B1。历史达到 200 条或已有检查点明确拒绝，不静默截断。附件/工具对话未接入，不执行 SSH 命令或产生模型授权。
+- 流式验证：finish_reason=stop 和 [DONE] 缺一不可；截断/过滤/错误 JSON/意外工具调用失败。停止、调用方取消、工作区关闭清理当前生成；信号回执不保证供应商计算已停止。
+- 简单 Rust 测试：cargo test --offline --test agent_chat --test agent_models --test agent_context，8+18+17，共 43/43 通过。包含 Unicode/CRLF 网络分片、历史续聊、EOF、停止、同会话互斥、用户/目标隔离、附件拒绝、预算/JSON 大小和非成功响应。最终补强取消后的任务约束保留后，agent_chat 8 项再次通过；另外 35 项代码未变。
+- 原生测试（客户端目录）：cargo test --manifest-path src-tauri/Cargo.toml --offline --lib backend_ipc::tests -- --test-threads=1，7/7 通过，其中新增模型控制、Channel 输出确认与 stop_chat 回环测试 3 项；没有运行其余 10 项。
+- 前端测试（客户端目录）：node --import tsx --test tests/agent-ipc.test.ts tests/ipc-transport.test.ts tests/chat-attachments.test.ts，27/27 通过；node node_modules/typescript/bin/tsc --noEmit 通过。新增 Agent IPC 6 项覆盖控制形状、Unicode/空白、done/error、取消和接收器错误。
+- 静态检查：cargo clippy --offline --lib --test agent_chat -- -D warnings 通过；修改 Rust 文件 rustfmt/针对性格式检查通过。桌面 cargo clippy --manifest-path src-tauri/Cargo.toml --offline --lib --tests 通过，既有 chat_history 排序及旧 backend_process 测试进程警告保留，无新 Agent 警告。
+- 环境与修正：一次静态检查的自动授权超时，普通沙箱重试因父目录配置访问失败；正常权限重试成功。Clippy 指出测试锁跨 await，已改为明确作用域后通过。没有改用户凭据或连接真实供应商/远端。
+- 文档：AGENT_CHAT.md 记录原生接口、事件、参数、日志和边界；客户端 docs/agent-ipc.md 指向该文档。下一项 B3，保持 B3/B4/B5 未勾选；未做完整 GUI、真实模型、全量测试或安装包。

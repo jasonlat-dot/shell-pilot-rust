@@ -6,11 +6,11 @@ use tokio_util::sync::CancellationToken;
 /// A native model-service client; it never opens a ShellPilot backend listening port.
 /// Intentionally not Debug: credentials remain inside the native request headers.
 pub struct ModelClient {
-    config: ModelConfig,
-    client: Client,
-    authorization: Option<header::HeaderValue>,
+    pub(super) config: ModelConfig,
+    pub(super) client: Client,
+    pub(super) authorization: Option<header::HeaderValue>,
 }
-fn network(error: reqwest::Error) -> ModelError {
+pub(super) fn network(error: reqwest::Error) -> ModelError {
     if error.is_timeout() {
         ModelError::Timeout
     } else {

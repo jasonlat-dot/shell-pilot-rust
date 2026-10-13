@@ -2,7 +2,7 @@
 
 本阶段完成模型配置、安全保存 API Key、请求预算与 OpenAI 兼容 Chat Completions 协议适配。它是桌面应用内部的 Rust 库，不启动后端监听端口。这里的 API 地址是模型服务地址。
 
-当前没有前端模型设置页面，也没有开放 Rust AI 对话入口。B2/B3 负责会话、流式对话、停止与恢复，B4 再接设置页面。不要用本文件的配置示例判断当前客户端已能聊天。
+当前没有前端模型设置页面，也没有开放 Rust AI 面板入口。B2 已接通基础文本对话 IPC/Channel，见 [AGENT_CHAT.md](AGENT_CHAT.md)；B3 继续补齐流式恢复，B4 再接设置页面。不要用本文件的配置示例判断当前客户端已能聊天。
 
 ## 文件与入口
 
@@ -89,13 +89,13 @@ Windows 复用现有 DPAPI，加密范围绑定当前 Windows 账户以及用户
 
 ## 协议与错误
 
-协议参考 [OpenAI Chat Completions 创建接口](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)。这里只实现 OpenAI 兼容 Chat Completions 的非流式请求，没有 Responses、Anthropic 原生协议或远端压缩分支。
+协议参考 [OpenAI Chat Completions 创建接口](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)。B1 的 complete 接口实现非流式请求；B2 新增基础文本 stream，见 [AGENT_CHAT.md](AGENT_CHAT.md)。当前没有 Responses、Anthropic 原生协议或远端压缩分支。
 
 支持文本 system/developer/user/assistant/tool 消息与 function 工具定义。函数调用参数必须是 JSON 对象，调用 ID 唯一，历史中的每次调用必须有结果；未定义工具、重复/孤立结果、未完成工具组均在发请求前拒绝。这里只校验协议，不执行 SSH 工具、不授予工具权限；执行参数 schema、目标和确认策略仍属于 D1–D3。
 
 成功返回一个 assistant choice，接收 `stop` 或 `tool_calls` 结束原因。`length`、`content_filter` 等不被当成完整成功；空 choices、损坏 JSON、未声明工具、错误调用参数或矛盾 usage 返回错误。原始 provider 错误正文不透传，只返回状态码，避免它回显密钥或提示词。网络错误也不附带 URL 或第三方诊断正文。
 
-客户端关闭重定向和自动重试；取消后不继续读取响应。取消/超时只代表本地请求停止，不保证供应商已经中止计费或计算。B2/B3 需要另外实现 SSE、结束标记、会话并发与持久化恢复，不能把本阶段的 `complete` 当作 `chat_stream`。
+客户端关闭重定向和自动重试；取消后不继续读取响应。取消/超时只代表本地请求停止，不保证供应商已经中止计费或计算。B2 已实现基础 SSE、结束标记与会话互斥，B3 继续补齐并发/轮次恢复；`complete` 仍是非流式接口，不能把它当作 `chat_stream`。
 
 ## 运行简单测试
 

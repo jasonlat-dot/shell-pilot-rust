@@ -2,6 +2,7 @@
 mod config;
 mod protocol;
 mod repository;
+mod stream;
 mod transport;
 pub use config::*;
 pub use protocol::*;

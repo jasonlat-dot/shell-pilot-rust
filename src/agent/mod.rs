@@ -1,5 +1,6 @@
-//! Persistent context kernel and native model adapter. Agent turns and executable tools are not wired yet.
+//! Persistent context kernel, native model adapters and basic text turns. Executable tools are not wired yet.
 pub mod budget;
+pub mod chat;
 pub mod model;
 pub mod provider;
 mod repository;

@@ -1,0 +1,88 @@
+# B2：基础文本对话与桌面 IPC
+
+更新日期：2026-10-14。
+
+B2 接通就绪模型对应的 Agent 列表、创建会话、流式文本对话和停止操作。桌面通过 invoke/Channel 调用同进程 Rust 服务，只有 Rust 模型客户端向模型供应商发 HTTP 请求。产品不新增监听端口或独立后端进程。
+
+当前 AI 面板仍由 `App.tsx` 的 Rust 功能开关禁用，模型设置页面尚未开放。B1 的配置由 Rust `ModelRepository` 保存，API Key 安全存储见 [AGENT_MODELS.md](AGENT_MODELS.md)；B4 才提供设置界面。本阶段不执行 SSH 命令、不处理附件，也没有自动压缩。
+
+## 控制接口与流式接口
+
+| 前端调用 | 原生调用 | 返回 |
+| --- | --- | --- |
+| `agentApi.list()` | `builtin_request`，GET `agent/query_ai_agent_config_list` | `[{ agentId, agentName, agentDesc }]` |
+| `agentApi.createSession(agentId)` | POST `agent/create_session` | `{ sessionId }` |
+| `agentApi.stopChat(agentId, sessionId)` | POST `agent/stop_chat` | boolean，表示是否已向当前活动生成发出取消信号 |
+| `agentApi.chatStream(body, receive, signal)` | `builtin_agent_subscribe` + Tauri Channel | `text / done / error` 事件，invoke 等待整个流完成 |
+
+列表按 userId 查询，只返回配置中 ready=true 的模型；agentId 使用对应模型配置 ID，名称暂用模型 ID。就绪标志不代表已通过真实供应商探测。create_session 复核配置与用户归属，生成持久 SQLite Agent 会话。
+
+请求体保留旧字段：
+
+```json
+{
+  "agentId": "your-model-profile-id",
+  "userId": "default",
+  "sessionId": "created-session-id",
+  "terminalSessionId": "",
+  "message": "请解释这段报错"
+}
+```
+
+不关联 SSH 终端时 terminalSessionId 传空字符串。关联终端时，原生适配器从存活终端查出 connectionId，并复核用户归属；不接受前端额外传入 connectionId/授权字段。任务目标固定，后续请求若改变目标会返回 `AGENT_TARGET_MISMATCH`，应新建会话。
+
+流式聊天必须使用 Channel。通过普通 JSON 请求调用 `agent/chat_stream` 会返回 `AGENT_CHANNEL_REQUIRED`，不会走 HTTP 兼容接口。
+
+## 事件与接收确认
+
+Channel 每帧格式：
+
+```json
+{ "sequence": 1, "payload": { "event": "text", "content": "一个文本片段" } }
+```
+
+沿用前端 `parseStreamEvent`，保留 Unicode、空白、引号与代码里的字面量 `\n`。每处理一帧调用 `builtin_agent_ack`，当前订阅同时最多有一帧等待确认。15 秒未确认时停止该订阅。接收器异常会请求取消，并确认已收到的帧，避免清理过程持续等待。
+
+成功结束发送 `{ event: "done", content: "完整文本" }`，失败使用 `{ event: "error", content, code }`。最后的错误帧 sequence=0，不等待确认。前端同时检查 invoke 结果与 done 事件，缺少 done 时不判成功。AbortSignal 调用 `builtin_cancel` 取消该 streamId，后续文本不再更新页面。
+
+这些事件是基础文本对话；旧工具/子 Agent 事件解析仍保留，但本阶段不会生成工具执行事件。
+
+## 模型流与会话记录
+
+模型协议按 [OpenAI 流式响应文档中的 Chat Completions](https://developers.openai.com/api/docs/guides/streaming-responses) 实现 SSE：`stream=true`、`choices[0].delta.content`。字节解析允许 CRLF、注释和跨网络分片的 UTF-8，SSE data 行合并后再解码。
+
+只有 `finish_reason=stop` 加明确的 `[DONE]` 才完成；单纯 EOF、截断、过滤、供应商错误 JSON 或意外工具调用均失败。支持可选 usage 数据，但不强制发送部分兼容供应商不接受的 stream_options。取消/总超时、TLS 校验、关闭重定向/重试及错误脱敏沿用 B1。
+
+用户消息和可信任务/终端快照写入 A2 的事件库。每次请求重新注入目标、目标任务和用户约束；任务快照不是执行授权。只有完整成功的 assistant 文本提交后才发送 done。生成中断写入取消事件，已经显示的部分文本不冒充完整 assistant 记录。
+
+同一用户/会话只允许一个活动生成，全工作区最多 32 个。停止和工作区关闭会取消活动模型请求。stop_chat 的 true 回执表示取消信号已发出，不保证供应商已经中止计算或计费；没有活动生成返回 false。
+
+## 当前边界与下一阶段
+
+- 消息及完整回复最多 16000 UTF-8 字节；JSON 编码后的回复另限 60000 字节，保证日志和 Channel 帧有界。SSE 单行/单事件最多 64 KiB，总网络响应受 B1 maxResponseBytes 限制。
+- 先检查完整历史与预算，不静默截断。达到 200 条原始事件或已有检查点时明确拒绝；检查点重建和长历史压缩由 B3/C 阶段继续接入。
+- 只发送已提交的 user/assistant 记录；失败记录可回查，但未完成轮次的专门恢复/重试策略仍待 B3。不能自动重发未知结果的轮次。
+- 附件引用、已有工具记录及流式工具调用明确拒绝，避免在 E1/D1 前错误宣称支持它们。
+- B3 仍需补齐请求/轮次幂等、停止与完成竞态、跨会话并发、错误/超时完整矩阵、持久轮次状态与重启恢复。当前基础测试不表示整项 B3 已完成。
+- B4 添加模型设置和 AI 面板入口，B5 再完成前后端完整联验。尚未测试真实模型供应商或完整 GUI。
+
+## 简单测试
+
+Rust 项目目录：
+
+```powershell
+cargo test --offline --test agent_chat --test agent_models --test agent_context
+cargo clippy --offline --lib --test agent_chat -- -D warnings
+```
+
+客户端目录：
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --offline --lib backend_ipc::tests -- --test-threads=1
+node --import tsx --test tests/agent-ipc.test.ts tests/ipc-transport.test.ts tests/chat-attachments.test.ts
+node node_modules/typescript/bin/tsc --noEmit
+```
+
+本轮通过：Rust 8+18+17=43 项；原生 IPC 7 项；前端 27 项。Rust Clippy -D warnings、TypeScript 与针对性格式检查通过。桌面 Clippy 通过，报告既有聊天排序和旧进程测试警告，新 Agent 桥没有新增警告。
+
+测试服务仅使用临时 `127.0.0.1` 模型端点和本地 SSH 协议夹具，不使用真实 API Key、用户 SSH 服务器、安装包或 GUI。完成记录及续接入口见 [AGENT_PROGRESS.md](AGENT_PROGRESS.md)。
