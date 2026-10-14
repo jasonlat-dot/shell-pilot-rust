@@ -32,6 +32,7 @@ fn checkpoint(snapshot: &Snapshot, evidence: Vec<u64>) -> CheckpointContent {
         summary: "保留原目标及不要重启的约束".into(),
         next_steps: vec!["回查输出并确认未完成操作".into()],
         evidence_event_ids: evidence,
+        retained_user_facts: vec![],
         pending_tool_call_ids: snapshot.pending_tool_call_ids.clone(),
         uncertain_tool_call_ids: snapshot.uncertain_tool_call_ids.clone(),
     }

@@ -13,7 +13,8 @@ B4 已开放模型设置、文字 AI 面板与原生历史；API Key 安全存�
 | `agentApi.list()` | `builtin_request`，GET `agent/query_ai_agent_config_list` | `[{ agentId, agentName, agentDesc }]` |
 | `agentApi.createSession(agentId)` | POST `agent/create_session` | `{ sessionId }` |
 | `agentApi.stopChat(agentId, sessionId)` | POST `agent/stop_chat` | boolean，表示是否已向当前活动生成发出取消信号 |
-| `agentApi.chatStream(body, receive, signal)` | `builtin_agent_subscribe` + Tauri Channel | `text / done / error` 事件，invoke 等待整个流完成 |
+| `agentApi.chatStream(body, receive, signal)` | `builtin_agent_subscribe` + Tauri Channel | `context / text / done / error` 事件，invoke 等待整个流完成 |
+| `agentApi.contextStatus(agentId, sessionId)` | GET `agent/context_status` | 按用户/模型/会话隔离的最近输入测量与真实整理状态；只读，不调用模型 |
 
 列表按 userId 查询，只返回配置中 ready=true 的模型；agentId 使用对应模型配置 ID，名称暂用模型 ID。就绪标志不代表已通过真实供应商探测。create_session 复核配置与用户归属，生成持久 SQLite Agent 会话。
 
@@ -45,7 +46,11 @@ Channel 每帧格式：
 
 成功结束发送 `{ event: "done", content: "完整文本" }`，失败使用 `{ event: "error", content, code }`。最后的错误帧 sequence=0，不等待确认。前端同时检查 invoke 结果与 done 事件，缺少 done 时不判成功。AbortSignal 调用 `builtin_cancel` 取消该 streamId，后续文本不再更新页面。
 
-这些事件是基础文本对话；旧工具/子 Agent 事件解析仍保留，但本阶段不会生成工具执行事件。
+C5 新增 `{ event: "context", status }`，与文字帧共用 sequence/ACK 和当前订阅取消机制；`status.requestId` 必须匹配当前请求。`usage` 可为空，存在时包含 inputTokens、availableInputTokens、contextWindow、outputReserve、safetyReserve、compactPercent 和 source（estimated / providerCount）。占用是最近一次准备发送的完整输入快照，不是累计 usage，也不包含草稿或回复后的新增内容。
+
+`phase` 为 idle / running / succeeded / failed / cancelled / interrupted；method 为 summary / remote 或 null。整理次数来自真实检查点数量，succeeded 必须关联已保存的 checkpointId。失败会提供固定 errorCode 与 fallback 标记，不回传供应商错误正文、提示或密钥。状态按 schema 11 持久保存；旧历史无测量时返回未知占用和实际检查点次数，生成中状态在租约过期后显示中断。只读状态不修改会话 revision，不触发摘要或恢复任务。细节及验证见 AGENT_PROGRESS.md 的 C5 记录。
+
+这些事件仍属于基础文本对话；旧工具/子 Agent 事件解析保留，但本阶段不会生成工具执行事件。
 
 ## 模型流与会话记录
 

@@ -212,7 +212,7 @@ pub(crate) fn measure(config: &ModelConfig, request: &ChatRequest) -> Result<Pre
 }
 pub(crate) struct PreparedResponses {
     body: Value,
-    input_tokens: u64,
+    pub(crate) input_tokens: u64,
     binding: Binding,
 }
 impl ModelClient {

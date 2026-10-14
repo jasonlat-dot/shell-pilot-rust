@@ -480,6 +480,17 @@ async fn remote_compaction_preserves_the_entire_canonical_window_latest_input_an
         "done"
     );
     assert_eq!(f.calls("compact"), 1);
+    let status = f
+        .manager
+        .context_status("model".into(), "default".into(), f.session.clone())
+        .await
+        .unwrap();
+    assert!(matches!(status.phase, context_status::Phase::Succeeded));
+    assert_eq!(status.compaction_count, 1);
+    assert!(matches!(
+        status.usage.unwrap().source,
+        context_status::Source::ProviderCount
+    ));
     let cp = f.repo.checkpoint(&f.session, "default").unwrap().unwrap();
     assert_eq!(cp.through_event_id, before.last().unwrap().id);
     assert_eq!(
@@ -947,7 +958,7 @@ fn schema_7_reopen_preserves_existing_raw_history_and_adds_only_native_window_ta
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |r| r.get::<_, u64>(0))
             .unwrap(),
-        10
+        11
     );
     assert_eq!(
         db.query_row("SELECT COUNT(*) FROM agent_responses_outputs", [], |r| r

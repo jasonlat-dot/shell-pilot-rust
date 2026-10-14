@@ -24,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone, Copy)]
 enum Mode {
     Good,
+    Fact,
     Authority,
     Invalid,
     Long,
@@ -80,7 +81,23 @@ async fn handler(
     let content = if matches!(mode, Mode::Invalid) {
         summary
     } else {
-        json!({"summary":summary,"nextSteps":["继续只读分析"],"evidenceEventIds":[ids.last().unwrap()]}).to_string()
+        let facts: Vec<Value> = if matches!(mode, Mode::Fact) {
+            source["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|event| {
+                    event["payload"]["type"] == "userMessage"
+                        && event["payload"]["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("QSB-7042"))
+                })
+                .map(|event| json!({"eventId":event["id"],"quote":"公开报告编号 QSB-7042"}))
+                .collect()
+        } else {
+            vec![]
+        };
+        json!({"summary":summary,"nextSteps":["继续只读分析"],"retainedUserFacts":facts,"evidenceEventIds":[ids.last().unwrap()]}).to_string()
     };
     let reply = json!({"choices":[{"index":0,"message":{"role":"assistant","content":content},"finish_reason":"stop"}]});
     axum::response::Response::builder()
@@ -283,6 +300,56 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn retained_fact_is_sent_to_the_model_after_automatic_recompaction_without_raw_message() {
+    let f = Fixture::new().await;
+    f.chat(f.request("只讨论方案，不执行命令")).await.unwrap();
+    f.chat(f.request("请保留公开报告编号 QSB-7042，这是普通业务事实。"))
+        .await
+        .unwrap();
+    for _ in 0..6 {
+        f.chat(f.request(&"u".repeat(1000))).await.unwrap();
+    }
+    f.config(8192, 60);
+    *f.mock.mode.lock().unwrap() = Mode::Fact;
+    f.chat(f.request("继续讨论部署检查")).await.unwrap();
+    let first = f.repo.checkpoint(&f.session, "default").unwrap().unwrap();
+    assert_eq!(first.content.retained_user_facts.len(), 1);
+    let fact_event = first.content.retained_user_facts[0].event_id;
+    assert!(fact_event <= first.through_event_id);
+    *f.mock.mode.lock().unwrap() = Mode::Good; // Subsequent summaries omit it entirely.
+    let mut changed = false;
+    for _ in 0..16 {
+        f.chat(f.request(&"other-topic".repeat(100))).await.unwrap();
+        let next = f.repo.checkpoint(&f.session, "default").unwrap().unwrap();
+        if next.id != first.id {
+            assert_eq!(
+                next.content.retained_user_facts,
+                first.content.retained_user_facts
+            );
+            assert!(next.through_event_id > fact_event);
+            changed = true;
+            break;
+        }
+    }
+    assert!(changed, "test must cross a second actual compaction");
+    let requests = f.mock.requests.lock().unwrap();
+    let body = requests
+        .iter()
+        .rev()
+        .find(|body| body["stream"] == true)
+        .unwrap();
+    let messages = body["messages"].as_array().unwrap();
+    assert!(messages.iter().any(|m| m["role"] == "assistant"
+        && m["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("retainedUserFacts") && text.contains("QSB-7042"))));
+    assert!(!messages.iter().any(|m| m["role"] == "user"
+        && m["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("QSB-7042"))));
+}
+
+#[tokio::test]
 async fn normal_chat_does_not_summarize_or_create_a_checkpoint() {
     let f = Fixture::new().await;
     let request = f.request("hello");
@@ -304,6 +371,16 @@ async fn threshold_compacts_only_complete_prefix_and_keeps_recent_turns_latest_i
     let request = f.request("最新问题必须原样保留");
     let frames = f.chat(request.clone()).await.unwrap();
     assert_eq!(frames.last().unwrap()["event"], "done");
+    let statuses: Vec<_> = frames
+        .iter()
+        .filter(|frame| frame["event"] == "context")
+        .map(|frame| &frame["status"])
+        .collect();
+    assert!(statuses.iter().any(|status| status["phase"] == "running"));
+    assert!(statuses
+        .iter()
+        .any(|status| status["phase"] == "succeeded" && status["compactionCount"] == 1));
+    assert_eq!(statuses.last().unwrap()["usage"]["source"], "estimated");
     assert_eq!(f.summaries(), 1);
     assert_eq!(f.streams(), 1);
     let checkpoint = f.repo.checkpoint(&f.session, "default").unwrap().unwrap();
@@ -399,6 +476,14 @@ async fn network_summary_error_is_not_retried_and_can_fall_back_without_claiming
     );
     assert_eq!(f.summaries(), 1);
     assert_eq!(f.streams(), 1);
+    let status = f
+        .manager
+        .context_status("model".into(), "default".into(), f.session.clone())
+        .await
+        .unwrap();
+    assert!(matches!(status.phase, context_status::Phase::Failed));
+    assert!(status.fallback);
+    assert_eq!(status.compaction_count, 0);
     assert!(f.repo.checkpoint(&f.session, "default").unwrap().is_none());
 }
 #[tokio::test]
@@ -876,9 +961,19 @@ async fn c4_stop_then_continue_uses_new_goal_and_keeps_constraints_and_empty_nat
     let request = f.request("这条被停止");
     assert!(matches!(
         f.manager
-            .chat(request, None, &CancellationToken::new(), |_| async {
-                Err(chat::Error::Model(ModelError::Cancelled))
-            })
+            .chat(
+                request,
+                None,
+                &CancellationToken::new(),
+                |event| async move {
+                    // This scenario stops after preparation; C5 metadata is acknowledged first.
+                    if matches!(event, StreamEvent::Context { .. }) {
+                        Ok(())
+                    } else {
+                        Err(chat::Error::Model(ModelError::Cancelled))
+                    }
+                }
+            )
             .await,
         Err(chat::Error::Model(ModelError::Cancelled))
     ));

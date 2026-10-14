@@ -4,6 +4,8 @@
 
 B4 已接通前端“设置 → 模型设置”和基础文本 AI 面板，使用本适配器的加密配置；使用说明见 [模型设置教程](../../ai-ssh-terminal-client/docs/agent-model-settings.md)。B2 基础文本 IPC/Channel 见 [AGENT_CHAT.md](AGENT_CHAT.md)，B3 持久轮次与恢复见 [AGENT_TURNS.md](AGENT_TURNS.md)。C2 已在文字请求前接入普通模型自动整理，C3 已补 Responses 与明确启用的远端整理；工具执行与聊天附件仍未开放。
 
+C5 已在 AI 面板展示最近输入占用、估算/供应商计数来源和真实整理状态；状态读取不解密模型凭据、不调用供应商。计数与当前容量快照分开，详见 AGENT_CHAT.md 与客户端模型设置教程。
+
 ## 文件与入口
 
 | 文件 | 作用 |

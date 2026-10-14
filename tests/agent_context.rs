@@ -87,6 +87,7 @@ fn content(snapshot: &shellpilot_server::agent::Snapshot) -> CheckpointContent {
         summary: "已检查错误日志，下一步检查 upstream，不要重启服务".into(),
         next_steps: vec!["读取 upstream 配置".into()],
         evidence_event_ids: vec![],
+        retained_user_facts: vec![],
         pending_tool_call_ids: snapshot.pending_tool_call_ids.clone(),
         uncertain_tool_call_ids: snapshot.uncertain_tool_call_ids.clone(),
     }
@@ -405,7 +406,7 @@ fn restart_restores_checkpoint_raw_events_and_uncertain_actions() {
         schema
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        10
+        11
     );
 }
 #[test]

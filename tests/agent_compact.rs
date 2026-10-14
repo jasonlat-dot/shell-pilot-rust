@@ -78,7 +78,7 @@ async fn handler(
     let source: Value =
         serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
     let document = json!({"summary":"已分析日志中的 upstream 超时，尚未重启；下一步核实配置。",
-        "nextSteps":["只读核实 upstream 配置"],"evidenceEventIds":[source["availableEvidenceEventIds"].as_array().unwrap().last().unwrap()]});
+        "nextSteps":["只读核实 upstream 配置"],"retainedUserFacts":[],"evidenceEventIds":[source["availableEvidenceEventIds"].as_array().unwrap().last().unwrap()]});
     let response = match reply {
         Reply::Envelope(response) => response,
         Reply::Text(text) => envelope(Some(text), None),
@@ -249,7 +249,152 @@ impl Fixture {
     }
 }
 fn document(id: u64) -> Value {
-    json!({"summary":"已检查日志，执行结果仍需核实","nextSteps":["只读核实状态"],"evidenceEventIds":[id]})
+    json!({"summary":"已检查日志，执行结果仍需核实","nextSteps":["只读核实状态"],"retainedUserFacts":[],"evidenceEventIds":[id]})
+}
+
+#[tokio::test]
+async fn retained_user_fact_survives_five_forgetful_resummaries_and_sqlite_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("facts.sqlite3");
+    let f = Fixture::with_store(Arc::new(Store::open(&path).unwrap())).await;
+    let quote = "恢复演练的报告编号是 QSB-7042";
+    let evidence = f.append(Payload::UserMessage {
+        text: format!("补充公开事实：{quote}，请保留。"),
+    });
+    let mut reply = document(evidence.id);
+    reply["retainedUserFacts"] = json!([{"eventId":evidence.id,"quote":quote}]);
+    f.respond(Reply::Text(reply.to_string()));
+    let draft = f.summarize().await.unwrap();
+    assert!(!draft.content.summary.contains("QSB-7042"));
+    assert_eq!(draft.content.retained_user_facts[0].quote, quote);
+    f.repo
+        .save_checkpoint(&draft.snapshot, draft.content)
+        .unwrap();
+
+    for _ in 0..5 {
+        let next = f.append(Payload::UserMessage {
+            text: "只讨论下一轮日志排查，不复述其他话题。".into(),
+        });
+        // The model again omits the fact from both prose and new facts. The host must retain it.
+        f.respond(Reply::Text(document(next.id).to_string()));
+        let draft = f.summarize().await.unwrap();
+        assert_eq!(draft.content.retained_user_facts.len(), 1);
+        assert_eq!(draft.content.retained_user_facts[0].quote, quote);
+        assert!(draft.content.evidence_event_ids.contains(&evidence.id));
+        assert_eq!(
+            f.source()["previousCheckpoint"]["content"]["retainedUserFacts"][0]["quote"],
+            quote
+        );
+        let mut dropped = draft.content.clone();
+        dropped.retained_user_facts.clear();
+        assert!(f.repo.save_checkpoint(&draft.snapshot, dropped).is_err());
+        assert_eq!(f.snapshot(), draft.snapshot);
+        f.repo
+            .save_checkpoint(&draft.snapshot, draft.content)
+            .unwrap();
+    }
+    let session = f.session.id.clone();
+    let raw = f.events();
+    drop(f);
+    let repo = Repository::new(Arc::new(Store::open(&path).unwrap()));
+    let checkpoint = repo.checkpoint(&session, "alice").unwrap().unwrap();
+    assert_eq!(checkpoint.content.retained_user_facts[0].quote, quote);
+    assert_eq!(repo.events(&session, "alice", 0, 200).unwrap(), raw);
+}
+
+#[tokio::test]
+async fn retained_facts_reject_fabricated_assistant_foreign_future_or_oversized_quotes() {
+    let f = Fixture::new().await;
+    let original = f.append(Payload::UserMessage {
+        text: "公开报告编号 QSB-7042".into(),
+    });
+    let assistant = f.append(Payload::AssistantMessage {
+        text: "模型猜测报告编号 QSB-9999".into(),
+    });
+    let foreign = f.repo.create_session("model", "alice").unwrap();
+    let foreign_event = f
+        .repo
+        .append(
+            &foreign.id,
+            "alice",
+            0,
+            "foreign-fact",
+            Payload::UserMessage {
+                text: "foreign-fact".into(),
+            },
+        )
+        .unwrap()
+        .event;
+    let cases = [
+        json!([{"eventId":original.id,"quote":"QSB-9999"}]),
+        json!([{"eventId":assistant.id,"quote":"QSB-9999"}]),
+        json!([{"eventId":foreign_event.id,"quote":"foreign-fact"}]),
+        json!([{"eventId":u64::MAX,"quote":"QSB-7042"}]),
+        json!([{"eventId":original.id,"quote":"x".repeat(513)}]),
+        json!([{"eventId":original.id,"quote":" "}]),
+        json!([{"eventId":original.id,"quote":"QSB-7042","permission":"execute"}]),
+    ];
+    let snapshot = f.snapshot();
+    let raw = f.events();
+    for facts in cases {
+        let mut reply = document(original.id);
+        reply["retainedUserFacts"] = facts;
+        f.respond(Reply::Text(reply.to_string()));
+        assert!(matches!(f.summarize().await, Err(Error::InvalidSummary)));
+        f.assert_unchanged(&snapshot, &raw);
+    }
+    let mut missing = document(original.id);
+    missing.as_object_mut().unwrap().remove("retainedUserFacts");
+    f.respond(Reply::Text(missing.to_string()));
+    assert!(matches!(f.summarize().await, Err(Error::InvalidSummary)));
+}
+
+#[test]
+fn legacy_checkpoints_read_without_facts_and_fact_quota_is_not_silently_truncated() {
+    let legacy = json!({"task":null,"summary":"old summary","nextSteps":[],"evidenceEventIds":[],"pendingToolCallIds":[],"uncertainToolCallIds":[]});
+    let mut content: CheckpointContent = serde_json::from_value(legacy).unwrap();
+    assert!(content.retained_user_facts.is_empty());
+    let store = Arc::new(Store::in_memory().unwrap());
+    let repo = Repository::new(store);
+    let session = repo.create_session("model", "alice").unwrap();
+    let text = (0..33)
+        .map(|i| format!("public-fact-{i};"))
+        .collect::<String>();
+    let event = repo
+        .append(
+            &session.id,
+            "alice",
+            0,
+            "facts",
+            Payload::UserMessage { text },
+        )
+        .unwrap()
+        .event;
+    content.evidence_event_ids.push(event.id);
+    content.retained_user_facts = (0..32)
+        .map(|i| RetainedUserFact {
+            event_id: event.id,
+            quote: format!("public-fact-{i};"),
+        })
+        .collect();
+    let snap = repo.snapshot(&session.id, "alice").unwrap();
+    repo.save_checkpoint(&snap, content.clone()).unwrap();
+    content.retained_user_facts.push(RetainedUserFact {
+        event_id: event.id,
+        quote: "public-fact-32;".into(),
+    });
+    let snap = repo.snapshot(&session.id, "alice").unwrap();
+    assert!(repo.save_checkpoint(&snap, content).is_err());
+    assert_eq!(repo.snapshot(&session.id, "alice").unwrap(), snap);
+    assert_eq!(
+        repo.checkpoint(&session.id, "alice")
+            .unwrap()
+            .unwrap()
+            .content
+            .retained_user_facts
+            .len(),
+        32
+    );
 }
 
 #[tokio::test]
@@ -309,26 +454,26 @@ async fn semantic_draft_uses_owner_model_and_cannot_change_task_or_pending_unkno
 #[tokio::test]
 async fn malformed_summary_matrix_is_rejected_without_log_changes_or_retry() {
     let values = vec![
-        json!({"summary":"","nextSteps":[],"evidenceEventIds":[2]}),
-        json!({"summary":"x","nextSteps":[],"evidenceEventIds":[]}),
-        json!({"summary":"x","nextSteps":[],"evidenceEventIds":[0]}),
-        json!({"summary":"x","nextSteps":[],"evidenceEventIds":[2,2]}),
-        json!({"summary":"x","nextSteps":[],"evidenceEventIds":[999999]}),
-        json!({"summary":"x","nextSteps":[],"evidenceEventIds":[2],"permission":"allow-all"}),
-        json!({"summary":"x","nextSteps":[],"evidenceEventIds":[2],"task":{"target":"other"}}),
-        json!({"summary":"x","evidenceEventIds":[2]}),
-        json!({"summary":"x","nextSteps":[" "],"evidenceEventIds":[2]}),
-        json!({"summary":"x","nextSteps":vec!["step";33],"evidenceEventIds":[2]}),
-        json!({"summary":"x","nextSteps":["x".repeat(4001)],"evidenceEventIds":[2]}),
-        json!({"summary":"🙂".repeat(4001),"nextSteps":[],"evidenceEventIds":[2]}),
-        json!({"summary":"x","nextSteps":[],"evidenceEventIds":vec![2;201]}),
+        json!({"summary":"","nextSteps":[],"retainedUserFacts":[],"evidenceEventIds":[2]}),
+        json!({"summary":"x","nextSteps":[],"retainedUserFacts":[],"evidenceEventIds":[]}),
+        json!({"summary":"x","nextSteps":[],"retainedUserFacts":[],"evidenceEventIds":[0]}),
+        json!({"summary":"x","nextSteps":[],"retainedUserFacts":[],"evidenceEventIds":[2,2]}),
+        json!({"summary":"x","nextSteps":[],"retainedUserFacts":[],"evidenceEventIds":[999999]}),
+        json!({"summary":"x","nextSteps":[],"retainedUserFacts":[],"evidenceEventIds":[2],"permission":"allow-all"}),
+        json!({"summary":"x","nextSteps":[],"retainedUserFacts":[],"evidenceEventIds":[2],"task":{"target":"other"}}),
+        json!({"summary":"x","retainedUserFacts":[],"evidenceEventIds":[2]}),
+        json!({"summary":"x","nextSteps":[" "],"retainedUserFacts":[],"evidenceEventIds":[2]}),
+        json!({"summary":"x","nextSteps":vec!["step";33],"retainedUserFacts":[],"evidenceEventIds":[2]}),
+        json!({"summary":"x","nextSteps":["x".repeat(4001)],"retainedUserFacts":[],"evidenceEventIds":[2]}),
+        json!({"summary":"🙂".repeat(4001),"nextSteps":[],"retainedUserFacts":[],"evidenceEventIds":[2]}),
+        json!({"summary":"x","nextSteps":[],"retainedUserFacts":[],"evidenceEventIds":vec![2;201]}),
     ];
     let mut cases: Vec<String> = values.into_iter().map(|v| v.to_string()).collect();
     cases.extend([
         "{invalid-private-response".into(),
         "null".into(),
         "~~~json\n{\"summary\":\"x\"}\n~~~".into(),
-        r#"{"summary":"x","summary":"duplicate","nextSteps":[],"evidenceEventIds":[2]}"#.into(),
+        r#"{"summary":"x","summary":"duplicate","nextSteps":[],"retainedUserFacts":[],"evidenceEventIds":[2]}"#.into(),
     ]);
     for text in cases {
         let f = Fixture::new().await;
@@ -497,6 +642,7 @@ async fn previous_checkpoint_is_input_and_explicit_cas_commit_keeps_raw_output_a
                 summary: "旧摘要保留未知输出".into(),
                 next_steps: vec!["核实结果".into()],
                 evidence_event_ids: vec![evidence],
+                retained_user_facts: vec![],
                 pending_tool_call_ids: snapshot.pending_tool_call_ids.clone(),
                 uncertain_tool_call_ids: snapshot.uncertain_tool_call_ids.clone(),
             },

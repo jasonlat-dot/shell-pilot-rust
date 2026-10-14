@@ -164,6 +164,7 @@ mod tests {
             summary: "native reference".into(),
             next_steps: vec![],
             evidence_event_ids: vec![event.id],
+            retained_user_facts: vec![],
             pending_tool_call_ids: vec![],
             uncertain_tool_call_ids: vec![],
         };

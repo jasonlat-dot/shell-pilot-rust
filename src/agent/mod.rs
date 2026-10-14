@@ -2,6 +2,8 @@
 pub mod budget;
 pub mod chat;
 pub mod compact;
+pub mod context_status;
+mod facts;
 mod live;
 pub mod model;
 mod projects;

@@ -159,9 +159,19 @@ fn new_request_id() -> String {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum StreamEvent {
-    Text { content: String },
-    Done { content: String },
-    Error { content: String, code: String },
+    Context {
+        status: super::context_status::Status,
+    },
+    Text {
+        content: String,
+    },
+    Done {
+        content: String,
+    },
+    Error {
+        content: String,
+        code: String,
+    },
 }
 type ActiveKey = (String, String);
 struct Active {
@@ -184,9 +194,23 @@ struct Running<'a> {
     owner: String,
     partial: Arc<Mutex<String>>,
     finished: bool,
+    observation: Option<super::context_status::Observation>,
 }
 impl Drop for Running<'_> {
     fn drop(&mut self) {
+        if let Some(observation) = self.observation.take() {
+            let code = if self.token.is_cancelled() {
+                "AGENT_CANCELLED"
+            } else {
+                "AGENT_INTERRUPTED"
+            };
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn_blocking(move || {
+                    let _ = observation
+                        .apply(super::context_status::Update::Finished(Some(code.into())));
+                });
+            }
+        }
         self.token.cancel();
         self.heartbeat.cancel();
         self.manager.active.lock().unwrap().remove(&self.key);
@@ -217,6 +241,21 @@ async fn worker<T: Send + 'static>(
     tokio::task::spawn_blocking(action)
         .await
         .map_err(|_| Error::Storage)?
+}
+async fn forward_context<F, Fut>(
+    observation: &super::context_status::Observation,
+    update: super::context_status::Update,
+    send: &mut F,
+) -> Result<()>
+where
+    F: FnMut(StreamEvent) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let observed = observation.clone();
+    if let Some(status) = worker(move || observed.apply(update)).await? {
+        send(StreamEvent::Context { status }).await?;
+    }
+    Ok(())
 }
 fn validate(request: &Request) -> Result<()> {
     for id in [
@@ -502,6 +541,15 @@ impl Manager {
         let turns = Turns::new(self.store.clone());
         worker(move || turns.history(&agent, &user, &session, after, limit)).await
     }
+    pub async fn context_status(
+        &self,
+        agent: String,
+        user: String,
+        session: String,
+    ) -> Result<super::context_status::Status> {
+        let store = self.store.clone();
+        worker(move || super::context_status::read(store, &agent, &user, &session)).await
+    }
     pub async fn events(
         &self,
         agent: String,
@@ -675,15 +723,51 @@ impl Manager {
             owner: owner.clone(),
             partial: partial.clone(),
             finished: true,
+            observation: None,
         };
-        let prepared =
+        use super::context_status::{Observation, Reporter, Source, Update};
+        let store = self.store.clone();
+        let r = request.clone();
+        let observation = worker(move || Observation::begin(store, &r)).await?;
+        running.observation = Some(observation.clone());
+        let (reporter, mut updates) = Reporter::channel(observation.clone());
+        let controller =
             super::compact::auto::Controller::with_source(self.store.clone(), self.live.clone())
+                .with_reporter(reporter.clone());
+        let preparing = async {
+            let prepared = controller
                 .prepare_text(&request, target.clone(), &token, cancel)
                 .await?;
-        let prepared =
-            super::compact::auto::Controller::with_source(self.store.clone(), self.live.clone())
+            let prepared = controller
                 .refresh_text(prepared, &request, target.clone(), &token, cancel)
                 .await?;
+            let (tokens, source) = if let Some(response) = &prepared.responses {
+                (response.input_tokens, Source::ProviderCount)
+            } else {
+                (
+                    super::provider::measure_request(&prepared.runtime.config, &prepared.request)?
+                        .estimated_input_tokens,
+                    Source::Estimated,
+                )
+            };
+            reporter.measured(&prepared.runtime.config, tokens, source)?;
+            Ok::<_, Error>(prepared)
+        };
+        tokio::pin!(preparing);
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        let prepared = loop {
+            tokio::select! {biased;
+                Some(update)=updates.recv()=>forward_context(&observation,update,&mut send).await?,
+                result=&mut preparing=>break result,
+                _=tick.tick()=>{let observed=observation.clone();worker(move||observed.heartbeat()).await?;},
+            }
+        };
+        while let Ok(update) = updates.try_recv() {
+            forward_context(&observation, update, &mut send).await?;
+        }
+        let failure = prepared.as_ref().err().map(|e| e.code().to_owned());
+        forward_context(&observation, Update::Finished(failure), &mut send).await?;
+        let prepared = prepared?;
         if token.is_cancelled() || cancel.is_cancelled() {
             return Err(ModelError::Cancelled.into());
         }
@@ -691,7 +775,7 @@ impl Manager {
         let response_prepared = prepared.responses;
         let chat = prepared.request;
         let revision = prepared.revision;
-        let target_for_admission = target;
+        let target_for_admission = target.clone();
         let turns = Turns::new(self.store.clone());
         let r = request.clone();
         let who = owner.clone();

@@ -24,6 +24,8 @@ impl Controller {
             .available_input()
             .map_err(|_| Error::CompactionLimit)?;
         let fits = before <= available;
+        self.reporter
+            .measured(&context.runtime.config, before, Source::ProviderCount)?;
         let trigger = u128::from(before) * 100
             >= u128::from(available) * u128::from(context.runtime.config.compact_percent);
         let force = context.events.len() >= 200;
@@ -82,6 +84,7 @@ impl Controller {
                 responses: Some(original),
             });
         }
+        self.reporter.emit(Update::Started(Method::Remote));
         let compacting = model.compact_responses(&source, &cancel.local);
         let candidate = tokio::select! {biased;
             _=cancel.caller.cancelled()=>return Err(ModelError::Cancelled.into()),
@@ -93,8 +96,16 @@ impl Controller {
                 cancel.check()?;
                 ensure_current(self.store.clone(), context.snapshot.clone()).await?;
                 if !fits {
+                    self.reporter.emit(Update::Failed {
+                        code: Error::from(error.clone()).code().into(),
+                        fallback: false,
+                    });
                     return Err(error.into());
                 }
+                self.reporter.emit(Update::Failed {
+                    code: Error::from(error).code().into(),
+                    fallback: true,
+                });
                 return Ok(Prepared {
                     runtime: context.runtime,
                     request: initial,
@@ -155,6 +166,10 @@ impl Controller {
             Ok(_) | Err(_) if fits => {
                 cancel.check()?;
                 ensure_current(self.store.clone(), context.snapshot.clone()).await?;
+                self.reporter.emit(Update::Failed {
+                    code: "AGENT_COMPACTION_LIMIT".into(),
+                    fallback: true,
+                });
                 return Ok(Prepared {
                     runtime: context.runtime,
                     request: initial,
@@ -189,6 +204,10 @@ impl Controller {
                 .into(),
             next_steps: vec![],
             evidence_event_ids: evidence,
+            retained_user_facts: context
+                .checkpoint
+                .as_ref()
+                .map_or_else(Vec::new, |c| c.content.retained_user_facts.clone()),
             pending_tool_call_ids: context.snapshot.pending_tool_call_ids.clone(),
             uncertain_tool_call_ids: context.snapshot.uncertain_tool_call_ids.clone(),
         };
@@ -196,6 +215,7 @@ impl Controller {
         let snap = context.snapshot.clone();
         self.check_live(request, &target).await?;
         let stop = cancel.clone();
+        let reporter = self.reporter.clone();
         let committed = worker(move || {
             stop.check()?;
             let result = repo.save_checkpoint_guarded_remote(
@@ -205,6 +225,9 @@ impl Controller {
                 Some(&window),
                 || stop.cancelled(),
             );
+            if let Ok(checkpoint) = &result {
+                reporter.emit(Update::Committed(checkpoint.id.clone()));
+            }
             stop.check()?;
             result.map_err(|error| match error {
                 crate::agent::Error::Stale => Error::ContextChanged,

@@ -475,6 +475,7 @@ fn event_link_keeps_only_preview_and_references_and_protects_full_evidence() {
                 summary: "已查证 upstream 拒绝连接，不重启服务".into(),
                 next_steps: vec!["查看 upstream 配置".into()],
                 evidence_event_ids: vec![receipt.event.id],
+                retained_user_facts: vec![],
                 pending_tool_call_ids: vec![],
                 uncertain_tool_call_ids: vec![],
             },

@@ -171,11 +171,20 @@ pub struct Snapshot {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetainedUserFact {
+    pub event_id: u64,
+    pub quote: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CheckpointContent {
     pub task: Option<Task>,
     pub summary: String,
     pub next_steps: Vec<String>,
     pub evidence_event_ids: Vec<u64>,
+    /// Bounded verbatim user evidence, never authority; carried across repeated summaries.
+    #[serde(default)]
+    pub retained_user_facts: Vec<RetainedUserFact>,
     pub pending_tool_call_ids: Vec<String>,
     pub uncertain_tool_call_ids: Vec<String>,
 }

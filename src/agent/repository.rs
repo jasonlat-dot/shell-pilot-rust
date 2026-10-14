@@ -262,11 +262,17 @@ impl Repository {
                     params![through,current.session.id],|r|r.get::<_,bool>(0))? {
                 return Err(Error::Invalid("invalid checkpoint frontier".into()));
             }
-            let old_through: u64 = if let Some(id)=&current.session.checkpoint_id {
-                tx.query_row("SELECT through_event_id FROM agent_checkpoints WHERE id=?1 AND session_id=?2",
-                    params![id,current.session.id],|r|r.get(0))?
-            } else { 0 };
+            let (old_through, old_facts) = if let Some(id)=&current.session.checkpoint_id {
+                let (frontier, json):(u64,String)=tx.query_row("SELECT through_event_id,content FROM agent_checkpoints WHERE id=?1 AND session_id=?2",
+                    params![id,current.session.id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+                (frontier,serde_json::from_str::<CheckpointContent>(&json)?.retained_user_facts)
+            } else { (0,vec![]) };
             if through<old_through { return Err(Error::Invalid("checkpoint frontier cannot move backwards".into())); }
+            super::facts::validate(&tx,&current.session.id,through,&content.retained_user_facts)?;
+            if old_facts.iter().any(|fact| !content.retained_user_facts.contains(fact))
+                || content.retained_user_facts.iter().any(|fact| !content.evidence_event_ids.contains(&fact.event_id)) {
+                return Err(Error::Invalid("checkpoint must preserve retained user facts and their evidence".into()));
+            }
             if through<current.through_event_id && tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM agent_events c WHERE c.session_id=?1 AND c.kind='tool_call'
                  AND c.id<=?2 AND NOT EXISTS(SELECT 1 FROM agent_events r WHERE r.session_id=c.session_id
