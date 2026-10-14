@@ -233,6 +233,16 @@ impl Repository {
         content: CheckpointContent,
         cancelled: impl Fn() -> bool,
     ) -> Result<Checkpoint> {
+        self.save_checkpoint_guarded_remote(snapshot, through, content, None, cancelled)
+    }
+    pub(crate) fn save_checkpoint_guarded_remote(
+        &self,
+        snapshot: &Snapshot,
+        through: u64,
+        content: CheckpointContent,
+        remote: Option<&super::provider::responses::ResponseWindow>,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Checkpoint> {
         model::text_value(&content.summary, 16000)?;
         model::text_list(&content.next_steps)?;
         if content.evidence_event_ids.len() > 200
@@ -289,6 +299,7 @@ impl Repository {
                 params![checkpoint.id,checkpoint.committed_revision,checkpoint.session_id,checkpoint.source_revision])? != 1 {
                 return Err(Error::Stale);
             }
+            if let Some(remote)=remote { super::responses_store::save_checkpoint(&tx,&checkpoint.id,remote)?; }
             if cancelled() { return Err(Error::Conflict); }
             tx.commit()?; Ok(checkpoint)
         })

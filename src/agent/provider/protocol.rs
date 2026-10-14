@@ -21,6 +21,10 @@ pub struct ToolCall {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "lowercase", deny_unknown_fields)]
 pub enum ChatMessage {
+    #[serde(skip)]
+    Responses {
+        window: super::responses::ResponseWindow,
+    },
     System {
         content: String,
     },
@@ -121,6 +125,16 @@ pub(crate) fn measure_request(
     request: &ChatRequest,
 ) -> Result<PreparedRequest> {
     let config = config.clone().normalized()?;
+    if config.provider == ProviderKind::OpenAiResponses {
+        return super::responses::measure(&config, request);
+    }
+    if request
+        .messages
+        .iter()
+        .any(|m| matches!(m, ChatMessage::Responses { .. }))
+    {
+        return Err(ModelError::ContextMismatch);
+    }
     if request.messages.is_empty() || request.messages.len() > 1024 || request.tools.len() > 64 {
         return Err(ModelError::Invalid("message/tool count out of range"));
     }
@@ -231,6 +245,8 @@ pub struct Completion {
     pub message: AssistantReply,
     pub usage: Option<Usage>,
     pub finish_reason: String,
+    #[serde(skip)]
+    pub(crate) response_output: Option<super::responses::ResponseWindow>,
 }
 #[derive(Deserialize)]
 struct Choice {
@@ -280,5 +296,6 @@ pub(crate) fn decode_response(bytes: &[u8], allowed: &HashSet<String>) -> Result
         message: choice.message,
         usage: response.usage,
         finish_reason: choice.finish_reason,
+        response_output: None,
     })
 }

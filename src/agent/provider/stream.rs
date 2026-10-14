@@ -7,12 +7,12 @@ use tokio_util::sync::CancellationToken;
 
 /// Byte framing keeps UTF-8 correct across arbitrary HTTP chunk boundaries.
 #[derive(Default)]
-struct Sse {
+pub(super) struct Sse {
     line: Vec<u8>,
     data: String,
 }
 impl Sse {
-    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>> {
+    pub(super) fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>> {
         let mut frames = Vec::new();
         for &byte in bytes {
             if byte != b'\n' {
@@ -73,6 +73,9 @@ impl ModelClient {
         F: FnMut(String) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
+        if self.config.provider == ProviderKind::OpenAiResponses {
+            return self.stream_responses(request, cancel, on_text).await;
+        }
         if cancel.is_cancelled() {
             return Err(ModelError::Cancelled);
         }

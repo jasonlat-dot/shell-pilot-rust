@@ -49,3 +49,5 @@ mod output_model;
 mod output_writer;
 pub use output_model::*;
 pub use output_writer::{CaptureStart, OutputWriter};
+
+pub(crate) mod responses_store;

@@ -124,6 +124,7 @@ impl Fixture {
                 ModelConfigUpdate {
                     config: ModelConfig {
                         provider: ProviderKind::OpenAiCompatible,
+                        remote_compaction: false,
                         base_url: base,
                         completions_path: "chat/completions".into(),
                         model: "test-text".into(),

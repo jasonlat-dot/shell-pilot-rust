@@ -212,6 +212,14 @@ fn finish_row(
             params![next_revision(s.revision)?, task_json, session, s.revision],
         ))?;
     }
+    if completed {
+        if let (Some(event), Some(output)) = (
+            assistant_event_id,
+            completion.and_then(|c| c.response_output.as_ref()),
+        ) {
+            super::responses_store::save_turn(db, event, output).map_err(Error::from)?;
+        }
+    }
     let state = match state {
         TurnState::Running => return Err(Error::Invalid),
         TurnState::Completed => "completed",
@@ -444,6 +452,7 @@ mod tests {
                 total_tokens: 12,
             }),
             finish_reason: "stop".into(),
+            response_output: None,
         }
     }
     #[test]

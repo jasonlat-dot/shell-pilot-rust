@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 /// Intentionally not Debug: credentials remain inside the native request headers.
 pub struct ModelClient {
     pub(super) config: ModelConfig,
+    pub(super) binding: super::responses::Binding,
     pub(super) client: Client,
     pub(super) authorization: Option<header::HeaderValue>,
 }
@@ -19,6 +20,7 @@ pub(super) fn network(error: reqwest::Error) -> ModelError {
 }
 impl ModelClient {
     pub fn new(runtime: RuntimeConfig) -> Result<Self> {
+        let binding = super::responses::Binding::from_runtime(&runtime)?;
         let config = runtime.config.normalized()?;
         if config.require_api_key && runtime.api_key.is_none() {
             return Err(ModelError::KeyMissing);
@@ -48,6 +50,7 @@ impl ModelClient {
         }
         let client = builder.build().map_err(network)?;
         Ok(Self {
+            binding,
             config,
             client,
             authorization,
@@ -62,6 +65,9 @@ impl ModelClient {
     ) -> Result<Completion> {
         if cancel.is_cancelled() {
             return Err(ModelError::Cancelled);
+        }
+        if self.config.provider == ProviderKind::OpenAiResponses {
+            return self.complete_responses(request, cancel).await;
         }
         let prepared = prepare_request(&self.config, request)?;
         let operation = async {

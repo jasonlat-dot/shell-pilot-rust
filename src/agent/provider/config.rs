@@ -8,6 +8,7 @@ use url::Url;
 #[serde(rename_all = "camelCase")]
 pub enum ProviderKind {
     OpenAiCompatible,
+    OpenAiResponses,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,6 +53,8 @@ impl Default for ModelCapabilities {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelConfig {
     pub provider: ProviderKind,
+    #[serde(default)]
+    pub remote_compaction: bool,
     /// Base includes any proxy prefix, e.g. https://api.openai.com/v1/.
     pub base_url: String,
     /// Relative suffix, e.g. chat/completions. No absolute URL or parent traversal.
@@ -86,6 +89,9 @@ impl ModelConfig {
             return Err(ModelError::Invalid("model name is empty or too long"));
         }
         self.model = self.model.trim().into();
+        if self.remote_compaction && self.provider != ProviderKind::OpenAiResponses {
+            return Err(ModelError::Invalid("remote compaction requires Responses"));
+        }
         if !(256..=16_777_216).contains(&self.context_window)
             || !(1..=600).contains(&self.timeout_seconds)
             || !(1024..=8 * 1024 * 1024).contains(&self.max_response_bytes)

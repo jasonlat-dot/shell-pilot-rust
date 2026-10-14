@@ -1,5 +1,6 @@
 //! C2: bounded pre-request compaction; immutable raw history, validated low-water commit and safe fallback.
 use super::{prefix_fits, Prefix, Summarizer};
+mod responses;
 use crate::{
     agent::{
         budget::group_history,
@@ -53,6 +54,7 @@ pub(crate) struct Prepared {
     pub runtime: RuntimeConfig,
     pub request: ChatRequest,
     pub revision: u64,
+    pub responses: Option<provider::responses::PreparedResponses>,
 }
 struct Context {
     snapshot: Snapshot,
@@ -60,6 +62,7 @@ struct Context {
     events: Vec<Event>,
     unfinished: HashSet<u64>,
     runtime: RuntimeConfig,
+    windows: crate::agent::responses_store::Windows,
 }
 #[derive(Clone)]
 struct Cancellation {
@@ -102,6 +105,11 @@ impl Controller {
         let t = target.clone();
         let mut context = worker(move || load(store, &r, t, None)).await?;
         cancel.check()?;
+        if context.runtime.config.provider == provider::ProviderKind::OpenAiResponses {
+            return self
+                .prepare_responses(context, request, target, cancel)
+                .await;
+        }
         let initial = project(&context, request, &target, None)?;
         // If mandatory live input alone cannot fit, no summary request is useful or authorized.
         let pinned = project(
@@ -118,6 +126,7 @@ impl Controller {
                 runtime: context.runtime,
                 request: initial,
                 revision: context.snapshot.session.revision,
+                responses: None,
             });
         }
         let original_fits = provider::prepare_request(&context.runtime.config, &initial).is_ok();
@@ -141,6 +150,7 @@ impl Controller {
                 runtime: context.runtime,
                 request: initial,
                 revision: context.snapshot.session.revision,
+                responses: None,
             });
         }
         // Bound local preflight as well as model retries. Binary search the largest whole prefix
@@ -182,6 +192,7 @@ impl Controller {
                     runtime: context.runtime,
                     request: initial,
                     revision: context.snapshot.session.revision,
+                    responses: None,
                 });
             }
             return Err(Error::CompactionLimit);
@@ -246,6 +257,7 @@ impl Controller {
                             runtime: context.runtime,
                             request: initial,
                             revision: context.snapshot.session.revision,
+                            responses: None,
                         });
                     }
                     return Err(error);
@@ -302,6 +314,7 @@ impl Controller {
                 runtime: context.runtime,
                 request: projected,
                 revision: context.snapshot.session.revision,
+                responses: None,
             });
         }
         cancel.check()?;
@@ -311,6 +324,7 @@ impl Controller {
                 runtime: context.runtime,
                 request: initial,
                 revision: context.snapshot.session.revision,
+                responses: None,
             })
         } else {
             Err(Error::CompactionLimit)
@@ -403,6 +417,17 @@ fn load(
             provider::ModelRepository::new(store).runtime(&request.agent_id, &request.user_id)?
         }
     };
+    let windows = crate::agent::responses_store::load(
+        &repo,
+        &request.session_id,
+        &request.user_id,
+        after,
+        snapshot.through_event_id,
+    )?;
+    crate::agent::responses_store::validate(
+        &windows,
+        &provider::responses::Binding::from_runtime(&runtime)?,
+    )?;
     if repo.snapshot(&request.session_id, &request.user_id)? != snapshot {
         return Err(Error::ContextChanged);
     }
@@ -412,6 +437,7 @@ fn load(
         events,
         unfinished,
         runtime,
+        windows,
     })
 }
 fn project(
@@ -435,7 +461,11 @@ fn project(
             .as_ref()
             .map_or((0, None), |c| (c.through_event_id, Some(&c.content)))
     });
-    if let Some(checkpoint) = checkpoint {
+    if let Some(window) = context.windows.0.as_ref().filter(|_| replacement.is_none()) {
+        messages.push(ChatMessage::Responses {
+            window: window.clone(),
+        });
+    } else if let Some(checkpoint) = checkpoint {
         let data = json!({"summary":checkpoint.summary,"nextSteps":checkpoint.next_steps,"evidenceEventIds":checkpoint.evidence_event_ids,
             "pendingToolCallIds":checkpoint.pending_tool_call_ids,"uncertainToolCallIds":checkpoint.uncertain_tool_call_ids});
         messages.push(ChatMessage::Assistant {
@@ -454,10 +484,16 @@ fn project(
             }),
             Payload::AssistantMessage { text } => {
                 messages.append(&mut pending);
-                messages.push(ChatMessage::Assistant {
-                    content: Some(text.clone()),
-                    tool_calls: vec![],
-                });
+                if let Some(window) = context.windows.1.get(&event.id) {
+                    messages.push(ChatMessage::Responses {
+                        window: window.clone(),
+                    });
+                } else {
+                    messages.push(ChatMessage::Assistant {
+                        content: Some(text.clone()),
+                        tool_calls: vec![],
+                    });
+                }
             }
             Payload::TaskStarted { .. } | Payload::Cancelled { .. } => pending.clear(),
             Payload::ToolCall { .. } | Payload::ToolResult { .. } => {

@@ -72,6 +72,8 @@ impl Error {
             Self::Model(ModelError::Cancelled) => "AGENT_CANCELLED",
             Self::Model(ModelError::Timeout) => "MODEL_TIMEOUT",
             Self::Model(ModelError::Incomplete) => "MODEL_INCOMPLETE",
+            Self::Model(ModelError::ContextMismatch) => "MODEL_CONTEXT_BINDING_CHANGED",
+            Self::Model(ModelError::RemoteUnsupported) => "MODEL_RESPONSES_UNSUPPORTED",
             Self::Model(ModelError::BudgetExceeded) => "MODEL_CONTEXT_LIMIT",
             Self::Model(ModelError::KeyMissing | ModelError::Credentials) => "MODEL_CREDENTIALS",
             Self::Model(ModelError::ResponseTooLarge) => "MODEL_RESPONSE_LIMIT",
@@ -481,6 +483,7 @@ impl Manager {
             return Err(ModelError::Cancelled.into());
         }
         let runtime = prepared.runtime;
+        let response_prepared = prepared.responses;
         let chat = prepared.request;
         let revision = prepared.revision;
         let target_for_admission = target;
@@ -526,7 +529,7 @@ impl Manager {
         let mut persisted = 0usize;
         let mut last_save = std::time::Instant::now();
         let result = tokio::select! {biased;_=cancel.cancelled()=>Err(ModelError::Cancelled),
-        result=client.stream(&chat,&token,|content| {
+        result=client.stream_with_responses(&chat, response_prepared,&token,|content| {
             let current={let mut text=partial.lock().unwrap();text.push_str(&content);text.clone()};
             let save=persisted==0||current.len().saturating_sub(persisted)>=1024||last_save.elapsed()>=std::time::Duration::from_millis(250);
             if save{persisted=current.len();last_save=std::time::Instant::now();}

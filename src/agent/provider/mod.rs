@@ -2,6 +2,7 @@
 mod config;
 mod protocol;
 mod repository;
+pub mod responses;
 mod stream;
 mod transport;
 pub use config::*;
@@ -37,6 +38,12 @@ pub enum ModelError {
     Http(u16),
     #[error("Model response exceeded the configured size limit")]
     ResponseTooLarge,
+    #[error("Stored Responses context belongs to another model endpoint or credential; start a new conversation")]
+    ContextMismatch,
+    #[error(
+        "The configured Responses provider does not support token counting or remote compaction"
+    )]
+    RemoteUnsupported,
     #[error("Model provider returned an invalid response")]
     Response,
     #[error("Model response was incomplete or filtered")]

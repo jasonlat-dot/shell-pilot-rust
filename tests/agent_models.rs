@@ -21,6 +21,7 @@ const TEST_KEY: &str = "unit-test-model-key";
 fn config() -> ModelConfig {
     ModelConfig {
         provider: ProviderKind::OpenAiCompatible,
+        remote_compaction: false,
         base_url: "https://model.example/v1/".into(),
         completions_path: "chat/completions".into(),
         model: "test-model".into(),
@@ -338,7 +339,7 @@ fn schema_upgrade_preserves_existing_agent_sessions() {
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        7
+        8
     );
     assert_eq!(
         db.query_row("SELECT count(*) FROM agent_sessions", [], |r| r
