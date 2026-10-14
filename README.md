@@ -22,15 +22,49 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ~~~
 
-这些是供开发者执行的命令，本轮按用户要求未实际执行。
+运行桌面应用需要同时取得以下两个仓库，当前 Rust 重构使用的客户端分支是 `test-rust-ui`：
 
-运行桌面应用，在兄弟客户端目录执行：
+| 项目 | 仓库 | 分支 | 本地目录名 |
+| --- | --- | --- | --- |
+| 桌面客户端（React / Tauri） | [ai-ssh-terminal-client](https://github.com/jasonlat-dot/ai-ssh-terminal-client) | `test-rust-ui` | `ai-ssh-terminal-client` |
+| Rust 业务库（本仓库） | [shell-pilot-rust](https://github.com/jasonlat-dot/shell-pilot-rust) | `main` | `ai-ssh-terminal-server-rust` |
+
+**按当前默认配置，两个仓库需要放在同一个父目录下，彼此平级。** 它们是两个独立的 Git 仓库，不是把 Rust 库放进客户端内部。父目录的名称和位置可以自行决定：
+
+~~~text
+你的开发目录/
+├── ai-ssh-terminal-client/
+│   ├── package.json
+│   ├── scripts/prepare-backend-bundle.ps1
+│   └── src-tauri/Cargo.toml
+└── ai-ssh-terminal-server-rust/
+    ├── Cargo.toml
+    └── src/
+~~~
+
+注意：本仓库的远端名称是 `shell-pilot-rust`，但当前客户端默认查找的本地目录名是 `ai-ssh-terminal-server-rust`。克隆时显式指定目标目录即可，不需要修改远端仓库名称。
+
+首次准备时，在选定的父目录执行；已经克隆好的仓库不需要重复克隆：
 
 ~~~powershell
+git clone --branch main https://github.com/jasonlat-dot/shell-pilot-rust.git ai-ssh-terminal-server-rust
+git clone --branch test-rust-ui https://github.com/jasonlat-dot/ai-ssh-terminal-client.git ai-ssh-terminal-client
+cd ai-ssh-terminal-client
+npm ci
+npm run prepare:backend
 npm run tauri dev
 ~~~
 
-客户端 `src-tauri/Cargo.toml` 通过路径依赖引用本库。Tauri 初始化 `Services::native`，前端通过 invoke/Channel 进入 Tauri Rust 桥，再直接调用本库函数。桌面业务不监听本地 HTTP 端口，不提供远程后端配置。
+`npm ci` 安装客户端依赖；`npm run prepare:backend` 检查 Rust 库位置并准备说明/许可证资源，不会启动或单独编译后端；`npm run tauri dev` 启动开发界面，并由 Cargo 把 Rust 库编译进桌面程序。开发环境准备好后，后续通常只需在客户端根目录运行 `npm run tauri dev`。如果已经位于本仓库根目录，默认布局下先执行 `cd ../ai-ssh-terminal-client`。
+
+如果希望使用其他目录名或非平级结构，需要同步调整客户端的两处路径，确保都指向同一份 Rust 业务库：
+
+- `src-tauri/Cargo.toml` 中的 `shellpilot-server = { path = "../../ai-ssh-terminal-server-rust" }`：`path` 相对于客户端的 `src-tauri` 目录计算，指向包含本库 `Cargo.toml` 的目录。
+- `scripts/prepare-backend-bundle.ps1` 中的 `$serverManifest = Join-Path $clientRoot '..\ai-ssh-terminal-server-rust\Cargo.toml'`：这里相对于客户端根目录计算，指向本库的 `Cargo.toml` 文件；该脚本也会从这个位置复制许可证，打包时会调用它。
+
+只修改 Cargo 依赖路径，会导致资源准备/打包脚本仍按旧布局查找；只修改脚本，则 Cargo 仍找不到业务库。保留上面的默认平级结构可以省去这些修改。
+
+Tauri 初始化 `Services::native`，前端通过 invoke/Channel 进入 Tauri Rust 桥，再直接调用本库函数。无需另外启动 Rust 服务；桌面业务不监听本地 HTTP 端口，不提供远程后端配置。
 
 数据目录由桌面设置管理，默认 SQLite 与附件位于 `%LOCALAPPDATA%\com.jasonlat.shellpilot.rust-preview\backend-data`。数据与原 Java 版相互独立，尚无 MySQL 数据导入工具。
 
