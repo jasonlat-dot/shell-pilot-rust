@@ -890,3 +890,171 @@ async fn delivery_failure_after_complete_commit_does_not_retroactively_cancel_th
         .unwrap();
     assert_eq!(f.mock.bodies.lock().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn fragmented_multiline_sse_with_comments_and_usage_preserves_raw_text() {
+    let text = "中文🙂\n~~~json\n{\"content\":\"literal\",\"path\":\"C:\\\\tmp\"}\n~~~";
+    let multiline = serde_json::to_string_pretty(&json!({
+        "choices":[{"index":0,"delta":{"role":"assistant","content":text},"finish_reason":null}]
+    }))
+    .unwrap()
+    .lines()
+    .map(|line| format!("data: {line}\r\n"))
+    .collect::<String>();
+    let data = format!(
+        ": keepalive\r\nevent: message\r\nid: ignored\r\n{multiline}\r\n{}data: {}\r\n\r\ndata: [DONE]\r\n\r\n",
+        chunk(None, Some("stop")),
+        json!({"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":8,"total_tokens":20}})
+    );
+    let f = Fixture::response(
+        data,
+        Duration::ZERO,
+        axum::http::StatusCode::OK,
+        "TEXT/EVENT-STREAM; charset=utf-8",
+    )
+    .await;
+    let r = f.request().await;
+    let mut received = Vec::new();
+    f.manager
+        .chat(r.clone(), None, &CancellationToken::new(), |event| {
+            received.push(event);
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+    assert!(matches!(received.last(), Some(StreamEvent::Done { content }) if content == text));
+    let turn = f.manager.receipt(r).await.unwrap().unwrap();
+    assert_eq!(turn.result_text.as_deref(), Some(text));
+    assert_eq!(turn.usage.unwrap().total_tokens, 20);
+    let bodies = f.mock.bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["stream"], true);
+    assert_eq!(bodies[0]["max_completion_tokens"], 512);
+    assert!(bodies[0].get("tools").is_none());
+}
+
+#[tokio::test]
+async fn stream_protocol_matrix_keeps_partial_evidence_without_success_or_automatic_retry() {
+    let cases = [
+        ("multiple choices", json!({"choices":[
+            {"index":0,"delta":{},"finish_reason":"stop"},
+            {"index":1,"delta":{},"finish_reason":"stop"}]}).to_string(), "MODEL_PROTOCOL_FAILED"),
+        ("wrong index", json!({"choices":[{"index":1,"delta":{},"finish_reason":"stop"}]}).to_string(), "MODEL_PROTOCOL_FAILED"),
+        ("wrong role", json!({"choices":[{"index":0,"delta":{"role":"user"},"finish_reason":null}]}).to_string(), "MODEL_PROTOCOL_FAILED"),
+        ("tool delta", json!({"choices":[{"index":0,"delta":{"tool_calls":[{"id":"tool"}]},"finish_reason":null}]}).to_string(), "MODEL_TOOL_PROTOCOL_FAILED"),
+        ("legacy function", json!({"choices":[{"index":0,"delta":{"function_call":{"name":"run"}},"finish_reason":null}]}).to_string(), "MODEL_TOOL_PROTOCOL_FAILED"),
+        ("refusal", json!({"choices":[{"index":0,"delta":{"refusal":"refused"},"finish_reason":null}]}).to_string(), "MODEL_INCOMPLETE"),
+        ("truncated", json!({"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}).to_string(), "MODEL_INCOMPLETE"),
+        ("filtered", json!({"choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}).to_string(), "MODEL_INCOMPLETE"),
+        ("invalid JSON", "{provider-secret:broken".into(), "MODEL_PROTOCOL_FAILED"),
+        ("premature marker", "[DONE]".into(), "MODEL_INCOMPLETE"),
+    ];
+    for (name, bad, code) in cases {
+        let f = Fixture::new(
+            format!("{}data: {bad}\n\n", chunk(Some("证据🙂"), None)),
+            Duration::ZERO,
+        )
+        .await;
+        let r = f.request().await;
+        let mut frames = Vec::new();
+        let error = f
+            .manager
+            .chat(r.clone(), None, &CancellationToken::new(), |event| {
+                frames.push(event);
+                async { Ok(()) }
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), code, "{name}");
+        assert!(!error.to_string().contains("provider-secret"), "{name}");
+        assert!(
+            !frames
+                .iter()
+                .any(|event| matches!(event, StreamEvent::Done { .. })),
+            "{name}"
+        );
+        let turn = f.manager.receipt(r.clone()).await.unwrap().unwrap();
+        assert_eq!(
+            turn.state,
+            shellpilot_server::agent::chat::TurnState::Failed,
+            "{name}"
+        );
+        assert_eq!(turn.partial_text, "证据🙂", "{name}");
+        assert!(turn.result_text.is_none(), "{name}");
+        assert!(
+            !f.events(&r.session_id)
+                .iter()
+                .any(|event| matches!(event.payload, Payload::AssistantMessage { .. })),
+            "{name}"
+        );
+        assert_eq!(
+            f.manager
+                .chat(r, None, &CancellationToken::new(), |_| async { Ok(()) })
+                .await
+                .unwrap_err()
+                .code(),
+            code,
+            "{name}"
+        );
+        assert_eq!(f.mock.bodies.lock().unwrap().len(), 1, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn response_and_sse_frame_limits_keep_the_delivered_prefix_without_retry() {
+    for (name, suffix, limit) in [
+        ("line", format!("data: {}\n\n", "x".repeat(65537)), 131072),
+        (
+            "multiline frame",
+            format!(
+                "{}\n",
+                "data: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n".repeat(2100)
+            ),
+            131072,
+        ),
+        (
+            "response without content length",
+            format!(": {}\n\n", "x".repeat(8192)),
+            4096,
+        ),
+    ] {
+        let f = Fixture::new(
+            format!("{}{suffix}", chunk(Some("bounded prefix"), None)),
+            Duration::ZERO,
+        )
+        .await;
+        let repository = ModelRepository::new(f.store.clone());
+        let profile = repository.get("agent", "default").unwrap();
+        let mut config = profile.config;
+        config.max_response_bytes = limit;
+        repository
+            .save(
+                "agent",
+                "default",
+                profile.revision,
+                ModelConfigUpdate {
+                    config,
+                    api_key: KeyChange::Keep,
+                },
+            )
+            .unwrap();
+        let r = f.request().await;
+        let error = f
+            .manager
+            .chat(r.clone(), None, &CancellationToken::new(), |_| async {
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "MODEL_RESPONSE_LIMIT", "{name}");
+        let turn = f.manager.receipt(r).await.unwrap().unwrap();
+        assert_eq!(turn.partial_text, "bounded prefix", "{name}");
+        assert_eq!(
+            turn.error_code.as_deref(),
+            Some("MODEL_RESPONSE_LIMIT"),
+            "{name}"
+        );
+        assert!(turn.result_text.is_none(), "{name}");
+        assert_eq!(f.mock.bodies.lock().unwrap().len(), 1, "{name}");
+    }
+}

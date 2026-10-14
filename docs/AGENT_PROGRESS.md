@@ -8,14 +8,15 @@ Rust 重构交接、已完成工作与运行方式见 [WORK_HANDOFF_2026-10-14.m
 
 ## 工作目录与约束
 
-- Rust：E:/project/AIShellTerminal/ai-ssh-terminal-server-rust
-- 前端：E:/project/AIShellTerminal/ai-ssh-terminal-client，分支 test-rust-ui
-- Java 参考：E:/project/AIShellTerminal/ai-ssh-terminal-server，保留原实现
+- Rust（当前本机）：E:/project/ShellPilot/ai-ssh-terminal-server-rust，main，HEAD ea46967（包含 c4bd68d）
+- 前端（当前本机）：E:/project/ShellPilot/ai-ssh-terminal-client，test-rust-ui，HEAD b7a9735
+- Java 参考（当前本机）：E:/project/ShellPilot/ai-ssh-terminal-server，保留原实现
 - Codex 参考：E:/project/ai-ssh/artifacts/codex-reference，提交 f82e36592278a0a782fb0d0fc97e5fa10e832ac2
 - 安装包：E:/project/ShellPilot/releases，最新 0.4.0；页签切换修复在源码，尚未打进安装包。
-- PowerShell；Git 位于 C:/Program Files/Git/cmd/git.exe，当前 Cargo 位于 C:/Users/Administrator/.cargo/bin/cargo.exe。
-- 当前 Node 位于 D:/softs/nodejs/node.exe。旧电脑的运行时路径只作为历史记录。
+- PowerShell；Git 位于 C:/Program Files/Git/cmd/git.exe，当前 Cargo 位于 C:/Users/kingdee/.cargo/bin/cargo.exe（1.99.0）。
+- 当前 Node 24.19.0：C:/Users/kingdee/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node.exe。旧电脑路径仅为历史记录。
 - 保留各仓库已有未提交变更；不连接用户远端、不执行实际变更命令来做测试。
+- 里程碑、测试结果和续接状态统一维护本文件，不再额外创建逐阶段验证文档；commit note 直接发给用户，不保存到文档。
 - SSH 任务绑定目标，切换 UI 页签不能改变在途任务目标。权限来自可信应用状态，模型摘要不产生权限。
 - 当前主要验证是临时目录/回环协议测试；真实模型、完整 GUI 和用户远端验证单独记录。
 - 后续前端变更需要同时做好功能和样式，优先复用客户端 main 分支的设计系统、Select/Ui 控件与主题参数；不能只接通功能后保留粗糙表单。相关界面需检查明暗主题、窄窗口和实际交互。
@@ -36,7 +37,7 @@ Rust 重构交接、已完成工作与运行方式见 [WORK_HANDOFF_2026-10-14.m
 - [x] B2 对接 agent 配置列表、create_session、chat_stream 和 stop_chat；保留现有前端事件协议。基础文本流式对话与本地 IPC/Channel 测试完成，UI 入口仍待 B4。
 - [x] B3 流式取消/超时/错误、同会话并发隔离、历史与恢复，不将 EOF 当成功。持久轮次、请求幂等、停止/完成事务排序及租约恢复已实现并通过回环测试；可见历史面板留给 B4。
 - [x] B4 前端模型设置和 Rust AI 入口；已在 B1–B3 后端测试基础上启用文本对话、模型切换及原生历史，配置桥和前端回归通过。
-- [ ] B5 真实回环模型协议联调，前端解析与停止/恢复回归。
+- [x] B5 真实回环模型协议联调，前端解析与停止/恢复回归。Rust 55、原生 IPC 15、前端 48 项及构建/静态检查通过；用户本轮免除浏览器连接与截图前置要求，真实 WebView 视觉验收留待 E6，详见本文件 B5 完成记录。
 
 ### C. 检查点压缩
 - [ ] C1 普通模型语义摘要适配器与摘要结构校验，不开放副作用工具。
@@ -63,9 +64,11 @@ Rust 重构交接、已完成工作与运行方式见 [WORK_HANDOFF_2026-10-14.m
 
 ## 当前进度与下一项
 
-A0–A6、B1–B4 已完成各自基础阶段，保留用户手动勾选的 A6；真实 SSH 执行去重仍待 D3。B4 已启用模型设置、基础文本对话和 B3 原生历史，并补齐 UI 与配置改名。最新验证：相关 Rust 52 项、原生 IPC 12 项、前端 37 项、TypeScript 和生产构建通过，Rust Clippy -D warnings 通过；B3 的内核证据保留，本轮未重复全量后端测试。
+A0–A6、B1–B5 已完成各自基础阶段，保留用户手动勾选的 A6。B5 自动验证：Rust 55 项、原生 IPC 15 项、前端 48 项通过；TypeScript、生产资源构建及静态检查通过。修复了历史恢复轮次停止期间缺少等待状态/防重入的问题。真实 SSH 副作用去重仍待 D3。
 
-下一项 B5：模型协议联调与前端停止/恢复回归，补足实际桌面交互验证。继续使用本地 IPC/Channel，不重新引入 HTTP 后端；自动压缩待 C，SSH 工具与审批待 D，附件待 E。本轮不打包、不提交。
+本机客户端 test-rust-ui/b7a9735、Rust main/ea46967（包含 c4bd68d）；本轮修改未提交。Cargo 相对依赖已正确指向本机 Rust 库。用户要求本轮不处理 Tabbit 路由问题，实际 WebView 截图/明暗主题/窄窗口验收未完成，列入 E6；自动组件验证与主题控件修改已完成，不宣称视觉验收通过。
+
+下一项 C1：普通模型语义摘要适配器与摘要结构校验，不开放副作用工具。本轮止于 B5，不进入 C/D/E，不提交、不推送、不打包。详细验证结果见本文件 B5 完成记录。
 详细验证结果和下一步会在每个完成项后记录。
 
 ### B4：2026-10-14 完成
@@ -244,3 +247,37 @@ A0–A6、B1–B4 已完成各自基础阶段，保留用户手动勾选的 A6�
 - 静态检查：Rust clippy --offline --lib --test agent_chat -- -D warnings 通过；桌面 clippy --manifest-path src-tauri/Cargo.toml --offline --lib --tests 通过，仅报告既有聊天排序和旧进程测试警告；修改的 Rust 文件格式检查通过。
 - 边界：租约测试人为设为过期以模拟崩溃时间，再关闭重开数据库；硬崩溃可能丢失尚未持久的少量增量。没有真实模型/GUI/用户远端/打包或全量回归。原有 A6/B1/B2 勾选保留，B3 勾选，下一项 B4。
 - 文档：AGENT_TURNS.md 记录请求身份、终态排序、历史接口、恢复宽限和验证命令；AGENT_CHAT.md / 客户端 agent-ipc.md 更新续接指向。
+
+### B5：2026-10-14 完成
+
+- 按本机 ShellPilot 两个仓库读取交接并核对分支/基线/工作区；库的 .idea/misc.xml 保留，Cargo path 无需修改。
+- 新增 Rust 协议测试 3 项、原生 IPC 组合测试 3 项、前端 IPC 3 项、界面组件 3 项；总验证 Rust 55、原生 15、前端 48 项全部通过。
+- 前端 App.tsx 固定恢复中的轮次 ID 并防止重复停止，5 秒确认超时后重读权威历史；AgentPanel.tsx/ModelSettings.css 同步补等待、禁用及现有图标，保留 B4 模型设置布局。
+- TypeScript/Vite 构建、Rust Clippy -D warnings、桌面 Clippy 与修改 Rust 文件格式检查通过；桌面只有两项既有告警，大 chunk 提示保留。
+- 实际浏览器验收工具 Tabbit diagnose 返回 69；用户明确要求不处理该项、由代理判断继续，因此 B5 按自动回归勾选。没有真实桌面截图、明暗/窄屏视觉验收、真实模型矩阵或用户服务器操作，验证边界与后续实际检查保留在本文件 B5 / E6 记录中。
+- B1–B4 没有重写；schema 7、稳定配置 ID、名称、DPAPI 密钥和历史关联未改变。未提交、未推送、未打包。下一项 C1。
+
+#### B5 验证命令与结果
+
+| 范围 | 命令（对应项目目录执行） | 结果 |
+| --- | --- | --- |
+| Rust 模型/对话/上下文 | cargo test --test agent_chat --test agent_models --test agent_context | 18 + 20 + 17 = 55 通过 |
+| 原生桌面 IPC | cargo test --manifest-path src-tauri/Cargo.toml --lib backend_ipc::tests -- --test-threads=1 | 15 通过，其他 10 项未运行 |
+| 前端解析/历史/传输/附件兼容/组件操作 | node --import tsx --test tests/agent-ipc.test.ts tests/agent-history.test.ts tests/ipc-transport.test.ts tests/chat-attachments.test.ts tests/chat-text-ui.test.mjs | 15 + 4 + 5 + 16 + 8 = 48 通过 |
+| TypeScript | node node_modules/typescript/bin/tsc --noEmit | 通过 |
+| 前端生产资源构建 | node node_modules/vite/bin/vite.js build | 通过，既有大 chunk 提示保留 |
+| Rust 静态检查 | cargo clippy --offline --lib --test agent_chat --test agent_models -- -D warnings | 通过 |
+| 桌面静态检查 | cargo clippy --manifest-path src-tauri/Cargo.toml --offline --lib --tests | 通过；仅既有 chat_history 排序及旧 backend_process zombie_processes 警告 |
+| 修改 Rust 文件 | rustfmt --edition 2021 --check 对应测试文件 | 通过 |
+| 改动检查 | git diff --check（允许 CRLF） | 通过 |
+
+Node 使用 C:/Users/kingdee/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node.exe；Cargo 使用 C:/Users/kingdee/.cargo/bin/cargo.exe。后续按本机 PATH 或实际安装路径执行。没有 npm prebuild 图标生成、Git 提交/推送或安装包构建。
+
+#### B5 覆盖与验收边界
+
+- Rust tests/agent_chat.rs：多行 SSE/注释/CRLF/UTF-8 分片、JSON/代码原文与 usage；10 种 choice/index/role、工具/旧 function、拒绝、截断/过滤、非法 JSON、过早 DONE 异常；行/帧/响应 3 种超限。保留已交付文本，不误报成功或自动重试。
+- 客户端 src-tauri/src/backend_ipc_tests.rs：回环模拟模型供应商经过产品 agent_stream/dispatch/ACK 和真实 SQLite，覆盖未 ACK 时停止、旧请求/ACK 隔离、显式续聊、future Drop、中断/失败记录、关闭重开及缓存重读。
+- tests/agent-ipc.test.ts / tests/chat-text-ui.test.mjs：取消隔离、完成/停止竞态、迟到回调、恢复原请求不自动发送或覆盖草稿、旧会话回执不清空新草稿。修正元素夹具遍历 undefined 时重入根节点的问题。
+- 原生发送端为测试接收器，前端使用 IPC/hooks/元素夹具；没有完整真实 WebView 截图。测试端口仅模拟模型供应商，不是产品 HTTP 后端。
+- 用户要求本轮不处理浏览器连接，因此 B5 以自动回归完成；E6 补验：途中停止及原请求恢复、历史生成中的等待/禁用、停止与完成竞态、切换会话不跳回旧会话、关闭重开后原文/状态、明暗主题和 320px AI 面板。
+- 未验证真实供应商兼容矩阵或真实 SSH 副作用；没有实现 C/D/E。schema 7 与 DPAPI 不变，用户 .idea/misc.xml 保留。
