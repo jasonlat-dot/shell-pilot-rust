@@ -1,4 +1,5 @@
-//! Persistent context kernel, native model adapters and basic text turns. Executable tools are not wired yet.
+//! Persistent context, native model adapters, text turns and the D1 tool-loop kernel.
+//! Desktop chat does not dispatch tools until target binding and approval are integrated.
 pub mod budget;
 pub mod chat;
 pub mod compact;
@@ -10,6 +11,7 @@ mod projects;
 pub mod provider;
 mod repository;
 mod scopes;
+pub mod tool_loop;
 pub use projects::{Project, ProjectChat, ProjectChats};
 mod turns;
 pub use model::*;

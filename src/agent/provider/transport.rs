@@ -19,6 +19,11 @@ pub(super) fn network(error: reqwest::Error) -> ModelError {
     }
 }
 impl ModelClient {
+    /// The normalized configuration actually used by this transport.
+    pub fn config(&self) -> &ModelConfig {
+        &self.config
+    }
+
     pub fn new(runtime: RuntimeConfig) -> Result<Self> {
         let binding = super::responses::Binding::from_runtime(&runtime)?;
         let config = runtime.config.normalized()?;
