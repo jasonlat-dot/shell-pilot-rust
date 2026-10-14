@@ -1,3 +1,4 @@
+pub(crate) mod agent_exec;
 mod host_key;
 mod http;
 mod output;
@@ -89,9 +90,23 @@ impl Drop for NetworkGuard {
 pub(crate) struct Transport {
     _network: NetworkGuard,
     handle: Option<client::Handle<HostVerifier>>,
-    host_key: Arc<Mutex<Option<String>>>,
+    identity: AgentIdentity,
+    trust_profile: (bool, Option<String>),
 }
 impl Transport {
+    fn matches_profile(&self, connection: &Connection) -> bool {
+        self.identity.connection_id == connection.connection_id
+            && self.identity.user_id == connection.user_id
+            && self
+                .identity
+                .host
+                .trim_matches(['[', ']'])
+                .eq_ignore_ascii_case(connection.host.trim_matches(['[', ']']))
+            && self.identity.port == connection.port
+            && self.identity.username == connection.username
+            && self.trust_profile.0 == connection.strict_host_key_check
+            && self.trust_profile.1 == connection.known_hosts
+    }
     pub(crate) fn is_closed(&self) -> bool {
         self.handle().is_closed()
     }
@@ -268,11 +283,9 @@ impl TerminalManager {
         runtime
             .transports
             .retain(|entry| !entry.transport.is_closed() && entry.active() > 0);
-        if let Some(entry) = runtime
-            .transports
-            .iter()
-            .find(|entry| !fresh && entry.available())
-        {
+        if let Some(entry) = runtime.transports.iter().find(|entry| {
+            !fresh && entry.available() && entry.transport.matches_profile(connection)
+        }) {
             return Ok(entry.clone());
         }
         if runtime.transports.len() >= self.settings.transports_per_connection {
@@ -437,20 +450,9 @@ impl TerminalManager {
                 let session = Arc::new(Session {
                     id: session_id.clone(),
                     connection_id: request.connection_id.clone(),
-                    identity: AgentIdentity {
-                        connection_id: connection.connection_id.clone(),
-                        user_id: connection.user_id.clone(),
-                        host: connection.host.clone(),
-                        port: connection.port,
-                        username: connection.username.clone(),
-                        host_key: entry
-                            .transport
-                            .host_key
-                            .lock()
-                            .unwrap()
-                            .clone()
-                            .ok_or(Error::HostKey)?,
-                    },
+                    identity: entry.transport.identity.clone(),
+                    transport: Arc::downgrade(&entry),
+                    trust_profile: entry.transport.trust_profile.clone(),
                     writer: Mutex::new(Some(writer.clone())),
                     output: Mutex::new(Output::new()),
                     changed: Notify::new(),
@@ -816,7 +818,18 @@ pub(crate) async fn authenticate(
     let mut transport = Transport {
         _network: network,
         handle: Some(handle),
-        host_key,
+        identity: AgentIdentity {
+            connection_id: connection.connection_id.clone(),
+            user_id: connection.user_id.clone(),
+            host: connection.host.clone(),
+            port: connection.port,
+            username: connection.username.clone(),
+            host_key: host_key.lock().unwrap().clone().ok_or(Error::HostKey)?,
+        },
+        trust_profile: (
+            connection.strict_host_key_check,
+            connection.known_hosts.clone(),
+        ),
     };
     let handle = transport.handle.as_mut().unwrap();
     let result = if connection.auth_type == 1 {

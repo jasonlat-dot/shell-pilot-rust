@@ -1,6 +1,7 @@
 //! D1 native main-model function loop. This is not an SSH executor or an IPC entry.
 //! The host must supply a dispatcher with its own live target and authorization checks.
-//! D2/D3 add that dispatcher; D4 connects durable execution/output and compaction.
+//! D2 supplies the bound SSH dispatcher; D3 adds durable approval/admission.
+//! D4 connects full output and compaction to the product execution path.
 mod schema;
 
 use super::provider::{

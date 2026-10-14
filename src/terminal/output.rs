@@ -129,6 +129,8 @@ pub(super) struct Session {
     pub id: String,
     pub connection_id: String,
     pub identity: super::AgentIdentity,
+    pub transport: std::sync::Weak<super::PooledTransport>,
+    pub trust_profile: (bool, Option<String>),
     pub writer: Mutex<Option<std::sync::Arc<russh::ChannelWriteHalf<russh::client::Msg>>>>,
     pub output: Mutex<Output>,
     pub changed: Notify,

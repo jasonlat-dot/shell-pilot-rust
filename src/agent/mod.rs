@@ -11,6 +11,7 @@ mod projects;
 pub mod provider;
 mod repository;
 mod scopes;
+pub mod ssh_tools;
 pub mod tool_loop;
 pub use projects::{Project, ProjectChat, ProjectChats};
 mod turns;

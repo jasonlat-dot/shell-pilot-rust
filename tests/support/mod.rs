@@ -27,6 +27,7 @@ pub struct Stats {
     pub shells: AtomicUsize,
     pub sizes: Mutex<Vec<(u32, u32)>>,
     pub rejected_channels: AtomicUsize,
+    pub execs: Mutex<Vec<String>>,
 }
 #[derive(Clone, Default)]
 pub struct Spec {
@@ -172,6 +173,45 @@ impl server::Handler for TestHandler {
         _: &mut Session,
     ) -> Result<(), Self::Error> {
         self.stats.sizes.lock().unwrap().push((cols, rows));
+        Ok(())
+    }
+    async fn exec_request(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let command = String::from_utf8_lossy(data).into_owned();
+        self.stats.execs.lock().unwrap().push(command.clone());
+        if command == "__exec_reject__" {
+            session.channel_failure(channel)?;
+            if self.channels.remove(&channel) {
+                self.stats.channels.fetch_sub(1, Ordering::SeqCst);
+            }
+            session.close(channel)?;
+            return Ok(());
+        }
+        session.channel_success(channel)?;
+        if command == "__exec_quiet__" {
+            return Ok(());
+        }
+        let stdout = if command == "__exec_large__" {
+            vec![b'x'; 4096]
+        } else {
+            "执行完成\n".as_bytes().to_vec()
+        };
+        // Split a multi-byte code point across SSH data messages.
+        session.data(channel, stdout[..2].to_vec())?;
+        session.data(channel, stdout[2..].to_vec())?;
+        session.extended_data(channel, 1, b"test stderr\n".to_vec())?;
+        if command != "__exec_no_status__" {
+            session.exit_status_request(channel, if command == "__exec_fail__" { 7 } else { 0 })?;
+        }
+        session.eof(channel)?;
+        if self.channels.remove(&channel) {
+            self.stats.channels.fetch_sub(1, Ordering::SeqCst);
+        }
+        session.close(channel)?;
         Ok(())
     }
     async fn data(
