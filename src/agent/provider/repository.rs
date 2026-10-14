@@ -8,6 +8,7 @@ pub struct ModelRepository {
     store: Arc<Store>,
 }
 /// Native-only runtime settings. Never serialize this into IPC or the event log.
+#[derive(Clone)]
 pub struct RuntimeConfig {
     pub config: ModelConfig,
     pub(crate) api_key: Option<SecretKey>,

@@ -6,6 +6,7 @@ use super::{
     Checkpoint, CheckpointContent, Event, Repository, Snapshot,
 };
 use crate::store::Store;
+pub mod auto;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Arc};
 use tokio_util::sync::CancellationToken;
@@ -54,6 +55,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug)]
 pub struct Draft {
     pub snapshot: Snapshot,
+    pub through_event_id: u64,
     pub content: CheckpointContent,
     pub usage: Option<Usage>,
     pub model: String,
@@ -91,6 +93,13 @@ struct Document {
     evidence_event_ids: Vec<u64>,
 }
 
+/// Native-only input frozen by C2. Not serializable and never supplied by a model.
+pub(crate) struct Prefix {
+    pub snapshot: Snapshot,
+    pub through: u64,
+    pub runtime: super::provider::RuntimeConfig,
+    pub summary_bytes: usize,
+}
 pub struct Summarizer {
     store: Arc<Store>,
 }
@@ -107,40 +116,31 @@ impl Summarizer {
         user: &str,
         cancel: &CancellationToken,
     ) -> Result<Draft> {
+        self.generate(session, user, cancel, None).await
+    }
+    pub(crate) async fn summarize_prefix(
+        &self,
+        session: &str,
+        user: &str,
+        cancel: &CancellationToken,
+        prefix: Prefix,
+    ) -> Result<Draft> {
+        self.generate(session, user, cancel, Some(prefix)).await
+    }
+    async fn generate(
+        &self,
+        session: &str,
+        user: &str,
+        cancel: &CancellationToken,
+        prefix: Option<Prefix>,
+    ) -> Result<Draft> {
         check_cancel(cancel)?;
         let store = self.store.clone();
         let session = session.to_owned();
         let user = user.to_owned();
-        let preparing = tokio::task::spawn_blocking(move || {
-            let repository = Repository::new(store.clone());
-            let (snapshot, source) = capture(&repository, &session, &user)?;
-            let source_json = serde_json::to_string(&source).map_err(|_| Error::InputLimit)?;
-            if source_json.len() > MAX_SOURCE_BYTES {
-                return Err(Error::InputLimit);
-            }
-            let runtime = ModelRepository::new(store).runtime(&snapshot.session.agent_id, &user)?;
-            let request = ChatRequest {
-                messages: vec![
-                    ChatMessage::System {
-                        content: INSTRUCTIONS.into(),
-                    },
-                    ChatMessage::User {
-                        content: source_json,
-                    },
-                ],
-                tools: vec![],
-            };
-            // Check the complete serialized request, including instructions and model output reserve.
-            super::provider::prepare_request(&runtime.config, &request)?;
-            Ok::<_, Error>((
-                snapshot,
-                source.available_evidence_event_ids,
-                source.required_evidence_event_ids,
-                runtime,
-                request,
-            ))
-        });
-        let (snapshot, evidence, required, runtime, request) = tokio::select! {
+        let preparing =
+            tokio::task::spawn_blocking(move || prepare(store, &session, &user, prefix.as_ref()));
+        let (snapshot, through, evidence, required, runtime, request, limit) = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(ModelError::Cancelled.into()),
             result = preparing => result.map_err(|_| Error::Worker)??,
@@ -171,6 +171,9 @@ impl Summarizer {
             &evidence,
             &required,
         )?;
+        if content.summary.len() > limit {
+            return Err(Error::InvalidSummary);
+        }
         let repository = Repository::new(self.store.clone());
         let expected = snapshot.clone();
         let checking = tokio::task::spawn_blocking(move || {
@@ -187,6 +190,7 @@ impl Summarizer {
         }
         Ok(Draft {
             snapshot,
+            through_event_id: through,
             content,
             usage: completion.usage,
             model,
@@ -201,7 +205,12 @@ fn check_cancel(cancel: &CancellationToken) -> Result<()> {
     }
 }
 
-fn capture(repository: &Repository, session: &str, user: &str) -> Result<(Snapshot, Source)> {
+fn capture(
+    repository: &Repository,
+    session: &str,
+    user: &str,
+    frontier: Option<u64>,
+) -> Result<(Snapshot, Source)> {
     // Re-read the version after all source reads. A4's commit check remains mandatory even afterwards.
     let snapshot = repository.snapshot(session, user)?;
     let previous = repository.checkpoint(session, user)?;
@@ -218,15 +227,23 @@ fn capture(repository: &Repository, session: &str, user: &str) -> Result<(Snapsh
     if running {
         return Err(Error::Busy);
     }
-    let events = repository.events(session, user, after, MAX_EVENTS)?;
-    let last = events.last().map_or(after, |event| event.id);
-    if last > snapshot.through_event_id {
+    let through = frontier.unwrap_or(snapshot.through_event_id);
+    if through < after || through > snapshot.through_event_id {
         return Err(Error::ContextChanged);
     }
-    if last < snapshot.through_event_id {
+    let events: Vec<_> = repository
+        .events(session, user, after, MAX_EVENTS)?
+        .into_iter()
+        .filter(|event| event.id <= through)
+        .collect();
+    let last = events.last().map_or(after, |event| event.id);
+    if last > through {
+        return Err(Error::ContextChanged);
+    }
+    if last < through {
         return Err(Error::InputLimit);
     }
-    if events.is_empty() {
+    if events.is_empty() && (frontier.is_none() || previous.is_none()) {
         return Err(Error::EmptySource);
     }
 
@@ -236,18 +253,15 @@ fn capture(repository: &Repository, session: &str, user: &str) -> Result<(Snapsh
              WHERE session_id=?1 AND state IN ('cancelled','failed','interrupted')
              AND user_event_id>?2 AND user_event_id<=?3 ORDER BY user_event_id LIMIT 201",
         )?;
-        let rows = statement.query_map(
-            rusqlite::params![session, after, snapshot.through_event_id],
-            |row| {
-                Ok(FailedTurn {
-                    request_id: row.get(0)?,
-                    user_event_id: row.get(1)?,
-                    state: row.get(2)?,
-                    partial_text: row.get(3)?,
-                    error_code: row.get(4)?,
-                })
-            },
-        )?;
+        let rows = statement.query_map(rusqlite::params![session, after, through], |row| {
+            Ok(FailedTurn {
+                request_id: row.get(0)?,
+                user_event_id: row.get(1)?,
+                state: row.get(2)?,
+                partial_text: row.get(3)?,
+                error_code: row.get(4)?,
+            })
+        })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?)
     })?;
     if failed_text_turns.len() > MAX_EVENTS {
@@ -283,7 +297,7 @@ fn capture(repository: &Repository, session: &str, user: &str) -> Result<(Snapsh
     let source = Source {
         session_id: session.into(),
         source_revision: snapshot.session.revision,
-        through_event_id: snapshot.through_event_id,
+        through_event_id: through,
         trusted_task: snapshot.session.task.clone(),
         pending_tool_call_ids: snapshot.pending_tool_call_ids.clone(),
         uncertain_tool_call_ids: snapshot.uncertain_tool_call_ids.clone(),
@@ -296,6 +310,77 @@ fn capture(repository: &Repository, session: &str, user: &str) -> Result<(Snapsh
     Ok((snapshot, source))
 }
 
+type Prepared = (
+    Snapshot,
+    u64,
+    Vec<u64>,
+    Vec<u64>,
+    super::provider::RuntimeConfig,
+    ChatRequest,
+    usize,
+);
+fn prepare(
+    store: Arc<Store>,
+    session: &str,
+    user: &str,
+    prefix: Option<&Prefix>,
+) -> Result<Prepared> {
+    let repository = Repository::new(store.clone());
+    let (snapshot, source) = capture(&repository, session, user, prefix.map(|p| p.through))?;
+    if prefix.is_some_and(|p| p.snapshot != snapshot) {
+        return Err(Error::ContextChanged);
+    }
+    let source_json = serde_json::to_string(&source).map_err(|_| Error::InputLimit)?;
+    if source_json.len() > MAX_SOURCE_BYTES {
+        return Err(Error::InputLimit);
+    }
+    let runtime = match prefix {
+        Some(p) => p.runtime.clone(),
+        None => ModelRepository::new(store).runtime(&snapshot.session.agent_id, user)?,
+    };
+    let limit = prefix.map_or(MAX_SUMMARY_BYTES, |p| p.summary_bytes);
+    if !(64..=MAX_SUMMARY_BYTES).contains(&limit) {
+        return Err(Error::InputLimit);
+    }
+    let instructions = if prefix.is_some() {
+        format!("{INSTRUCTIONS}\nFor this request keep summary <= {limit} UTF-8 bytes and nextSteps <= 4 concise items.")
+    } else {
+        INSTRUCTIONS.into()
+    };
+    let request = ChatRequest {
+        messages: vec![
+            ChatMessage::System {
+                content: instructions,
+            },
+            ChatMessage::User {
+                content: source_json,
+            },
+        ],
+        tools: vec![],
+    };
+    super::provider::prepare_request(&runtime.config, &request)?;
+    Ok((
+        snapshot,
+        source.through_event_id,
+        source.available_evidence_event_ids,
+        source.required_evidence_event_ids,
+        runtime,
+        request,
+        limit,
+    ))
+}
+pub(crate) fn prefix_fits(
+    store: Arc<Store>,
+    session: &str,
+    user: &str,
+    prefix: &Prefix,
+) -> Result<bool> {
+    match prepare(store, session, user, Some(prefix)) {
+        Ok(_) => Ok(true),
+        Err(Error::InputLimit | Error::Model(ModelError::BudgetExceeded)) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
 fn validate(
     text: &str,
     snapshot: &Snapshot,

@@ -1,5 +1,5 @@
 use super::*;
-use crate::agent::budget::{estimate_text, InputCosts};
+use crate::agent::budget::estimate_text;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -98,8 +98,30 @@ fn validate_calls(
     Ok(())
 }
 pub fn prepare_request(config: &ModelConfig, request: &ChatRequest) -> Result<PreparedRequest> {
+    if request.messages.len() > 256 {
+        return Err(ModelError::Invalid("message/tool count out of range"));
+    }
+    let measured = measure_request(config, request)?;
+    if measured.body.len() > 2 * 1024 * 1024 {
+        return Err(ModelError::Invalid("model request exceeds 2 MiB"));
+    }
+    if measured.estimated_input_tokens
+        > config
+            .budget()
+            .available_input()
+            .map_err(|_| ModelError::BudgetExceeded)?
+    {
+        return Err(ModelError::BudgetExceeded);
+    }
+    Ok(measured)
+}
+/// Planning only; transports must always call prepare_request's strict hard checks.
+pub(crate) fn measure_request(
+    config: &ModelConfig,
+    request: &ChatRequest,
+) -> Result<PreparedRequest> {
     let config = config.clone().normalized()?;
-    if request.messages.is_empty() || request.messages.len() > 256 || request.tools.len() > 64 {
+    if request.messages.is_empty() || request.messages.len() > 1024 || request.tools.len() > 64 {
         return Err(ModelError::Invalid("message/tool count out of range"));
     }
     if !request.tools.is_empty() && !config.capabilities.tool_calls {
@@ -169,27 +191,23 @@ pub fn prepare_request(config: &ModelConfig, request: &ChatRequest) -> Result<Pr
         );
     }
     let body = serde_json::to_string(&body).map_err(|_| ModelError::ToolProtocol)?;
-    if body.len() > 2 * 1024 * 1024 {
-        return Err(ModelError::Invalid("model request exceeds 2 MiB"));
+    if body.len() > 8 * 1024 * 1024 {
+        return Err(ModelError::Invalid("model planning request exceeds 8 MiB"));
     }
     let cost = estimate_text(&body)
         .checked_add(request.messages.len() as u64 * 12)
         .ok_or(ModelError::BudgetExceeded)?;
-    let plan = config
+    let available = config
         .budget()
-        .plan(
-            &InputCosts {
-                fixed_tokens: cost,
-                ..Default::default()
-            },
-            &[],
-        )
+        .available_input()
         .map_err(|_| ModelError::BudgetExceeded)?;
+    let should_compact =
+        u128::from(cost) * 100 >= u128::from(available) * u128::from(config.compact_percent);
     Ok(PreparedRequest {
         endpoint: config.endpoint()?,
         body,
-        estimated_input_tokens: plan.estimated_input_tokens,
-        should_compact: plan.should_compact,
+        estimated_input_tokens: cost,
+        should_compact,
         allowed_tools: allowed,
     })
 }

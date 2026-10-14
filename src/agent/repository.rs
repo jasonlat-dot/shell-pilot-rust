@@ -223,6 +223,16 @@ impl Repository {
         snapshot: &Snapshot,
         content: CheckpointContent,
     ) -> Result<Checkpoint> {
+        self.save_checkpoint_guarded(snapshot, snapshot.through_event_id, content, || false)
+    }
+    /// Prefix checkpoints cover only the stated frontier; the full snapshot still guards every change.
+    pub(crate) fn save_checkpoint_guarded(
+        &self,
+        snapshot: &Snapshot,
+        through: u64,
+        content: CheckpointContent,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Checkpoint> {
         model::text_value(&content.summary, 16000)?;
         model::text_list(&content.next_steps)?;
         if content.evidence_event_ids.len() > 200
@@ -236,12 +246,30 @@ impl Repository {
             let tx = db.transaction()?;
             let current = read_snapshot(&tx, &snapshot.session.id, &snapshot.session.user_id)?;
             if current != *snapshot { return Err(Error::Stale); }
+            if cancelled() { return Err(Error::Conflict); }
+            if (through==0 && current.through_event_id>0) || through>current.through_event_id
+                || through>0 && !tx.query_row("SELECT EXISTS(SELECT 1 FROM agent_events WHERE id=?1 AND session_id=?2)",
+                    params![through,current.session.id],|r|r.get::<_,bool>(0))? {
+                return Err(Error::Invalid("invalid checkpoint frontier".into()));
+            }
+            let old_through: u64 = if let Some(id)=&current.session.checkpoint_id {
+                tx.query_row("SELECT through_event_id FROM agent_checkpoints WHERE id=?1 AND session_id=?2",
+                    params![id,current.session.id],|r|r.get(0))?
+            } else { 0 };
+            if through<old_through { return Err(Error::Invalid("checkpoint frontier cannot move backwards".into())); }
+            if through<current.through_event_id && tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_events c WHERE c.session_id=?1 AND c.kind='tool_call'
+                 AND c.id<=?2 AND NOT EXISTS(SELECT 1 FROM agent_events r WHERE r.session_id=c.session_id
+                 AND r.call_id=c.call_id AND r.kind='tool_result' AND r.id<=?2))",
+                params![current.session.id,through],|r|r.get::<_,bool>(0))? {
+                return Err(Error::ToolProtocol);
+            }
             if content.task != current.session.task || content.pending_tool_call_ids != current.pending_tool_call_ids || content.uncertain_tool_call_ids != current.uncertain_tool_call_ids {
                 return Err(Error::Invalid("checkpoint must preserve the task, constraints, target and uncertain calls".into()));
             }
             let mut seen = std::collections::HashSet::new();
             for &event_id in &content.evidence_event_ids {
-                if event_id == 0 || event_id > current.through_event_id || !seen.insert(event_id) {
+                if event_id == 0 || event_id > through || !seen.insert(event_id) {
                     return Err(Error::Invalid("invalid evidence reference".into()));
                 }
                 if !tx.query_row("SELECT EXISTS(SELECT 1 FROM agent_events WHERE id=?1 AND session_id=?2)",
@@ -250,7 +278,7 @@ impl Repository {
                 }
             }
             let checkpoint = Checkpoint { id: uuid::Uuid::new_v4().to_string(),
-                session_id: current.session.id.clone(), through_event_id: current.through_event_id,
+                session_id: current.session.id.clone(), through_event_id: through,
                 source_revision: current.session.revision,
                 committed_revision: next_revision(current.session.revision)?, content,
                 created_at: chrono::Utc::now().timestamp() };
@@ -261,6 +289,7 @@ impl Repository {
                 params![checkpoint.id,checkpoint.committed_revision,checkpoint.session_id,checkpoint.source_revision])? != 1 {
                 return Err(Error::Stale);
             }
+            if cancelled() { return Err(Error::Conflict); }
             tx.commit()?; Ok(checkpoint)
         })
     }

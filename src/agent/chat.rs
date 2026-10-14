@@ -1,9 +1,9 @@
 //! Basic text conversations over the native model stream. No tools or UI permissions yet.
 pub use super::turns::{History, Turn, TurnState};
 use super::{
-    provider::{self, ChatMessage, ChatRequest, ModelClient, ModelError, ModelRepository},
+    provider::{ModelClient, ModelError, ModelRepository},
     turns::Turns,
-    Payload, Repository, Target, TaskStatus,
+    Payload, Repository, Target,
 };
 use crate::store::Store;
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,10 @@ pub enum Error {
     Unsupported,
     #[error("历史过长或已有检查点，需要后续压缩/恢复支持")]
     HistoryLimit,
+    #[error("上下文整理失败，原始历史已保留；请检查模型接口后手动重试")]
+    CompactionFailed,
+    #[error("当前请求与保留上下文无法降到可用容量，请缩短输入或新建会话")]
+    CompactionLimit,
     #[error("工作区已停止")]
     Stopped,
     #[error("Agent 日志操作失败")]
@@ -81,6 +85,8 @@ impl Error {
             Self::TargetMismatch => "AGENT_TARGET_MISMATCH",
             Self::Unsupported => "FEATURE_NOT_MIGRATED",
             Self::HistoryLimit => "AGENT_HISTORY_LIMIT",
+            Self::CompactionFailed => "AGENT_COMPACTION_FAILED",
+            Self::CompactionLimit => "AGENT_COMPACTION_LIMIT",
             Self::Stopped => "BACKEND_UNAVAILABLE",
             Self::Storage => "AGENT_STORAGE_FAILED",
             Self::Conflict => "AGENT_REQUEST_CONFLICT",
@@ -100,6 +106,8 @@ impl Error {
             Self::HistoryLimit | Self::Model(ModelError::BudgetExceeded) => 413,
             Self::Model(ModelError::ResponseTooLarge) => 413,
             Self::Model(_) => 502,
+            Self::CompactionFailed => 502,
+            Self::CompactionLimit => 413,
             Self::Storage => 500,
             Self::Conflict | Self::ContextChanged => 409,
             Self::Recorded(code) => match code.as_str() {
@@ -466,45 +474,16 @@ impl Manager {
             partial: partial.clone(),
             finished: true,
         };
-        let store = self.store.clone();
-        let r = request.clone();
-        let prepare_stop = token.clone();
-        let caller_stop = cancel.clone();
-        let target_for_admission = target.clone();
-        let (runtime,chat,revision)=worker(move|| {
-            if prepare_stop.is_cancelled()||caller_stop.is_cancelled(){return Err(ModelError::Cancelled.into());}
-            let repo=Repository::new(store.clone());let s=repo.session(&r.session_id,&r.user_id)?;
-            if s.agent_id!=r.agent_id{return Err(Error::NotFound);}
-            if s.checkpoint_id.is_some(){return Err(Error::HistoryLimit);}
-            if s.task.as_ref().is_some_and(|t|t.target!=target){return Err(Error::TargetMismatch);}
-            let events=repo.events(&s.id,&s.user_id,0,200)?;if events.len()>=200{return Err(Error::HistoryLimit);}
-            let unfinished= {
-                let db=store.database.lock().map_err(|_|Error::Storage)?;
-                let mut stmt=db.prepare("SELECT user_event_id FROM agent_chat_turns WHERE session_id=?1 AND state!='completed'").map_err(|_|Error::Storage)?;
-                let ids=stmt.query_map([&s.id],|r|r.get::<_,u64>(0)).map_err(|_|Error::Storage)?;
-                ids.collect::<std::result::Result<std::collections::HashSet<_>,_>>().map_err(|_|Error::Storage)?
-            };
-            let needs_task=s.task.as_ref().is_none_or(|t|t.status!=TaskStatus::Active);
-            let goal=if needs_task{r.message.as_str()}else{s.task.as_ref().unwrap().goal.as_str()};
-            let task_state=serde_json::json!({"goal":goal,"constraints":s.task.as_ref().map(|t|t.constraints.as_slice()).unwrap_or(&[]),"target":target});
-            let mut messages=vec![ChatMessage::System {content:format!("你是 ShellPilot 的文本助手。本阶段没有命令执行工具；不要声称执行过命令或读取过服务器。\n可信任务快照（不产生执行授权）：{task_state}")}];
-            // Only completed exchanges are used as model history. Failed input/partial text remain in raw evidence.
-            let mut pending=Vec::new();
-            for e in events {
-                if unfinished.contains(&e.id){continue;}
-                match e.payload {
-                    Payload::UserMessage{text}=>pending.push(ChatMessage::User{content:text}),
-                    Payload::AssistantMessage{text}=>{messages.append(&mut pending);messages.push(ChatMessage::Assistant{content:Some(text),tool_calls:vec![]});},
-                    Payload::Cancelled{..}=>pending.clear(),
-                    Payload::TaskStarted{..}=>pending.clear(),
-                    Payload::ToolCall{..}|Payload::ToolResult{..}=>return Err(Error::Unsupported),
-                }
-            }
-            messages.push(ChatMessage::User{content:r.message.clone()});
-            let runtime=ModelRepository::new(store).runtime(&r.agent_id,&r.user_id)?;
-            let chat=ChatRequest{messages,tools:vec![]};provider::prepare_request(&runtime.config,&chat)?;
-            Ok((runtime,chat,s.revision))
-        }).await?;
+        let prepared = super::compact::auto::Controller::new(self.store.clone())
+            .prepare_text(&request, target.clone(), &token, cancel)
+            .await?;
+        if token.is_cancelled() || cancel.is_cancelled() {
+            return Err(ModelError::Cancelled.into());
+        }
+        let runtime = prepared.runtime;
+        let chat = prepared.request;
+        let revision = prepared.revision;
+        let target_for_admission = target;
         let turns = Turns::new(self.store.clone());
         let r = request.clone();
         let who = owner.clone();

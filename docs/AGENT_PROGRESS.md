@@ -8,7 +8,7 @@ Rust 重构交接、已完成工作与运行方式见 [WORK_HANDOFF_2026-10-14.m
 
 ## 工作目录与约束
 
-- Rust（当前本机）：E:/project/ShellPilot/ai-ssh-terminal-server-rust，main，HEAD 01ad303（包含 c4bd68d）
+- Rust（当前本机）：E:/project/ShellPilot/ai-ssh-terminal-server-rust，main，HEAD a142a46（包含 c4bd68d）
 - 前端（当前本机）：E:/project/ShellPilot/ai-ssh-terminal-client，test-rust-ui，HEAD b71ed34（包含 b7a9735）
 - Java 参考（当前本机）：E:/project/ShellPilot/ai-ssh-terminal-server，保留原实现
 - Codex 参考：E:/project/ai-ssh/artifacts/codex-reference，提交 f82e36592278a0a782fb0d0fc97e5fa10e832ac2
@@ -41,7 +41,7 @@ Rust 重构交接、已完成工作与运行方式见 [WORK_HANDOFF_2026-10-14.m
 
 ### C. 检查点压缩
 - [x] C1 普通模型语义摘要适配器与摘要结构校验，不开放副作用工具。只返回经校验的摘要草稿；13 项专门测试、相关 Agent 97 项及原生 IPC 15 项通过，自动触发/低水位/提交仍待 C2。
-- [ ] C2 自动压缩状态机：每次模型请求前/工具批次后检查、较低水位、有限重试、失败保留日志/旧检查点。
+- [x] C2 自动压缩状态机：当前文字模型请求前自动检查、较低水位、有限重试和检查点提交；工具批次预算边界已提供并验证，真实工具循环接入留给 D1/D4。失败保留日志/旧检查点；Agent 112、桌面 IPC 17、前端 51 项通过。
 - [ ] C3 支持的 Responses 供应商远端压缩能力分支；完整保留其输出窗口，不跨供应商复用不透明对象。
 - [ ] C4 压缩后重新注入实时目标、环境、可信授权与最新用户请求。
 - [ ] C5 前端上下文占用与真实压缩事件，失败不显示成功。
@@ -64,11 +64,15 @@ Rust 重构交接、已完成工作与运行方式见 [WORK_HANDOFF_2026-10-14.m
 
 ## 当前进度与下一项
 
-A0–A6、B1–B5、C1 已完成各自基础阶段。C1 提供普通模型的严格 JSON 语义摘要草稿，目标/约束/未知结果由程序保留；生成不修改原日志或检查点，不执行任何工具。最新验证：C1 专门 13 项、相关 Agent 合计 97 项、原生桌面 IPC 15 项通过，Clippy -D warnings 与修改 Rust 文件格式检查通过。
+A0–A6、B1–B5、C1–C2 已完成各自基础阶段。C2 已将普通模型摘要接入基础文本聊天：在下一次模型请求前按完整请求估算触发、检查更低水位，再经版本校验提交较早历史的检查点；保留近期轮次、最新用户原文和全部原始日志。自动整理期间仍可停止。工具批次只提供完整组预算检查边界，没有开放执行器。
 
-本机客户端 test-rust-ui/b71ed34、Rust main/01ad303；包含既定基线。B5 已由用户提交，本轮开始两个工作区干净，C1 修改尚未提交。Cargo 相对依赖正确；未改前端接口/样式、依赖锁或 schema 7。本轮只有 Rust 代码与已有进度/说明文件改动。
+本机客户端 test-rust-ui/b71ed34、Rust main/a142a46；包含既定基线。B5、C1 已由用户提交，本轮开始两个工作区干净；C2 前后端及现有文档修改尚未提交。Cargo 相对依赖正确；依赖锁、schema 7、稳定配置 ID 与 DPAPI 保持原状。
 
-下一项 C2：在模型请求/工具批次边界接入自动压缩状态机，检查较低水位、有限重试和失败回退，成功后通过 A4 版本校验提交检查点。C1 尚未接入当前聊天路径，前端不显示“已压缩”；C3 远端压缩、C4 重注入、C5 UI 仍待办，SSH 执行和审批待 D，聊天附件和记忆待 E。用户的真实 WebView 视觉验收仍保留到 E6。本轮不提交、不推送、不打包。
+最新验证：相关 Rust Agent 112/112（含 C2 集成 13 与单元 2）、桌面 IPC 17/17（含 C2 2）、前端 51/51，TypeScript、Vite 生产构建与修改 Rust 文件格式检查通过。业务库严格 Clippy 无告警，桌面 Clippy 只有既有 sort_by_key/zombie_processes 告警。真实供应商与 WebView 视觉验收未做。
+
+下一项 C3：研究并接入支持的 Responses 供应商远端压缩能力分支，完整保留输出窗口，不跨供应商复用不透明对象。当前仍只支持普通 Chat Completions。C4 完整实时环境/可信授权重注入、C5 占用与整理事件 UI、C6 综合回归仍待办；C2 只沿用基础文本路径的目标/约束/最新请求重注入。SSH 执行和审批待 D，聊天附件和记忆待 E。本轮不提交、不推送、不打包。
+
+前端已可测试：重新编译并重启桌面开发程序，在“设置 → 模型设置 → 高级参数 → 自动整理触发比例”设置触发比例；已有安装包不含 C2。长对话继续、整理等待时停止及历史保留的操作说明见客户端 docs/agent-model-settings.md。C5 尚未提供整理状态标记，不能仅凭等待状态判断整理成功。
 详细验证结果和下一步会在每个完成项后记录。
 
 ### B4：2026-10-14 完成
@@ -310,3 +314,33 @@ Node 使用 C:/Users/kingdee/.cache/codex-runtimes/codex-primary-runtime/depende
 - 前端工作区未改，Cargo 依赖锁未改。未启动真实 GUI、用户服务器或安装包。
 
 完成标记 C1 已回填，下一项 C2。本轮未提交、推送或打包，commit note 只在聊天中提供。
+
+### C2：2026-10-14 完成
+
+- 基线：客户端 test-rust-ui/b71ed34、Rust main/a142a46；本轮开始工作区干净，Cargo 的 ../../ai-ssh-terminal-server-rust 依赖按实际目录正确解析。B5 与 C1 是用户已提交版本，C2 本轮不提交。
+- 代码：Rust src/agent/compact/auto.rs、compact.rs、chat.rs、provider/protocol.rs、provider/repository.rs、repository.rs；tests/agent_auto_compact.rs。前端 ModelSettings.tsx、RustBackendSettingsDialog.tsx、api/chatErrors.ts、tests/model-compaction-ui.test.mjs；原生 src-tauri/src/backend_ipc_tests.rs。
+- 触发：每次基础文本请求入轮次前估算完整序列化消息（含实时任务、旧检查点、近期历史、最新输入），达到 compactPercent × 可用输入容量，或原始增量达到 200 条等消息/请求体压力时尝试整理。可用输入 = 窗口 − 输出 − 安全预留；默认触发 75%。估算仍是 UTF-8 启发式，没有冒充精确 tokenizer。
+- 低水位：候选摘要替换较早的完整对话前缀，目标降至触发水位的 80%（默认 75% → 60%，设置 60% → 48%）。必须同时满足完整普通请求的窗口、256 消息、2 MiB 请求体硬上限，并确实减少估算成本或被强制整理的消息数，才提交。最新用户输入不被裁剪；实时目标/约束从可信状态加入 system，摘要作为不可信历史数据。
+- 范围与重试：增量读取最多 256 条，单次摘要来源最多 200 条/512 KiB；完整对话/工具组边界不被拆分。有界只读预检寻找能进入当前模型窗口的前缀，尽可能保留最近两轮完整对话。最多两次摘要调用，第二次要求更短摘要（4096 → 2048 UTF-8 字节）；只对无效摘要或缩减不足进行这次重试，网络/认证/超时错误不自动重试。旧检查点可再次整理，原始日志不删除。
+- 失败：只在完整原始上下文本身可发送且快照未变时回退原上下文，不声称整理成功；否则明确报错，不发普通请求、不创建文字轮次。无效/未够低水位摘要、来源超限、取消、目标或新消息变化均不覆盖旧检查点。最新必需输入自身超窗时，在调用摘要之前拒绝。
+- 提交：Repository::save_checkpoint_guarded 支持较早前缀，但以完整最新 Snapshot 做 A4 CAS，前缀必须为同会话事件、不得后退或拆开工具调用/结果组，引用不得超过前缀。事务写入前和最终提交前检查取消，已观察到取消则回滚 checkpoint/revision；若有效提交先于停止胜出，保留有效检查点但不继续普通模型请求。成功后重读并按新 revision 入轮次。
+- 配置与停止：在途请求冻结用户所属模型配置和原生密钥，摘要期间设置修改/删除不能改路由；后续请求使用最新配置。准备阶段仍注册准确 requestId，可在首个文字帧/轮次入库前停止；停止、丢弃订阅、重读旧完成回执均不重新摘要或重发模型。
+- 工具边界：check_after_tool_batch 校验完整真实调用/结果组并返回预算/触发信息，显式 unknown 仍为未知；不制造成功结果、不执行工具。当前文本请求继续拒绝工具历史，真实工具循环在 D1/D4 接入，不能把本项当成 SSH 执行已完成。
+- 前端：高级参数增加 1–99% 自动整理比例，复用 ModelField、主题参数、标签与蓝色高亮；保存保留配置 ID、密钥及历史关联，锁定时仍禁用。新增容量/整理失败指导，工作区能力说明同步。C5 的占用/真实整理状态标记尚未实现；此轮没有新增 CSS 或截图，真实明暗主题/窄屏视觉验收仍留待 E6。
+
+#### C2 验证命令与结果
+
+在 Rust 库目录：
+- cargo test --offline --lib agent::：8/8（原轮次内核 6 + C2 取消事务/前缀和并行工具组 2）。
+- cargo test --offline --test agent_auto_compact --test agent_context --test agent_kernel --test agent_outputs --test agent_models --test agent_chat --test agent_compact：13+17+6+17+20+18+13 = 104/104；连同单元 8 项，共 112/112。
+- C2 集成 13 项覆盖：普通低预算无摘要、触发和硬超窗缩减、保持近期轮次/最新原文/可信约束/全量历史、无效摘要两次上限、HTTP 错误无重试且仅完整可用原文回退、缩减不足不提交、准备停止/调用方取消、新消息/目标竞态、最新必需输入超窗、SQLite 重开/请求回执重放、工具批次完整性、在途模型配置冻结、失败保留已有检查点及其后的全部证据。
+- cargo clippy --offline --lib --test agent_auto_compact --test agent_compact -- -D warnings：通过。
+- 修改的 Rust 文件 rustfmt --edition 2021 --config skip_children=true --check：通过。
+
+在客户端目录：
+- cargo test --manifest-path src-tauri/Cargo.toml --offline --lib backend_ipc::tests -- --test-threads=1：17/17。新增 2 项通过真实产品 agent_stream/dispatch/ACK 和 SQLite 验证自动压缩后 Channel 与可见历史兼容、首帧前停止摘要；其余 10 项未重复运行。
+- node --import tsx --test tests/agent-history.test.ts tests/agent-ipc.test.ts tests/ipc-transport.test.ts tests/chat-attachments.test.ts tests/chat-text-ui.test.mjs tests/model-compaction-ui.test.mjs：51/51。新增 3 项验证百分比读取/保存/身份与密钥保持、锁定交互及错误提示。
+- TypeScript noEmit 和 Vite 生产构建：通过。保留既有大 chunk 提示。
+- cargo clippy --manifest-path src-tauri/Cargo.toml --offline --lib --tests：通过，无新增告警，既有 sort_by_key/zombie_processes 告警保留；修改原生文件 rustfmt 检查通过。
+- 协议测试使用随机回环供应商与临时数据，不使用用户 Key、不访问真实供应商或 SSH 服务器。原生测试接收器/前端元素夹具不等于真实 WebView 视觉验收。未启动用户现有安装包验证、未打包。
+- schema 7、Cargo/npm 依赖锁均未改。完成标记 C2 已回填；最新续接游标 C3。commit note 只在聊天中提供。
