@@ -205,12 +205,10 @@ impl Observation {
             }
             Update::Finished(code) => {
                 if status.phase == Phase::Running {
-                    status.phase = if code.as_deref() == Some("AGENT_CANCELLED") {
-                        Phase::Cancelled
-                    } else if code.is_some() {
-                        Phase::Failed
-                    } else {
-                        Phase::Interrupted
+                    status.phase = match code.as_deref() {
+                        Some("AGENT_CANCELLED") => Phase::Cancelled,
+                        Some("AGENT_INTERRUPTED") | None => Phase::Interrupted,
+                        Some(_) => Phase::Failed,
                     };
                     status.error_code = code;
                 }

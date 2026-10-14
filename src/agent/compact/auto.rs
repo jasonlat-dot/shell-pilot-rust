@@ -613,6 +613,10 @@ fn project(
             }
         }
     }
+    // A user may append a correction while a summary is in flight. Its stale draft is
+    // rejected, but the unanswered correction must still reach the next model request.
+    // Failed/cancelled turn inputs were excluded above; only real pending user events remain.
+    messages.append(&mut pending);
     messages.push(ChatMessage::User {
         content: request.message.clone(),
     });

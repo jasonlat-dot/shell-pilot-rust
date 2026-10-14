@@ -297,6 +297,377 @@ impl Fixture {
     fn snapshot(&self) -> Snapshot {
         self.repo.snapshot(&self.session, "default").unwrap()
     }
+    async fn status(&self) -> context_status::Status {
+        self.manager
+            .context_status("model".into(), "default".into(), self.session.clone())
+            .await
+            .unwrap()
+    }
+    fn last_stream(&self) -> Value {
+        self.mock
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|body| body["stream"] == true)
+            .unwrap()
+            .clone()
+    }
+}
+
+#[tokio::test]
+async fn c6_smaller_window_recompacts_existing_checkpoint_and_keeps_constraints_and_facts() {
+    let f = Fixture::new().await;
+    let constraints = vec![
+        "不要重启服务".to_owned(),
+        "只讨论，不执行任何命令".to_owned(),
+    ];
+    f.repo
+        .start_task(
+            &f.session,
+            "default",
+            0,
+            "c6-task",
+            TaskRequest {
+                goal: "讨论备份方案".into(),
+                constraints: constraints.clone(),
+                target: None,
+            },
+        )
+        .unwrap();
+    f.chat(f.request("请保留公开报告编号 QSB-7042"))
+        .await
+        .unwrap();
+    for _ in 0..7 {
+        f.chat(f.request(&"u".repeat(1000))).await.unwrap();
+    }
+    f.config(12288, 40);
+    *f.mock.mode.lock().unwrap() = Mode::Fact;
+    f.chat(f.request("继续讨论备份")).await.unwrap();
+    let first = f.repo.checkpoint(&f.session, "default").unwrap().unwrap();
+    assert_eq!(first.content.retained_user_facts.len(), 1);
+    f.config(32768, 75);
+    *f.mock.mode.lock().unwrap() = Mode::Good; // Later summaries deliberately omit the fact.
+    for _ in 0..5 {
+        f.chat(f.request(&"other-topic".repeat(100))).await.unwrap();
+    }
+    let raw = f.events();
+    f.config(8192, 75);
+    let request = f.request("最新要求：仅列出检查步骤，不要执行。");
+    let frames = f.chat(request.clone()).await.unwrap();
+    let second = f.repo.checkpoint(&f.session, "default").unwrap().unwrap();
+    assert_ne!(first.id, second.id);
+    assert!(second.through_event_id >= first.through_event_id);
+    assert_eq!(
+        second.content.retained_user_facts,
+        first.content.retained_user_facts
+    );
+    assert_eq!(
+        second.content.task.as_ref().unwrap().constraints,
+        constraints
+    );
+    assert_eq!(&f.events()[..raw.len()], &raw);
+    let body = f.last_stream();
+    let live = c4_context(body["messages"][0]["content"].as_str().unwrap());
+    assert_eq!(live["constraints"], json!(constraints));
+    assert_eq!(
+        body["messages"].as_array().unwrap().last().unwrap()["content"],
+        request.message
+    );
+    assert!(body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message["role"] == "assistant"
+            && message["content"].as_str().unwrap().contains("QSB-7042")));
+    let status = f.status().await;
+    let usage = status.usage.unwrap();
+    assert_eq!(usage.context_window, 8192);
+    assert!(usage.input_tokens <= usage.available_input_tokens);
+    assert_eq!(status.compaction_count, 2);
+    assert_eq!(status.phase, context_status::Phase::Succeeded);
+    assert_eq!(frames.last().unwrap()["event"], "done");
+}
+
+#[tokio::test]
+async fn c6_new_constraint_during_recompaction_rejects_stale_draft_then_retries_current_context() {
+    let f = Fixture::new().await;
+    f.seed().await;
+    f.config(8192, 60);
+    f.chat(f.request("继续讨论")).await.unwrap();
+    // Consume the first summary notification before arming the next controlled race.
+    f.mock.arrived.notified().await;
+    let old = f.repo.checkpoint(&f.session, "default").unwrap().unwrap();
+    f.config(32768, 75);
+    for _ in 0..5 {
+        f.chat(f.request(&"u".repeat(1000))).await.unwrap();
+    }
+    f.config(8192, 60);
+    f.mock.requests.lock().unwrap().clear();
+    f.mock.hold.store(true, Ordering::SeqCst);
+    let manager = f.manager.clone();
+    let request = f.request("先前请求");
+    let copy = request.clone();
+    let run = tokio::spawn(async move {
+        manager
+            .chat(copy, None, &CancellationToken::new(), |_| async { Ok(()) })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), f.mock.arrived.notified())
+        .await
+        .unwrap();
+    let correction = "新增约束：不要重启，也不要覆盖现有数据库。只讨论，不执行。";
+    let inserted = f
+        .repo
+        .append(
+            &f.session,
+            "default",
+            f.snapshot().session.revision,
+            "new-constraint",
+            Payload::UserMessage {
+                text: correction.into(),
+            },
+        )
+        .unwrap()
+        .event;
+    let snapshot = f.snapshot();
+    let events = f.events();
+    f.mock.hold.store(false, Ordering::SeqCst);
+    f.mock.release.notify_one();
+    assert_eq!(
+        run.await.unwrap().unwrap_err().code(),
+        "AGENT_CONTEXT_CHANGED"
+    );
+    assert_eq!(f.snapshot(), snapshot);
+    assert_eq!(f.events(), events);
+    assert_eq!(
+        f.repo.checkpoint(&f.session, "default").unwrap().unwrap(),
+        old
+    );
+    assert_eq!(f.status().await.compaction_count, 1);
+    assert_eq!(f.streams(), 0);
+    assert!(f.manager.receipt(request).await.unwrap().is_none());
+    f.chat(f.request("请按最新约束继续")).await.unwrap();
+    let body = f.last_stream();
+    assert!(body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message["role"] == "user" && message["content"] == correction));
+    assert!(!body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message["role"] == "user" && message["content"] == "先前请求"));
+    assert_eq!(
+        body["messages"].as_array().unwrap().last().unwrap()["content"],
+        "请按最新约束继续"
+    );
+    let checkpoint = f.repo.checkpoint(&f.session, "default").unwrap().unwrap();
+    assert!(
+        checkpoint.through_event_id < inserted.id,
+        "unanswered correction stays outside the compacted prefix"
+    );
+    assert_eq!(f.streams(), 1);
+    assert_eq!(f.status().await.compaction_count, 2);
+}
+
+#[tokio::test]
+async fn c6_dropped_summary_is_interrupted_and_reopen_keeps_the_last_committed_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c6.sqlite3");
+    let f = Fixture::with_store(Arc::new(Store::open(&path).unwrap())).await;
+    f.seed().await;
+    f.config(8192, 60);
+    let completed = f.request("已完成的请求");
+    f.chat(completed.clone()).await.unwrap();
+    f.mock.arrived.notified().await;
+    let checkpoint = f.repo.checkpoint(&f.session, "default").unwrap().unwrap();
+    f.config(32768, 75);
+    for _ in 0..5 {
+        f.chat(f.request(&"u".repeat(1000))).await.unwrap();
+    }
+    f.config(8192, 60);
+    f.mock.requests.lock().unwrap().clear();
+    f.mock.hold.store(true, Ordering::SeqCst);
+    let request = f.request("整理中断的请求");
+    let copy = request.clone();
+    let manager = f.manager.clone();
+    let run = tokio::spawn(async move {
+        manager
+            .chat(copy, None, &CancellationToken::new(), |_| async { Ok(()) })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), f.mock.arrived.notified())
+        .await
+        .unwrap();
+    let before = f.snapshot();
+    let events = f.events();
+    run.abort();
+    assert!(run.await.unwrap_err().is_cancelled());
+    let status = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let status = f.status().await;
+            if status.phase != context_status::Phase::Running {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(status.phase, context_status::Phase::Interrupted);
+    assert_eq!(status.error_code.as_deref(), Some("AGENT_INTERRUPTED"));
+    assert_eq!(status.compaction_count, 1);
+    assert_eq!(f.snapshot(), before);
+    assert_eq!(f.events(), events);
+    assert_eq!(f.streams(), 0);
+    let mock = f.mock.clone();
+    mock.hold.store(false, Ordering::SeqCst);
+    mock.release.notify_one();
+    let session = f.session.clone();
+    drop(f);
+    let store = Arc::new(Store::open(&path).unwrap());
+    let manager = Manager::new(store.clone(), CancellationToken::new());
+    let status = manager
+        .context_status("model".into(), "default".into(), session.clone())
+        .await
+        .unwrap();
+    assert_eq!(status.phase, context_status::Phase::Interrupted);
+    assert_eq!(status.compaction_count, 1);
+    let repo = Repository::new(store.clone());
+    assert_eq!(
+        repo.checkpoint(&session, "default").unwrap().unwrap(),
+        checkpoint
+    );
+    assert_eq!(repo.events(&session, "default", 0, 200).unwrap(), events);
+    assert!(manager.receipt(request.clone()).await.unwrap().is_none());
+    // A successful old request is replayed from SQLite with the former model server gone.
+    let mut frames = Vec::new();
+    manager
+        .chat(completed, None, &CancellationToken::new(), |event| {
+            frames.push(event);
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+    assert_eq!(frames.len(), 1);
+    assert!(matches!(frames[0], StreamEvent::Done { .. }));
+    // Restore only the temporary model endpoint, then continue from the same persisted session.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/v1/", listener.local_addr().unwrap());
+    let router = Router::new()
+        .route("/v1/chat/completions", post(handler))
+        .with_state(mock.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let models = ModelRepository::new(store);
+    let profile = models.get("model", "default").unwrap();
+    let mut config = profile.config;
+    config.base_url = base;
+    models
+        .save(
+            "model",
+            "default",
+            profile.revision,
+            ModelConfigUpdate {
+                config,
+                api_key: KeyChange::Keep,
+            },
+        )
+        .unwrap();
+    mock.requests.lock().unwrap().clear();
+    let followup = Request {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        message: "恢复后继续讨论，不执行命令".into(),
+        ..request
+    };
+    frames.clear();
+    manager
+        .chat(followup, None, &CancellationToken::new(), |event| {
+            frames.push(event);
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+    assert!(matches!(frames.last().unwrap(), StreamEvent::Done { .. }));
+    let status = manager
+        .context_status("model".into(), "default".into(), session.clone())
+        .await
+        .unwrap();
+    assert_eq!(status.compaction_count, 2);
+    assert_eq!(status.phase, context_status::Phase::Succeeded);
+    assert_eq!(
+        mock.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|body| body["stream"] == true)
+            .count(),
+        1
+    );
+    assert_eq!(
+        &repo.events(&session, "default", 0, 200).unwrap()[..events.len()],
+        &events
+    );
+    manager.shutdown();
+    server.abort();
+}
+
+#[tokio::test]
+async fn c6_unsupported_attachments_and_oversized_text_cannot_mutate_compacted_history() {
+    let f = Fixture::new().await;
+    f.seed().await;
+    f.config(8192, 60);
+    f.chat(f.request("继续")).await.unwrap();
+    let checkpoint = f.repo.checkpoint(&f.session, "default").unwrap().unwrap();
+    let snapshot = f.snapshot();
+    let events = f.events();
+    let status = serde_json::to_value(f.status().await).unwrap();
+    f.mock.requests.lock().unwrap().clear();
+    for count in [1, 256] {
+        let mut request = f.request("这个附件不应被读取或静默忽略");
+        request.attachments = (0..count)
+            .map(|i| chat::Attachment {
+                file_id: format!("large-media-{i}"),
+            })
+            .collect();
+        assert_eq!(
+            f.chat(request).await.unwrap_err().code(),
+            "FEATURE_NOT_MIGRATED"
+        );
+    }
+    assert_eq!(
+        f.chat(f.request(&"中".repeat(5334)))
+            .await
+            .unwrap_err()
+            .code(),
+        "AGENT_INVALID_REQUEST"
+    );
+    assert_eq!(f.snapshot(), snapshot);
+    assert_eq!(f.events(), events);
+    assert_eq!(
+        f.repo.checkpoint(&f.session, "default").unwrap().unwrap(),
+        checkpoint
+    );
+    assert_eq!(serde_json::to_value(f.status().await).unwrap(), status);
+    assert!(f.mock.requests.lock().unwrap().is_empty());
+    // A syntactically valid but over-budget message also cannot trigger a futile summary.
+    f.config(1024, 60);
+    assert_eq!(
+        f.chat(f.request(&"input".repeat(1000)))
+            .await
+            .unwrap_err()
+            .code(),
+        "MODEL_CONTEXT_LIMIT"
+    );
+    assert_eq!(f.snapshot(), snapshot);
+    assert!(f.mock.requests.lock().unwrap().is_empty());
+    f.config(8192, 60);
+    f.chat(f.request("返回正常文字对话")).await.unwrap();
+    assert_eq!(f.streams(), 1);
 }
 
 #[tokio::test]
