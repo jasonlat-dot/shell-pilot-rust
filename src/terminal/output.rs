@@ -128,6 +128,7 @@ impl Output {
 pub(super) struct Session {
     pub id: String,
     pub connection_id: String,
+    pub identity: super::AgentIdentity,
     pub writer: Mutex<Option<std::sync::Arc<russh::ChannelWriteHalf<russh::client::Msg>>>>,
     pub output: Mutex<Output>,
     pub changed: Notify,

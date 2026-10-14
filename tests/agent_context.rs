@@ -405,7 +405,7 @@ fn restart_restores_checkpoint_raw_events_and_uncertain_actions() {
         schema
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        8
+        10
     );
 }
 #[test]
@@ -699,4 +699,163 @@ fn explicit_unknown_output_remains_uncertain_in_checkpoint_and_after_restart() {
             .uncertain_tool_call_ids,
         vec!["x"]
     );
+}
+
+#[test]
+fn conversation_scopes_and_separate_checkpoint_survive_database_reopen() {
+    use shellpilot_server::agent::{ScopeKind, ServerIdentity};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("scopes.sqlite3");
+    let (root, a, b, checkpoint, raw, scope) = {
+        let repo = Repository::new(Arc::new(Store::open(&path).unwrap()));
+        let root = repo.create_general_session("ssh-agent", "default").unwrap();
+        let target = Target {
+            connection_id: "connection-a".into(),
+            terminal_session_id: "pty-a".into(),
+        };
+        let identity = ServerIdentity {
+            host: "a.example".into(),
+            port: 22,
+            username: "tester".into(),
+            host_key: "SHA256:actual-host-a".into(),
+        };
+        let a = repo
+            .server_scope(
+                "ssh-agent",
+                "default",
+                &root.id,
+                &target,
+                identity.clone(),
+                false,
+            )
+            .unwrap();
+        let b = repo
+            .server_scope("ssh-agent", "default", &root.id, &target, identity, true)
+            .unwrap();
+        repo.start_task(
+            &a.id,
+            "default",
+            0,
+            "task-a",
+            TaskRequest {
+                goal: "A-only".into(),
+                constraints: vec!["只读".into()],
+                target: None,
+            },
+        )
+        .unwrap();
+        repo.append(
+            &a.id,
+            "default",
+            1,
+            "user-a",
+            Payload::UserMessage {
+                text: "A 原文🙂".into(),
+            },
+        )
+        .unwrap();
+        repo.append(
+            &a.id,
+            "default",
+            2,
+            "reply-a",
+            Payload::AssistantMessage {
+                text: "A 诊断".into(),
+            },
+        )
+        .unwrap();
+        let snap = repo.snapshot(&a.id, "default").unwrap();
+        let checkpoint = repo.save_checkpoint(&snap, content(&snap)).unwrap();
+        (
+            root.id,
+            a.id.clone(),
+            b.id,
+            checkpoint.id,
+            repo.events(&a.id, "default", 0, 200).unwrap(),
+            a.scope.unwrap(),
+        )
+    };
+    let repo = Repository::new(Arc::new(Store::open(&path).unwrap()));
+    assert_eq!(repo.scopes("ssh-agent", "default", &root).unwrap().len(), 3);
+    assert_eq!(
+        repo.session(&root, "default").unwrap().scope.unwrap().kind,
+        ScopeKind::General
+    );
+    assert_eq!(repo.session(&a, "default").unwrap().scope.unwrap(), scope);
+    assert_eq!(
+        repo.checkpoint(&a, "default").unwrap().unwrap().id,
+        checkpoint
+    );
+    assert_eq!(repo.events(&a, "default", 0, 200).unwrap(), raw);
+    assert!(
+        repo.checkpoint(&root, "default").unwrap().is_none()
+            && repo.checkpoint(&b, "default").unwrap().is_none()
+    );
+    assert!(repo.events(&b, "default", 0, 200).unwrap().is_empty());
+    assert!(matches!(
+        repo.scopes("ssh-agent", "other", &root),
+        Err(Error::NotFound)
+    ));
+}
+#[test]
+fn schema_eight_upgrade_keeps_legacy_target_events_and_checkpoint_without_promoting_to_general() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("legacy.sqlite3");
+    let (snapshot, raw, checkpoint) = {
+        let repo = Repository::new(Arc::new(Store::open(&path).unwrap()));
+        let old = repo.create_session("ssh-agent", "default").unwrap();
+        repo.start_task(&old.id, "default", 0, "legacy", task("old-a"))
+            .unwrap();
+        let snap = repo.snapshot(&old.id, "default").unwrap();
+        let checkpoint = repo.save_checkpoint(&snap, content(&snap)).unwrap().id;
+        (
+            repo.snapshot(&old.id, "default").unwrap(),
+            repo.events(&old.id, "default", 0, 200).unwrap(),
+            checkpoint,
+        )
+    };
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch("DROP TABLE agent_session_scopes; PRAGMA user_version=8;")
+        .unwrap();
+    drop(db);
+    let repo = Repository::new(Arc::new(Store::open(&path).unwrap()));
+    assert_eq!(
+        repo.snapshot(&snapshot.session.id, "default").unwrap(),
+        snapshot
+    );
+    assert_eq!(
+        repo.events(&snapshot.session.id, "default", 0, 200)
+            .unwrap(),
+        raw
+    );
+    assert_eq!(
+        repo.checkpoint(&snapshot.session.id, "default")
+            .unwrap()
+            .unwrap()
+            .id,
+        checkpoint
+    );
+    assert!(repo
+        .session(&snapshot.session.id, "default")
+        .unwrap()
+        .scope
+        .is_none());
+    assert!(repo
+        .server_scope(
+            "ssh-agent",
+            "default",
+            &snapshot.session.id,
+            &Target {
+                connection_id: "old-a".into(),
+                terminal_session_id: "new".into()
+            },
+            shellpilot_server::agent::ServerIdentity {
+                host: "new".into(),
+                port: 22,
+                username: "tester".into(),
+                host_key: "SHA256:new".into()
+            },
+            false
+        )
+        .is_err());
 }

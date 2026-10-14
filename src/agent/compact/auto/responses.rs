@@ -108,9 +108,25 @@ impl Controller {
             messages: vec![],
             tools: vec![],
         };
-        // Reinject exactly the current trusted system goal/constraints/target, not provider instructions.
+        // Rebuild host-owned context after the network operation, never take authority from its window.
+        self.check_live(request, &target).await?;
+        let store = self.store.clone();
+        let r = request.clone();
+        let t = target.clone();
+        let frozen = context.runtime.clone();
+        let source = self.source.clone();
+        let fresh = worker(move || load(store, &r, t, Some(frozen), source)).await?;
+        if fresh.snapshot != context.snapshot {
+            return Err(Error::ContextChanged);
+        }
+        let reinjected = project(
+            &fresh,
+            request,
+            &target,
+            Some((fresh.snapshot.through_event_id, None)),
+        )?;
         next.messages.extend(
-            initial
+            reinjected
                 .messages
                 .iter()
                 .filter(|m| {
@@ -178,6 +194,7 @@ impl Controller {
         };
         let repo = Repository::new(self.store.clone());
         let snap = context.snapshot.clone();
+        self.check_live(request, &target).await?;
         let stop = cancel.clone();
         let committed = worker(move || {
             stop.check()?;
@@ -197,14 +214,29 @@ impl Controller {
         .await?;
         cancel.check()?;
         // Admission still checks this revision. No provider window can overwrite a newer message/target.
-        let current =
-            Repository::new(self.store.clone()).snapshot(&request.session_id, &request.user_id)?;
-        if current.session.revision != committed.committed_revision {
+        let store = self.store.clone();
+        let r = request.clone();
+        let t = target.clone();
+        let frozen = context.runtime.clone();
+        let source = self.source.clone();
+        let current = worker(move || load(store, &r, t, Some(frozen), source)).await?;
+        if current.snapshot.session.revision != committed.committed_revision {
             return Err(Error::ContextChanged);
         }
+        let rebuilt = project(&current, request, &target, None)?;
+        let prepared = if protocol::body(&current.runtime.config, &rebuilt)?
+            != protocol::body(&context.runtime.config, &next)?
+        {
+            let operation = model.prepare_responses(&rebuilt, &cancel.local);
+            let (prepared, tokens) = tokio::select! {biased;_=cancel.caller.cancelled()=>return Err(ModelError::Cancelled.into()),result=operation=>result?};
+            model.require_fit(tokens)?;
+            prepared
+        } else {
+            prepared
+        };
         Ok(Prepared {
             runtime: context.runtime,
-            request: next,
+            request: rebuilt,
             revision: committed.committed_revision,
             responses: Some(prepared),
         })

@@ -7,7 +7,7 @@ use russh::keys::{
 use sha1::Sha1;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
 pub(crate) struct HostVerifier {
@@ -15,6 +15,7 @@ pub(crate) struct HostVerifier {
     host: String,
     entries: Vec<Entry>,
     pub rejected: Arc<AtomicBool>,
+    pub identity: Arc<Mutex<Option<String>>>,
 }
 
 impl HostVerifier {
@@ -51,6 +52,7 @@ impl HostVerifier {
             host,
             entries,
             rejected: Arc::new(AtomicBool::new(false)),
+            identity: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -91,6 +93,12 @@ impl russh::client::Handler for HostVerifier {
         let accepted = self.accepts(key);
         if !accepted {
             self.rejected.store(true, Ordering::SeqCst);
+        } else {
+            *self.identity.lock().unwrap() = Some(
+                key.public_key()
+                    .fingerprint(russh::keys::HashAlg::Sha256)
+                    .to_string(),
+            );
         }
         Ok(accepted)
     }

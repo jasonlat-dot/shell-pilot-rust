@@ -24,8 +24,10 @@ pub enum Error {
     Busy,
     #[error("Agent 请求参数无效")]
     Invalid,
-    #[error("会话绑定的终端与本次目标不一致，请新建会话")]
+    #[error("当前连接与任务的服务器身份不一致，请选择对应任务或新建服务器任务")]
     TargetMismatch,
+    #[error("当前 SSH 连接不可用；仍可讨论已有记录，新建服务器任务或实时操作需先连接")]
+    TargetUnavailable,
     #[error("附件和工具对话尚未接入")]
     Unsupported,
     #[error("历史过长或已有检查点，需要后续压缩/恢复支持")]
@@ -85,6 +87,7 @@ impl Error {
             Self::Busy => "AGENT_BUSY",
             Self::Invalid => "AGENT_INVALID_REQUEST",
             Self::TargetMismatch => "AGENT_TARGET_MISMATCH",
+            Self::TargetUnavailable => "AGENT_TARGET_UNAVAILABLE",
             Self::Unsupported => "FEATURE_NOT_MIGRATED",
             Self::HistoryLimit => "AGENT_HISTORY_LIMIT",
             Self::CompactionFailed => "AGENT_COMPACTION_FAILED",
@@ -99,7 +102,7 @@ impl Error {
     pub fn status(&self) -> u16 {
         match self {
             Self::NotFound => 404,
-            Self::Busy | Self::TargetMismatch => 409,
+            Self::Busy | Self::TargetMismatch | Self::TargetUnavailable => 409,
             Self::Invalid => 400,
             Self::Unsupported => 501,
             Self::Stopped => 503,
@@ -114,7 +117,10 @@ impl Error {
             Self::Conflict | Self::ContextChanged => 409,
             Self::Recorded(code) => match code.as_str() {
                 "MODEL_TIMEOUT" => 504,
-                "AGENT_INTERRUPTED" | "AGENT_CANCELLED" | "AGENT_CONTEXT_CHANGED" => 409,
+                "AGENT_INTERRUPTED"
+                | "AGENT_CANCELLED"
+                | "AGENT_CONTEXT_CHANGED"
+                | "AGENT_TARGET_UNAVAILABLE" => 409,
                 "MODEL_RESPONSE_LIMIT" | "MODEL_CONTEXT_LIMIT" | "AGENT_HISTORY_LIMIT" => 413,
                 _ => 502,
             },
@@ -167,6 +173,7 @@ pub struct Manager {
     store: Arc<Store>,
     stop: CancellationToken,
     active: Mutex<HashMap<ActiveKey, Active>>,
+    live: super::live::Source,
 }
 struct Running<'a> {
     manager: &'a Manager,
@@ -246,10 +253,28 @@ fn recorded(turn: &Turn) -> Error {
 impl Manager {
     pub fn new(store: Arc<Store>, stop: CancellationToken) -> Self {
         Self {
+            live: super::live::Source::new(store.clone(), None),
             store,
             stop,
             active: Mutex::new(HashMap::new()),
         }
+    }
+    pub fn with_terminals(
+        store: Arc<Store>,
+        stop: CancellationToken,
+        terminals: Arc<crate::terminal::TerminalManager>,
+    ) -> Self {
+        let mut manager = Self::new(store.clone(), stop);
+        manager.live = super::live::Source::new(store, Some(terminals));
+        manager
+    }
+    async fn capture_live(
+        &self,
+        request: Request,
+        target: Option<Target>,
+    ) -> Result<super::live::Live> {
+        let source = self.live.clone();
+        worker(move || source.capture_for(&request, &target)).await
     }
     pub fn shutdown(&self) {
         self.stop.cancel();
@@ -294,6 +319,170 @@ impl Manager {
                 return Err(ModelError::KeyMissing.into());
             }
             Ok(Repository::new(store).create_session(&agent, &user)?.id)
+        })
+        .await
+    }
+    pub async fn create_general_session(
+        &self,
+        agent: String,
+        user: String,
+    ) -> Result<super::Session> {
+        if self.stop.is_cancelled() {
+            return Err(Error::Stopped);
+        }
+        let store = self.store.clone();
+        worker(move || {
+            if !ModelRepository::new(store.clone())
+                .get(&agent, &user)?
+                .ready
+            {
+                return Err(ModelError::KeyMissing.into());
+            }
+            Repository::new(store)
+                .create_general_session(&agent, &user)
+                .map_err(Error::from)
+        })
+        .await
+    }
+    pub async fn server_scope(
+        &self,
+        agent: String,
+        user: String,
+        root: String,
+        terminal: String,
+        new_task: bool,
+    ) -> Result<super::Session> {
+        if self.stop.is_cancelled() {
+            return Err(Error::Stopped);
+        }
+        let source = self.live.clone();
+        let store = self.store.clone();
+        worker(move || {
+            let (connection, identity) = source.server_identity(&terminal, &user)?;
+            Repository::new(store)
+                .server_scope(
+                    &agent,
+                    &user,
+                    &root,
+                    &Target {
+                        connection_id: connection,
+                        terminal_session_id: terminal,
+                    },
+                    identity,
+                    new_task,
+                )
+                .map_err(Error::from)
+        })
+        .await
+    }
+    pub async fn scopes(
+        &self,
+        agent: String,
+        user: String,
+        root: String,
+    ) -> Result<Vec<super::Session>> {
+        let store = self.store.clone();
+        worker(move || {
+            Repository::new(store)
+                .scopes(&agent, &user, &root)
+                .map_err(Error::from)
+        })
+        .await
+    }
+    pub async fn projects(&self, user: String) -> Result<Vec<super::Project>> {
+        let repo = Repository::new(self.store.clone());
+        worker(move || repo.projects(&user).map_err(Error::from)).await
+    }
+    pub async fn create_project(
+        &self,
+        user: String,
+        name: String,
+        connection: String,
+    ) -> Result<super::Project> {
+        if self.stop.is_cancelled() {
+            return Err(Error::Stopped);
+        }
+        let repo = Repository::new(self.store.clone());
+        worker(move || {
+            repo.create_project(&user, &name, &connection)
+                .map_err(Error::from)
+        })
+        .await
+    }
+    pub async fn project_chats(
+        &self,
+        user: String,
+        project: Option<String>,
+        after: String,
+    ) -> Result<super::ProjectChats> {
+        let repo = Repository::new(self.store.clone());
+        worker(move || {
+            repo.project_chats(&user, project.as_deref(), &after)
+                .map_err(Error::from)
+        })
+        .await
+    }
+    pub async fn project_terminal(
+        &self,
+        user: String,
+        project: String,
+        terminal: String,
+    ) -> Result<super::Project> {
+        if self.stop.is_cancelled() {
+            return Err(Error::Stopped);
+        }
+        let source = self.live.clone();
+        let repo = Repository::new(self.store.clone());
+        worker(move || {
+            let (connection, identity) = source.server_identity(&terminal, &user)?;
+            repo.bind_project(&project, &user, &connection, &identity)
+                .map_err(Error::from)
+        })
+        .await
+    }
+    pub async fn project_chat(
+        &self,
+        user: String,
+        project: String,
+        agent: String,
+        terminal: String,
+    ) -> Result<super::Session> {
+        if self.stop.is_cancelled() {
+            return Err(Error::Stopped);
+        }
+        let source = self.live.clone();
+        let store = self.store.clone();
+        worker(move || {
+            if !ModelRepository::new(store.clone())
+                .get(&agent, &user)?
+                .ready
+            {
+                return Err(ModelError::KeyMissing.into());
+            }
+            let (connection, identity) = source.server_identity(&terminal, &user)?;
+            Repository::new(store)
+                .create_project_chat(
+                    &project,
+                    &user,
+                    &agent,
+                    &Target {
+                        connection_id: connection,
+                        terminal_session_id: terminal,
+                    },
+                    identity,
+                )
+                .map_err(Error::from)
+        })
+        .await
+    }
+    pub async fn text_target(&self, request: Request) -> Result<Option<Target>> {
+        let store = self.store.clone();
+        worker(move || {
+            let session = Repository::new(store).session(&request.session_id, &request.user_id)?;
+            if session.agent_id != request.agent_id {
+                return Err(Error::NotFound);
+            }
+            Ok(session.task.and_then(|t| t.target))
         })
         .await
     }
@@ -435,11 +624,22 @@ impl Manager {
             }
             return Err(recorded(&turn));
         }
-        if request.terminal_session_id
-            != target
-                .as_ref()
-                .map(|t| t.terminal_session_id.as_str())
-                .unwrap_or("")
+        let request_copy = request.clone();
+        let store = self.store.clone();
+        let scoped = worker(move || {
+            Ok(Repository::new(store)
+                .session(&request_copy.session_id, &request_copy.user_id)?
+                .scope
+                .is_some())
+        })
+        .await?;
+        if !scoped
+            && !request.terminal_session_id.is_empty()
+            && request.terminal_session_id
+                != target
+                    .as_ref()
+                    .map(|t| t.terminal_session_id.as_str())
+                    .unwrap_or("")
         {
             return Err(Error::TargetMismatch);
         }
@@ -476,9 +676,14 @@ impl Manager {
             partial: partial.clone(),
             finished: true,
         };
-        let prepared = super::compact::auto::Controller::new(self.store.clone())
-            .prepare_text(&request, target.clone(), &token, cancel)
-            .await?;
+        let prepared =
+            super::compact::auto::Controller::with_source(self.store.clone(), self.live.clone())
+                .prepare_text(&request, target.clone(), &token, cancel)
+                .await?;
+        let prepared =
+            super::compact::auto::Controller::with_source(self.store.clone(), self.live.clone())
+                .refresh_text(prepared, &request, target.clone(), &token, cancel)
+                .await?;
         if token.is_cancelled() || cancel.is_cancelled() {
             return Err(ModelError::Cancelled.into());
         }
@@ -528,6 +733,8 @@ impl Manager {
         let turns = Turns::new(self.store.clone());
         let mut persisted = 0usize;
         let mut last_save = std::time::Instant::now();
+        self.capture_live(request.clone(), admission.0.target.clone())
+            .await?;
         let result = tokio::select! {biased;_=cancel.cancelled()=>Err(ModelError::Cancelled),
         result=client.stream_with_responses(&chat, response_prepared,&token,|content| {
             let current={let mut text=partial.lock().unwrap();text.push_str(&content);text.clone()};

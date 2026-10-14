@@ -135,4 +135,23 @@ Windows 本轮结果：模型测试 18 项 + 原 Agent 内核 40 项，共 58/58
 - [Input token counting](https://developers.openai.com/api/reference/go/resources/responses/subresources/input_tokens/methods/count)
 - [Responses streaming](https://developers.openai.com/api/docs/guides/streaming-responses)
 
-阶段测试与续接游标只维护 AGENT_PROGRESS.md。C4 完整环境/可信授权重注入与 C5 占用/真实整理事件提示仍待后续阶段。
+阶段测试与续接游标只维护 AGENT_PROGRESS.md。C5 占用/真实整理事件提示仍待后续阶段。
+
+## C4：实时上下文重新注入
+
+普通摘要和 Responses 整理后，都从当前宿主与 SQLite 快照重建目标、约束、任务身份和环境，再附上最新用户原文。任务或消息版本改变时拒绝旧结果，不用摘要替换当前任务。Responses 的新请求重新构造 instructions；完整规范窗口仍原样保留。提交后再次读取，确认重建请求仍满足预算才允许发送；若离线状态改变导致投影不同，则对新请求重新计数和检查容量，不能使用旧计数。
+
+产品 Agent 与终端共用同一个 TerminalManager：根据绑定 terminalSessionId 检查连接有效性、connectionId 和当前用户归属；主机/端口/用户名来自该 PTY 打开时实际使用的连接身份，修改保存的连接配置不会让已存在的 PTY 冒充新主机。每次准备、整理后、提交前及入轮次/发模型前复核。C4R 调整后，文字生成/整理只受用户停止与工作区停止取消；关闭 SSH 保留文字续聊，不再持有执行用的终端生命周期 lease。同一实际 host/port/username/hostKey 的新 PTY 可提供后续文字环境，身份变化拒绝绑定；已完成请求回执只读重放，不依赖活终端。真正工具执行的 lease/授权仍属于 D 阶段。
+
+环境区分本机 desktopOs 与远端系统/目录。没有执行远端探测，远端 os/cwd 明确为 null/未知；不把本机 Windows、保存的 startupCommand、终端输出或旧摘要当成远端事实。只向模型提供必要的非敏感身份，不发送 SSH 密码、私钥、启动脚本或 known_hosts。库级没有终端宿主的调用明确标记 verified=false，不能宣称实际在线；产品始终使用带终端宿主的管理器。
+
+可信权限目前是 Rust 宿主确定的 textOnly：sshExecute/localExecute=false，tools/approvals 为空。它不由 IPC 参数、模型返回窗口、摘要、root 身份或用户手动终端操作推导。目标/环境字段中的用户字符串仍按数据处理。本阶段没有实现命令授权存储或执行器，D3 接入真实审批时需替换为原生授权来源，不能将本项描述成已经支持命令确认。
+
+参考本机固定 Codex 提交 f82e36592278a0a782fb0d0fc97e5fa10e832ac2 的 compact.rs/build_compaction_replacement_history、session/mod.rs/build_initial_context_with_world_state 和 context/world_state/compact_permissions.rs：采用宿主重建环境/权限并保持最新用户请求的原则。ShellPilot 不引入 CLI 工作目录、沙箱权限前缀、插件世界状态或自动 SSH 探测；按桌面绑定终端和当前文字能力实现。
+
+
+## C4R：持久服务器项目与独立聊天
+
+默认普通对话与终端页签无关；每个服务器项目保存用户归属、连接 ID、创建时连接资料快照和首次实际 SSH 密钥身份。新项目聊天有独立 server scope/sessionId、原始日志、检查点和 Responses 窗口。恢复历史不调用 create_session/project_chat：按原会话/原模型读取，连接成功后调用 project_terminal 核对实际身份。同项目也不合并不同聊天或不同模型的窗口。
+
+schema 9 增加 agent_session_scopes，schema 10 增加 agent_projects/agent_project_chats，并给既有服务器历史补侧边栏归属；原事件与检查点不重写。普通/项目聊天可离线文字续聊，远端 OS/CWD 没有探测仍未知；副作用工具和审批仍在 D。更早缺少完整 SSH 身份的记录归档，不从编辑后的连接资料制造历史身份。当前终端选区只能加入来源项目已核对的终端所对应的聊天。

@@ -28,6 +28,17 @@ use std::{
 use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
+/// Non-secret identity captured from the connection actually used to open this channel.
+#[derive(Clone)]
+pub(crate) struct AgentIdentity {
+    pub connection_id: String,
+    pub user_id: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub host_key: String,
+}
+
 const HISTORY_TTL: Duration = Duration::from_secs(300);
 const MAX_REQUESTS: usize = 4096;
 
@@ -78,6 +89,7 @@ impl Drop for NetworkGuard {
 pub(crate) struct Transport {
     _network: NetworkGuard,
     handle: Option<client::Handle<HostVerifier>>,
+    host_key: Arc<Mutex<Option<String>>>,
 }
 impl Transport {
     pub(crate) fn is_closed(&self) -> bool {
@@ -256,7 +268,11 @@ impl TerminalManager {
         runtime
             .transports
             .retain(|entry| !entry.transport.is_closed() && entry.active() > 0);
-        if let Some(entry) = runtime.transports.iter().find(|entry| !fresh && entry.available()) {
+        if let Some(entry) = runtime
+            .transports
+            .iter()
+            .find(|entry| !fresh && entry.available())
+        {
             return Ok(entry.clone());
         }
         if runtime.transports.len() >= self.settings.transports_per_connection {
@@ -421,6 +437,20 @@ impl TerminalManager {
                 let session = Arc::new(Session {
                     id: session_id.clone(),
                     connection_id: request.connection_id.clone(),
+                    identity: AgentIdentity {
+                        connection_id: connection.connection_id.clone(),
+                        user_id: connection.user_id.clone(),
+                        host: connection.host.clone(),
+                        port: connection.port,
+                        username: connection.username.clone(),
+                        host_key: entry
+                            .transport
+                            .host_key
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .ok_or(Error::HostKey)?,
+                    },
                     writer: Mutex::new(Some(writer.clone())),
                     output: Mutex::new(Output::new()),
                     changed: Notify::new(),
@@ -523,6 +553,14 @@ impl TerminalManager {
             .get(id)
             .cloned()
             .ok_or(Error::TerminalMissing)
+    }
+    pub(crate) fn agent_identity(&self, id: &str) -> Option<(AgentIdentity, bool)> {
+        self.prune();
+        let session = self.session(id).ok()?;
+        Some((
+            session.identity.clone(),
+            session.state().connected && !session.stop.is_cancelled(),
+        ))
     }
     pub fn connected(&self, id: &str) -> ConnectionState {
         self.prune();
@@ -718,6 +756,7 @@ pub(crate) async fn authenticate(
 ) -> Result<Transport, Error> {
     let verifier = HostVerifier::new(connection)?;
     let rejected = verifier.rejected.clone();
+    let host_key = verifier.identity.clone();
     let preferred = russh::Preferred {
         key: Cow::Owned(vec![
             Algorithm::Ed25519,
@@ -777,6 +816,7 @@ pub(crate) async fn authenticate(
     let mut transport = Transport {
         _network: network,
         handle: Some(handle),
+        host_key,
     };
     let handle = transport.handle.as_mut().unwrap();
     let result = if connection.auth_type == 1 {

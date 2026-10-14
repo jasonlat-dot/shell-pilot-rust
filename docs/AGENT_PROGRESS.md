@@ -1,6 +1,6 @@
 # Rust SSH Agent 实施清单与续接入口
 
-更新日期：2026-10-14。状态：阶段 5 实施中，模型设置、文本对话、原生历史及 C1–C3 整理路径已启用。
+更新日期：2026-10-14。状态：阶段 5 实施中，模型设置、文本对话、持久项目工作区及 C1–C4/C4R 整理/宿主上下文路径已启用。
 用户要求：参考 Codex CLI 优化上下文和工具决策；先列清单，每完成一项更新标记，供换窗口后续接。当前不打包。需要修改前端的阶段同步修改 test-rust-ui。
 源码参考与设计依据：[CODEX_AGENT_REFERENCE.md](CODEX_AGENT_REFERENCE.md)。本文件是进度唯一入口，完成标记必须有代码与验证证据，不以“已设计”替代“已实现”。
 
@@ -8,8 +8,8 @@ Rust 重构交接、已完成工作与运行方式见 [WORK_HANDOFF_2026-10-14.m
 
 ## 工作目录与约束
 
-- Rust（当前本机）：E:/project/ShellPilot/ai-ssh-terminal-server-rust，main，HEAD 0b0b47a（包含 c4bd68d）
-- 前端（当前本机）：E:/project/ShellPilot/ai-ssh-terminal-client，test-rust-ui，HEAD 3585c82（包含 b7a9735）
+- Rust（当前本机）：E:/project/ShellPilot/ai-ssh-terminal-server-rust，main，HEAD 0c27b34（包含 c4bd68d）
+- 前端（当前本机）：E:/project/ShellPilot/ai-ssh-terminal-client，test-rust-ui，HEAD 980ecb6（包含 b7a9735）
 - Java 参考（当前本机）：E:/project/ShellPilot/ai-ssh-terminal-server，保留原实现
 - Codex 参考：E:/project/ai-ssh/artifacts/codex-reference，提交 f82e36592278a0a782fb0d0fc97e5fa10e832ac2
 - 安装包：E:/project/ShellPilot/releases，最新 0.4.0；页签切换修复在源码，尚未打进安装包。
@@ -43,7 +43,8 @@ Rust 重构交接、已完成工作与运行方式见 [WORK_HANDOFF_2026-10-14.m
 - [x] C1 普通模型语义摘要适配器与摘要结构校验，不开放副作用工具。只返回经校验的摘要草稿；13 项专门测试、相关 Agent 97 项及原生 IPC 15 项通过，自动触发/低水位/提交仍待 C2。
 - [x] C2 自动压缩状态机：当前文字模型请求前自动检查、较低水位、有限重试和检查点提交；工具批次预算边界已提供并验证，真实工具循环接入留给 D1/D4。失败保留日志/旧检查点；Agent 112、桌面 IPC 17、前端 51 项通过。
 - [x] C3 支持的 Responses 供应商远端压缩能力分支；完整保存/复用返回窗口，用供应商输入计数验证预算，绑定原模型/接口/凭据，前端明确配置能力。专测 17、相关 Agent 130、桌面 IPC 19、前端 58 项通过。
-- [ ] C4 压缩后重新注入实时目标、环境、可信授权与最新用户请求。
+- [x] C4 压缩后重新注入实时目标、环境、可信授权与最新用户请求。宿主共享真实终端身份/生命周期，当前文字权限不从摘要产生；Agent 136、终端 22、桌面 IPC 20、前端 63 项及构建/静态检查通过，详细记录见本文件 C4。
+- [x] C4R 持久项目/作用域与重启恢复：schema 9/10 保留原日志/检查点/窗口，同身份重连接续、离线文字讨论、不同项目隔离。最近两次窗口 UI 已按用户要求撤销，项目记录保留在原 Agent“历史”入口；Rust 173、桌面 IPC 22、前端 74 项及构建/静态检查通过。
 - [ ] C5 前端上下文占用与真实压缩事件，失败不显示成功。
 - [ ] C6 跨压缩约束、插入新消息、模型缩窗、大附件与中断恢复测试。
 
@@ -64,41 +65,15 @@ Rust 重构交接、已完成工作与运行方式见 [WORK_HANDOFF_2026-10-14.m
 
 ## 当前进度与下一项
 
-A0–A6、B1–B5、C1–C3 已完成各自基础阶段。C2 普通 Chat Completions 语义摘要路径保持；C3 已补 Responses 文字协议、原生完整输出窗口和供应商远端整理分支。Responses 必须支持输入计数，remoteCompaction 默认关闭、按供应商支持情况明确开启。返回窗口整体保存并复用，不跨接口/模型/凭据复用加密项，原始文字历史保留。
+A0–A6、B1–B5、C1–C4 已完成各自基础阶段。C2 普通语义摘要与 C3 Responses 远端整理路径保持；C4 在整理后从当前宿主/SQLite 重建目标、约束、实时环境及文字权限，原始日志保留。旧摘要或原生窗口不能授予命令权限；远端 os/cwd 没有探测时保持未知。
 
-本机客户端 test-rust-ui/3585c82、Rust main/0b0b47a；包含既定基线，C2 已由用户提交。开始工作区保留 Node 启动修复及用户 package-lock.json、Cargo.toml、icon.icns 和已暂存文件；未改用户这些改动的内容或暂存状态。当前 C3 前后端与已有说明文件修改未提交。Cargo 相对依赖正确，无新增依赖；schema 升为 8，稳定配置 ID、名称、DPAPI 与原始历史兼容。
+本机客户端 test-rust-ui/980ecb6、Rust main/0c27b34，均包含既定基线。C3 和 Node 启动修复由用户提交；本轮 C4/C4R 代码与说明仍未提交，保留已有 src-tauri/icons/icon.icns 用户修改。Cargo 相对依赖 ../../ai-ssh-terminal-server-rust 正确；schema 10，Cargo/npm 依赖及锁文件不变。稳定配置 ID、名称、DPAPI 和原始历史保持。
 
-最新验证：Rust 库单元与相关集成 135/135，其中 Agent 130（单元 9 + 集成 121），其他库单元 5；C3 专测 17 与原子窗口事务单元 1。桌面 IPC 19/19（C3 2），前端 58/58（含模型 UI 新增 2、既有 Node 启动 5），最终修改后分别复验相关场景。TypeScript、Vite、业务库严格 Clippy 与修改 Rust 格式检查通过，桌面 Clippy 仅保留既有 sort_by_key/zombie_processes 告警。验证使用回环模型和临时数据库，没有真实供应商/SSH 或完整 WebView 视觉验收。
+最新验证：Rust 14 单元 + 137 Agent 集成 + 22 终端集成 = 173/173，其中 Agent 146（单元 9 + 集成 137）。桌面 IPC 22/22；前端相关 74/74（撤销两次窗口 UI 后的历史入口回归）；TypeScript/Vite、业务库严格 Clippy 通过。新增项目专测 4、桌面项目重启/新 PTY 实际续聊 1、前端项目恢复 5/IPC 1/侧边栏交互 4。最后项目迁移专测从实际 schema 9 升到 10，再次回归 4/4 并严格 Clippy 通过。全部使用临时数据库、随机回环模型/本地模拟 SSH，不使用真实模型 Key 或用户服务器。前端构建仅有既有 chunk 大小提示；未构建安装包。
 
-下一项 C4：压缩后完整重新注入实时目标、环境、可信授权和最新用户请求；核对任务/终端有效性以及旧窗口不改变权限，不能把 C3 沿用的基本目标/约束重注入当成 C4 已完成。C5 再提供真实占用与整理事件提示，C6 综合回归仍待办。SSH 执行和审批待 D，聊天附件与记忆待 E。本轮不提交、不推送、不打包。
+C4R 持久项目/作用域与历史恢复逻辑保留；用户随后撤销最近两次窗口 UI。当前为原左侧服务器列表、中央终端、右侧 Agent 和原设置导航；项目记录从 Agent 既有“历史”弹层进入，不保留 Codex 项目侧栏、最左图标栏或主区视图切换。历史按同一 sessionId/原 agentId 恢复，再连接/核对身份；新聊天才创建独立上下文，不合并不同服务器历史。
 
-前端已可测试：重新编译并重启桌面开发程序，“模型设置 → 模型渠道 → 接口协议”可选 Responses，高级参数可明确启用供应商远端整理。服务须支持 responses、responses/input_tokens 和开启整理时的 responses/compact；仅支持 Chat Completions 的配置保持原协议。具体操作见客户端 docs/agent-model-settings.md。C5 尚无整理状态标记，等待不代表整理成功。
-详细验证结果和下一步会在每个完成项后记录。
-
-### B4：2026-10-14 完成
-
-- 前端：`ModelSettings.tsx`、`api/models.ts` 提供模型配置创建/编辑/删除、Key 保留/替换/清除、窗口/输出/超时和可选参数；保存立即生效，无需 `.env`。`RustBackendSettingsDialog.tsx` 增加模型分类，`App.tsx` 启用基础文本 AI 面板、配置选择及文本引用。
-- 原生：`backend_ipc.rs` 新增按用户和配置 revision 隔离的模型 CRUD；复用 B1 ModelRepository，DPAPI/数据库放在 spawn_blocking；错误码和状态明确，模型密钥不回传。产品无 HTTP 监听端口。
-- 历史：使用 B3 数据库会话/轮次，支持会话及消息分页，拒绝不前进、超长或版本改变的分页；完整、失败、取消、中断、仍生成分别显示。活动历史自动刷新且可按 requestId 停止；继续旧会话使用原目标，终端页签切换不能修改目标。
-- 边界：面板明确为文本对话，聊天附件入口禁用，纯文本粘贴不转上传附件；不开放工具执行、审批或自动压缩。生成期间限制模型修改和切换；删除配置不删除历史。
-- 验证：客户端 `node --import tsx --test tests/agent-history.test.ts tests/agent-ipc.test.ts tests/ipc-transport.test.ts tests/chat-attachments.test.ts`，37/37；`cargo test --manifest-path src-tauri/Cargo.toml --offline --lib backend_ipc::tests -- --test-threads=1`，11/11；TypeScript 与 Vite 生产构建通过。Clippy 无新增告警，保留既有 sort_by_key/zombie_processes 告警；Rust 修改文件格式化通过。
-- 环境：普通沙箱 Tauri 宏编译因 Windows 路径访问失败，改在正常 Windows 权限下离线验证后通过。未使用真实模型 Key、未连接用户服务器、未做完整 GUI 验收或安装包。
-- 文档：[客户端模型设置教程](../../ai-ssh-terminal-client/docs/agent-model-settings.md)，同步 AGENT_MODELS.md 与客户端 agent-ipc.md。
-- 下一项 B5。较早记录里的“B4 待办 / AI 面板禁用”属于当时阶段，以顶部清单和本段为准。保留 A6 手动勾选，不提交 Git。
-
-### B4 样式回修：2026-10-14
-
-- 用户确认基础对话正常，同时要求改进 UI 并参考 main 样式。对照发现既有设置/聊天 CSS 保留，但 B4 新表单和模型栏没有复用其控件与布局。
-- 模型配置改为列表＋编辑区，字段按连接/认证/预算分组，底部固定保存与删除确认；复用 main 的 settings 参数、Select 和 Toggle，补齐加载、空列表、选中、错误和保存状态。
-- AI 面板采用紧凑模型选择栏和设置图标，恢复操作独立显示；设置导航补充图标与说明，工作区字段等宽，统一按钮、间距和主题。
-- 浏览器隔离预览使用内存模拟配置，不接触真实密钥/数据库：检查 1280/860/740 宽窗口、亮暗主题、320 像素聊天面板、保存无认证配置、自定义下拉框及高级参数。740 宽窗口下模型编辑区无横向溢出，保存栏可见。临时预览文件与进程在完成后清理。
-- 前端 37 项相关回归、TypeScript 和生产构建通过。Rust 业务未改，本轮不重复原生测试；没有完整真实桌面/供应商联验，B5 仍待办。未打包、未提交。
-
-- 用户截图后续修订：内容区最大 1280px，2240px 大屏实测编辑区约 1052px，留出右侧空白；内部足够宽时分为模型渠道/认证和接口/生成两栏。地址整行，短字段按用途两两并排；添加 AccentIcon、BASE URL/MODEL/敏感/参数等 Badge，以及协议、模型列表和推理快捷选项的蓝色选中高亮。修正旧响应式 CSS 覆盖整行地址的规则。
-- 隔离浏览器预览补验 2240×1100、1280×900 和 740×720，亮暗主题、窄屏无横向溢出；推理 medium 快捷选项与下拉框同步，模拟保存成功。37 项相关测试、TypeScript 和生产构建通过。真实模型调用仍由后续 B5 验收；没有新增不支持的模型协议或附件能力。
-
-- 名称与标题后续修订：用户要求配置名称可编辑，删除额外“模型设置”和“编辑配置”两个标题区域。显示名称与内部 ID 分离，schema 7 新增 agent_model_names；旧配置回退原 ID，新建配置使用独立 UUID。改名在同一 revision/事务中保存，不改变密钥熵绑定、历史归属或活动会话 ID；列表和 AI 面板使用显示名称。
-- 验证：模型 20 项、上下文 17 项、对话 15 项，共 52 项 Rust；原生 IPC 12 项；前端 37 项；TypeScript、生产构建、Rust Clippy -D warnings 通过。覆盖 schema 6 升级、旧名回退、改名持久化、密钥继续解密、版本冲突与会话关联。隔离浏览器验证名称编辑后列表更新、两个冗余标题不存在；未访问真实供应商或用户服务器。保持 B5 待办，不打包、不提交。
+下一项 C5：前端上下文占用与真实整理事件，失败不显示成功；C6 综合回归仍待办。SSH 执行和审批待 D，聊天附件与记忆待 E。本轮不提交、不推送、不打包。用户之前已免除浏览器连接前置；本次 Tabbit diagnose 未返回可用实例（退出 1），使用组件/流程回归和主题/窄窗口样式源代码检查，未完成真实 WebView 视觉验收。请用户重启开发版验证侧边栏和实际服务器历史。
 
 ## 验证与完成记录
 
@@ -386,3 +361,63 @@ Rust 库：
 - 回归模型都是随机回环模拟供应商和临时 SQLite，未使用用户 Key 或真实模型服务、不执行 SSH 变更；前端 hooks/元素夹具和原生测试接收器不等于完整 WebView 视觉验收。
 
 完成标记 C3 已回填，最新续接游标 C4。本轮未提交、推送、打包。
+
+### C4：2026-10-14 完成
+
+- 基线与范围：Rust main/0c27b34、客户端 test-rust-ui/980ecb6，均包含既定基线，工作开始时干净。实现 C4，不重写 B1–B4、不跳至 C5/D；未提交、推送或打包。
+- 参考与适配：实际读取本机固定 Codex 提交 f82e36592278a0a782fb0d0fc97e5fa10e832ac2 的 compact.rs/build_compaction_replacement_history、session/mod.rs/build_initial_context_with_world_state、context/world_state/compact_permissions.rs。采用宿主重建当前状态、权限和最新用户请求的原则；不搬 CLI 工作目录、沙箱允许前缀、插件世界状态或自动 SSH 探测。
+- Rust 代码：src/agent/live.rs、chat.rs、compact/auto.rs、compact/auto/responses.rs、agent/mod.rs、services.rs；src/terminal/mod.rs、output.rs。Services 的 Agent 与终端共享 TerminalManager，模型准备从阻塞线程读取 SQLite/宿主；不会新增产品端口或独立 server。
+- 身份与有效性：PTY 打开时只捕获实际连接的 connectionId/owner/host/port/username；连接配置修改不改变已有终端身份。准备、整理完成、检查点提交前、入轮次和发普通模型前复核原 terminalSessionId/connectionId/当前用户。共享生命周期 token 中止整理/计数/文字等待，检查点事务在提交前直接检查原终端取消；关闭原终端后不发后续普通请求、不生成成功回执，原日志/旧检查点保留。已经有效提交的检查点保留，关闭发生在完成提交之后的回执仍可只读重放。
+- 上下文：两条整理路径都重新注入当前目标、约束与活动 taskId。停止后新任务目标使用最新提问，保留约束但不将旧 taskId 当成活动任务；最新用户原文仍为最后一条 user，不被摘要或远端保留消息替代。任务/消息更改仍由 A4 完整快照 CAS 拒绝旧结果；Responses 提交后重新读取/构造，核对完整 body 与已计数请求一致，不剪规范窗口。
+- 环境与权限：区分 desktopOs 和远端 os/cwd（未探测为 null/未知）；不解析终端输出来确认事实，不用本机 Windows 或 startupCommand 冒充远端环境。不向模型发送 SSH 密码、私钥、启动脚本或 known_hosts。原生权限为 textOnly、sshExecute/localExecute=false、tools/approvals 为空；来源不是 IPC、历史摘要、root 身份或模型的授权描述。当前没有命令审批数据库/执行器，D3 才接入真实原生授权来源。无终端宿主的库级调用明确 verified=false，产品始终装配真实终端宿主。
+- 前端：src/state/chatTarget.ts、App.tsx、AgentPanel.tsx、api/chatErrors.ts、src-tauri/src/backend_ipc.rs。聊天标题名称与状态灯一起跟随保存的 connectionId+terminalSessionId，不随当前页签切换；纯文本历史标记未绑定，关闭/重连新 ID 显示原终端已断开。AGENT_TARGET_UNAVAILABLE/AGENT_TARGET_MISMATCH 提示连接目标后新建会话。复用既有标题、状态灯、主题与宽度规则，完整名称通过 title 提示；没有新增表单/CSS/冗余标题。组件元素及状态回归通过，实际明暗主题/窄面板 WebView 视觉验收仍待用户/E6。
+- 文档：已有 AGENT_MODELS.md、客户端 docs/agent-model-settings.md、docs/agent-ipc.md 同步当前边界和可测试步骤；交接文档只更新续接摘要。里程碑和验证只维护本文件，不新增阶段 MD、commit note 文件。
+- C4 六项新业务回归：普通/远端整理后正确注入实际主机、任务和约束；修改连接配置不冒充新主机；两种历史均保留伪造授权文本但不能改变当前权限；最新 Unicode/换行/两侧空白原样；两种整理期间断开不改完整 Snapshot、不发文字请求；重连 ID 不能改绑旧聊天；停止后旧检查点保留、新目标/约束/无授权重建；错误主机或用户在模型调用前拒绝。
+
+#### C4 验证命令与结果
+
+Rust 库：
+- cargo test --offline --lib --test agent_auto_compact --test agent_responses --test agent_chat --test agent_context --test agent_compact --test agent_models --test agent_outputs --test agent_kernel --test terminal：14 + 17+19+18+17+13+20+17+6 + 22 = 163/163。Agent 部分 136/136；C4 新增 6 项，其余回归保持通过。
+- cargo clippy --offline --lib --test agent_auto_compact --test agent_responses --test agent_chat --test terminal -- -D warnings：通过。测试锁改为词法作用域明确释放，避免跨 await 告警；最终对 C4 六项复验。
+- 所有修改 Rust 文件 rustfmt --edition 2021 --config skip_children=true --check、Git diff --check（Windows cr-at-eol）：通过。
+
+客户端：
+- cargo test --manifest-path src-tauri/Cargo.toml --offline --lib backend_ipc::tests -- --test-threads=1：20/20；新增 1 项在两种协议上通过真实产品 agent_stream/Channel/ACK 验证整理中断开、历史/检查点保留、重连拒绝和已完成回执重放。其余 10 个库测试未重复运行。
+- node --import tsx --test tests/agent-history.test.ts tests/agent-ipc.test.ts tests/ipc-transport.test.ts tests/chat-attachments.test.ts tests/chat-text-ui.test.mjs tests/model-compaction-ui.test.mjs tests/node-runtime.test.mjs tests/chat-target.test.ts：63/63。新增 4 项绑定目标状态和 1 项标题元素/状态灯/完整名称提示回归。
+- TypeScript noEmit 和 Vite 生产构建：通过，保留既有大 chunk 提示。桌面 cargo clippy --offline --lib --tests 通过，无新增告警；原生修改文件 rustfmt 与补丁空白检查通过。
+- 初次编译较慢，桌面改为 1 个编译作业，Rust 2 个作业；不终止用户开发程序。原生新测试最初误用 B5 短文本回执预期，修正为本轮模拟模型原文后全部通过，不影响生产代码。
+- 验证只使用随机回环模拟模型/SSH 和临时 SQLite；不使用真实供应商 Key，不执行用户服务器变更。没有实际供应商语义质量验证、完整 WebView 截图或安装包构建。
+
+完成标记 C4 已回填，最新续接游标 C5。本轮未提交、推送、打包。
+## C4R 完成记录：持久项目与重启恢复（2026-10-14）
+
+用户发现早期作用域入口仍依赖当次普通根会话/终端：重启后点击“针对当前服务器”可能进入新聊天，侧边栏不能直接找到原服务器历史。最终方案改为默认普通 Agent 对话、服务器项目及项目内持久聊天，替换临时范围选择 UX。
+
+- schema 9 增加普通/server scope：服务器身份从真实 SSH 握手获取 host/port/username/hostKey；普通对话不随页签绑定。文字生成/整理与 SSH 执行 lease 分离，关闭终端可离线解释已有证据。原始日志、检查点与完整 Responses 窗口按原 sessionId 隔离；整理后状态变化重新投影/计数，不能复用失效预算。
+- schema 10 增加 agent_projects/agent_project_chats。项目检查连接所有权、保存创建时地址/端口/用户快照、首次实际 SSH 密钥；之后重新绑定需身份一致。创建聊天与项目归属同事务，失败不留下半个会话。既有已验证 scope 按服务器身份补项目归属，未验证旧 task 归档，不改原任务/消息/检查点，不从修改后的配置推断旧密钥。
+- GET projects/project_chats 支持跨模型侧边栏与每组 50 条分页；POST create_project/project_terminal/project_chat 分别负责保存项目、核对当前终端和显式创建聊天。历史点击从 SQLite 读原 sessionId/agentId，连接失败保留原文；绑定操作不创建聊天或调用模型。项目内新聊天/换模型创建独立上下文，旧聊天留在项目。
+- AgentWorkspace 使用现有 Icon/Select/Modal 与主题变量，项目与普通历史在左，主区“对话 / 终端”切换；终端仍挂载，文件/SSH 页签与手动命令入口保留。管理服务器和模型设置可从侧边栏打开。复用现有连接，重开时重连原逻辑终端页签，避免反复新增终端；自动重连后原生重新核对身份。终端选区仅可加入来源项目已验证终端的聊天，普通/其他项目拒绝自动混入。
+- Rust 项目 4 项专测覆盖重开不新增聊天、原日志保留、不同项目/模型隔离、分页/所有权、地址/账号/密钥变化拒绝、实际 schema 9→10 及重复打开不重复迁移；基础库/Agent/终端合计 173 项通过。
+- 桌面 IPC 22 项通过，新增用随机 SSH/模型夹具完成：原项目聊天生成 → 关闭工作区 → 重开 → 同 ID 读原文 → 新 PTY 核对 → 显式下一轮继续。恢复与绑定阶段模型请求计数不增长；续聊请求含原约束和新 PTY，原会话已有两轮，未生成替代会话。
+- 前端相关 74 项通过，新流程测试原会话/原模型先恢复、断线保留、普通不连接、复用连接、修改资料先阻止连接、身份失败不绑定；UI 测试项目/普通分组、历史点击、新聊天、保存服务器选择、视图切换与错误反馈。TypeScript/Vite 通过，Rust 严格 Clippy 通过。桌面 Clippy 沿用已有告警；真实供应商、真实服务器与 WebView 视觉需用户验收，未提交/推送/打包。
+
+续接请从 C5 开始，保持本项目与 scope 层；不要重新恢复“针对当前服务器”入口，不把终端页签选择当成聊天归属。真正 SSH 工具执行仍要在 D 阶段绑定当次 PTY/taskId 与原生授权；已验证项目/文字环境不等于执行许可。下一窗口先核对实际目录、分支、工作区与本文件，保留用户修改。
+
+
+### C4R 界面追加：最左侧导航（2026-10-14，随后已撤销）
+
+- [x] 按用户 Codex 截图将模型配置、外观、SSH 连接、本地设置/关于移动到 56px 最左侧图标栏；项目与普通历史位于第二列，主内容位于第三列。入口有名称提示、键盘焦点和当前项高亮，使用现有 Icon/主题变量，窄窗口项目列缩为 210px。
+- [x] 模型与外观入口直接选择设置页的受控分类，移除桌面设置页内的重复分类菜单；SSH 连接管理展示在主内容区，点击终端入口返回终端。普通/项目历史保持挂载，切换配置页不新建聊天、不修改项目或服务器绑定。独立启动设置页保留原导航。
+- [x] 前端项目工作区交互 5/5，相关前端整体 75/75；TypeScript/Vite 与 diff 空白检查通过。新增一项验证模型/外观/SSH/设置切换保持项目/会话 ID，不触发新建/恢复聊天。真实 WebView 明暗主题/窄窗口视觉仍由用户确认，本次沿用先前免除浏览器前置的约定。Rust 业务/IPC/数据库未修改，不重复编译 Rust；C5 仍是下一项。不提交、推送或打包。
+
+代码位置：客户端 src/components/AgentWorkspace.tsx、AgentWorkspace.css、RustBackendSettingsDialog.tsx、src/App.tsx；复用 tests/project-workspace-ui.test.mjs。
+
+
+### 用户要求撤销最近两次 UI（2026-10-14）
+
+- [x] 撤销 Agent 主区/项目侧栏布局和最左图标导航，恢复原左侧服务器列表、中央终端、右侧 Agent、PanelDivider/命令区和设置分类。RustBackendSettingsDialog 的仅本次 UI 改动恢复到原版本。
+- [x] 删除本轮自行创建的 AgentWorkspace.tsx/AgentWorkspace.css 与已撤销布局测试，项目/普通聊天归组入口保留在 Agent 原“历史”弹层（ProjectChatHistory.tsx）；新建项目、原 ID/原模型历史恢复、自动连接/同身份重连仍使用已验证的底层逻辑。没有回退 Rust 库、IPC、schema 或数据库，不覆盖用户 icon.icns 修改。
+- [x] 项目历史组件 4/4，前端相关整体 74/74；TypeScript/Vite 与补丁空白检查通过。仅前端 UI 与进度/使用说明调整，不重复 Rust 编译/协议回归。不提交、推送、打包。
+- 续接保持此原窗口布局，不重新启用已撤销的项目侧栏/图标栏；C5 仍为下一项。历史 C4R/最左导航章节中的截图布局属于已撤销版本，不能作为当前 UI 的要求。
+
+代码位置：客户端 src/App.tsx、src/components/AgentPanel.tsx、ProjectChatHistory.tsx、RustBackendSettingsDialog.tsx、src/reference.css；测试改为 tests/project-history-ui.test.mjs，projectConversation.ts 与相关功能回归保留。

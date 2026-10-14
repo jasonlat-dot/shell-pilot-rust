@@ -15,22 +15,32 @@ impl Services {
     /// Embedded desktop services have no HTTP host or listening socket.
     pub fn native(store: Arc<Store>, settings: files::Settings, instance: uuid::Uuid) -> Arc<Self> {
         let stop = CancellationToken::new();
+        let terminals = Arc::new(terminal::TerminalManager::new(store.clone()));
         Arc::new(Self {
-            terminals: Arc::new(terminal::TerminalManager::new(store.clone())),
+            terminals: terminals.clone(),
             sftp: sftp::Manager::new(store.clone()),
             files: files::Manager::new_native(store.clone(), settings, instance),
-            agent: Arc::new(chat::Manager::new(store.clone(), stop.clone())),
+            agent: Arc::new(chat::Manager::with_terminals(
+                store.clone(),
+                stop.clone(),
+                terminals,
+            )),
             store,
             stop,
         })
     }
     pub fn new(store: Arc<Store>, settings: files::Settings, file_base_url: String) -> Arc<Self> {
         let stop = CancellationToken::new();
+        let terminals = Arc::new(terminal::TerminalManager::new(store.clone()));
         Arc::new(Self {
-            terminals: Arc::new(terminal::TerminalManager::new(store.clone())),
+            terminals: terminals.clone(),
             sftp: sftp::Manager::new(store.clone()),
             files: files::Manager::new(store.clone(), settings, file_base_url),
-            agent: Arc::new(chat::Manager::new(store.clone(), stop.clone())),
+            agent: Arc::new(chat::Manager::with_terminals(
+                store.clone(),
+                stop.clone(),
+                terminals,
+            )),
             store,
             stop,
         })

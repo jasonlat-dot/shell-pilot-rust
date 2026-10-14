@@ -2,12 +2,17 @@
 pub mod budget;
 pub mod chat;
 pub mod compact;
+mod live;
 pub mod model;
+mod projects;
 pub mod provider;
 mod repository;
+mod scopes;
+pub use projects::{Project, ProjectChat, ProjectChats};
 mod turns;
 pub use model::*;
 pub use repository::Repository;
+pub use scopes::{Scope, ScopeKind, ServerIdentity};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

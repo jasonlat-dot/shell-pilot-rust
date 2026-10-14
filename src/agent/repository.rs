@@ -348,6 +348,7 @@ pub(super) fn read_session(db: &Connection, id: &str, user_id: &str) -> Result<S
         revision,
         task: task_json.as_deref().map(serde_json::from_str).transpose()?,
         checkpoint_id,
+        scope: super::scopes::read(db, id)?,
     })
 }
 fn read_snapshot(db: &Connection, id: &str, user_id: &str) -> Result<Snapshot> {
