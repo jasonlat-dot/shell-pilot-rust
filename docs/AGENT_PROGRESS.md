@@ -8,8 +8,8 @@ Rust 重构交接、已完成工作与运行方式见 [WORK_HANDOFF_2026-10-14.m
 
 ## 工作目录与约束
 
-- Rust（当前本机）：E:/project/ShellPilot/ai-ssh-terminal-server-rust，main，HEAD ea46967（包含 c4bd68d）
-- 前端（当前本机）：E:/project/ShellPilot/ai-ssh-terminal-client，test-rust-ui，HEAD b7a9735
+- Rust（当前本机）：E:/project/ShellPilot/ai-ssh-terminal-server-rust，main，HEAD 01ad303（包含 c4bd68d）
+- 前端（当前本机）：E:/project/ShellPilot/ai-ssh-terminal-client，test-rust-ui，HEAD b71ed34（包含 b7a9735）
 - Java 参考（当前本机）：E:/project/ShellPilot/ai-ssh-terminal-server，保留原实现
 - Codex 参考：E:/project/ai-ssh/artifacts/codex-reference，提交 f82e36592278a0a782fb0d0fc97e5fa10e832ac2
 - 安装包：E:/project/ShellPilot/releases，最新 0.4.0；页签切换修复在源码，尚未打进安装包。
@@ -40,7 +40,7 @@ Rust 重构交接、已完成工作与运行方式见 [WORK_HANDOFF_2026-10-14.m
 - [x] B5 真实回环模型协议联调，前端解析与停止/恢复回归。Rust 55、原生 IPC 15、前端 48 项及构建/静态检查通过；用户本轮免除浏览器连接与截图前置要求，真实 WebView 视觉验收留待 E6，详见本文件 B5 完成记录。
 
 ### C. 检查点压缩
-- [ ] C1 普通模型语义摘要适配器与摘要结构校验，不开放副作用工具。
+- [x] C1 普通模型语义摘要适配器与摘要结构校验，不开放副作用工具。只返回经校验的摘要草稿；13 项专门测试、相关 Agent 97 项及原生 IPC 15 项通过，自动触发/低水位/提交仍待 C2。
 - [ ] C2 自动压缩状态机：每次模型请求前/工具批次后检查、较低水位、有限重试、失败保留日志/旧检查点。
 - [ ] C3 支持的 Responses 供应商远端压缩能力分支；完整保留其输出窗口，不跨供应商复用不透明对象。
 - [ ] C4 压缩后重新注入实时目标、环境、可信授权与最新用户请求。
@@ -64,11 +64,11 @@ Rust 重构交接、已完成工作与运行方式见 [WORK_HANDOFF_2026-10-14.m
 
 ## 当前进度与下一项
 
-A0–A6、B1–B5 已完成各自基础阶段，保留用户手动勾选的 A6。B5 自动验证：Rust 55 项、原生 IPC 15 项、前端 48 项通过；TypeScript、生产资源构建及静态检查通过。修复了历史恢复轮次停止期间缺少等待状态/防重入的问题。真实 SSH 副作用去重仍待 D3。
+A0–A6、B1–B5、C1 已完成各自基础阶段。C1 提供普通模型的严格 JSON 语义摘要草稿，目标/约束/未知结果由程序保留；生成不修改原日志或检查点，不执行任何工具。最新验证：C1 专门 13 项、相关 Agent 合计 97 项、原生桌面 IPC 15 项通过，Clippy -D warnings 与修改 Rust 文件格式检查通过。
 
-本机客户端 test-rust-ui/b7a9735、Rust main/ea46967（包含 c4bd68d）；本轮修改未提交。Cargo 相对依赖已正确指向本机 Rust 库。用户要求本轮不处理 Tabbit 路由问题，实际 WebView 截图/明暗主题/窄窗口验收未完成，列入 E6；自动组件验证与主题控件修改已完成，不宣称视觉验收通过。
+本机客户端 test-rust-ui/b71ed34、Rust main/01ad303；包含既定基线。B5 已由用户提交，本轮开始两个工作区干净，C1 修改尚未提交。Cargo 相对依赖正确；未改前端接口/样式、依赖锁或 schema 7。本轮只有 Rust 代码与已有进度/说明文件改动。
 
-下一项 C1：普通模型语义摘要适配器与摘要结构校验，不开放副作用工具。本轮止于 B5，不进入 C/D/E，不提交、不推送、不打包。详细验证结果见本文件 B5 完成记录。
+下一项 C2：在模型请求/工具批次边界接入自动压缩状态机，检查较低水位、有限重试和失败回退，成功后通过 A4 版本校验提交检查点。C1 尚未接入当前聊天路径，前端不显示“已压缩”；C3 远端压缩、C4 重注入、C5 UI 仍待办，SSH 执行和审批待 D，聊天附件和记忆待 E。用户的真实 WebView 视觉验收仍保留到 E6。本轮不提交、不推送、不打包。
 详细验证结果和下一步会在每个完成项后记录。
 
 ### B4：2026-10-14 完成
@@ -281,3 +281,32 @@ Node 使用 C:/Users/kingdee/.cache/codex-runtimes/codex-primary-runtime/depende
 - 原生发送端为测试接收器，前端使用 IPC/hooks/元素夹具；没有完整真实 WebView 截图。测试端口仅模拟模型供应商，不是产品 HTTP 后端。
 - 用户要求本轮不处理浏览器连接，因此 B5 以自动回归完成；E6 补验：途中停止及原请求恢复、历史生成中的等待/禁用、停止与完成竞态、切换会话不跳回旧会话、关闭重开后原文/状态、明暗主题和 320px AI 面板。
 - 未验证真实供应商兼容矩阵或真实 SSH 副作用；没有实现 C/D/E。schema 7 与 DPAPI 不变，用户 .idea/misc.xml 保留。
+
+### C1：2026-10-14 完成
+
+- 核对基线：客户端 test-rust-ui/b71ed34，Rust main/01ad303；两者包含交接基线且开始工作区干净。src-tauri 的 ../../ai-ssh-terminal-server-rust 正确解析本机路径，不需要修改。
+- 代码：src/agent/compact.rs，mod.rs 公开 compact 模块；tests/agent_compact.rs。没有新增逐阶段文档、数据库迁移、依赖或前端接口。
+- 入口：compact::Summarizer::new(store).summarize(sessionId, userId, cancel)。按会话所属用户读取其模型配置，使用现有普通 Chat Completions 非流式适配器。一次调用只发一个请求、不自动重试、没有可执行工具定义；模型返回工具、拒绝、截断或协议错误均不能变成有效摘要。
+- 来源：版本快照、可信任务与目标、旧检查点、之后的原始事件和失败/取消/中断文字轮次的部分文本。所有模型输入中的日志/旧摘要/命令文本均标作不可信证据，不能产生执行授权。生成中的文字轮次返回 Busy，不争抢 B3 租约或恢复任务。
+- 范围：最多 200 条新增事件/失败轮次、序列化来源最多 512 KiB。完整请求连同提示、输出与安全预留经过 B1/A3 预算检查，超限明确拒绝，不默默丢消息。没有新增证据时返回 EmptySource；更大历史的分段和自动重试由 C2 后续处理。
+- 输出：只接受完整 JSON 对象，且必须仅有 summary、nextSteps、evidenceEventIds。拒绝缺字段、未知/重复字段、代码围栏或嵌入 JSON 修复；summary 为非空、最多 16000 UTF-8 字节，nextSteps 最多 32 项且每项非空/最多 4000 字节；证据 ID 必须非空、唯一、在本次提供的来源范围内，最多 200 项。
+- 应用字段：CheckpointContent 的 task（含目标/约束/状态）、pendingToolCallIds、uncertainToolCallIds 完全从快照构造，模型不能编辑。旧检查点证据和本次未决工具/失败轮次的关键引用由程序合并保留，累计超过 200 项或整个检查点超过 64 KiB 时拒绝，不截掉回查线索。
+- 返回：Draft 包含 snapshot、content、usage 和实际使用的模型 ID。生成、无效输出、取消、超时和失败不写事件或检查点。输入采集前后及返回前核对快照；新消息、停止或目标变更使旧草稿失效。调用方以后提交仍必须使用 Repository::save_checkpoint 的 A4 CAS，不能用生成时的校验替代最终事务检查。
+- 测试：真实随机回环模型服务验证语义输出协议与 usage、17 种坏摘要、越权字段、跨用户/会话/未来证据、拒绝/工具/截断、取消/超时/HTTP 错误、输入容量/模型窗口、活动轮次互斥、失败部分文本、旧检查点引用、未知工具保留、生成后版本冲突，以及 SQLite 关闭重开后的检查点/原事件/原始输出范围回查。13 项专门测试通过；测试显式保存检查点仅验证 A4 兼容，不是 C1 生产自动保存。
+- 凭据：使用临时测试 DPAPI Key 验证认证仅进入原生 Authorization 请求头，未加入摘要输入、Draft 或原日志；没有使用用户密钥或实际供应商/SSH 服务器。用户原文和日志自行携带的敏感信息并未实现通用自动脱敏。
+- 边界：结构/出处与可信字段可以校验，模型自由文本的全部语义正确性不能由这些规则保证；真实模型摘要质量与收益比较留到后续 C/E5。C1 不保证摘要更短、不执行自动压缩、不提交检查点、不替换模型聊天窗口；当前文字对话行为和模型设置保持原状。尚未提供 UI/IPC 摘要入口，因此本轮不改前端业务和样式，也不重复前端 JS/视觉验收。
+- README 顶部同步当前文字对话能力，并明确其早期迁移/安装包段落属于历史记录，当前能力以本清单为准。
+
+#### C1 验证命令与结果
+
+在 Rust 库目录：
+- cargo test --offline --lib agent::：6/6，通过 B3 轮次/恢复内核。
+- cargo test --offline --test agent_compact --test agent_context --test agent_kernel --test agent_outputs --test agent_models --test agent_chat：13+17+6+17+20+18 = 91/91；连同上述 6 项，相关 Agent 共 97/97。
+- cargo clippy --offline --lib --test agent_compact -- -D warnings：通过，无告警。
+- rustfmt --edition 2021 --config skip_children=true --check src/agent/mod.rs src/agent/compact.rs tests/agent_compact.rs：通过。
+
+在客户端目录：
+- cargo test --manifest-path src-tauri/Cargo.toml --offline --lib backend_ipc::tests -- --test-threads=1：15/15，通过同进程库嵌入与模型/停止/历史/Channel 的既有协议；其余 10 项未重复运行。
+- 前端工作区未改，Cargo 依赖锁未改。未启动真实 GUI、用户服务器或安装包。
+
+完成标记 C1 已回填，下一项 C2。本轮未提交、推送或打包，commit note 只在聊天中提供。

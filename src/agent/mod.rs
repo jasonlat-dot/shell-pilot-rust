@@ -1,6 +1,7 @@
 //! Persistent context kernel, native model adapters and basic text turns. Executable tools are not wired yet.
 pub mod budget;
 pub mod chat;
+pub mod compact;
 pub mod model;
 pub mod provider;
 mod repository;

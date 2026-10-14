@@ -4,7 +4,9 @@
 
 Agent 重构当前进度与新窗口续接：见 [docs/AGENT_PROGRESS.md](docs/AGENT_PROGRESS.md)。
 
-Java 服务端的分阶段 Rust 重构，目标是随 Tauri 桌面客户端打包，移除 JRE 和独立 MySQL 服务依赖。当前已实现连接配置管理、原生 SSH 终端、SFTP 文件管理/传输及本地文件/附件存储。AI Agent 尚未迁移。客户端 test-rust-ui 分支现已将本库直接嵌入 Tauri，并生成独立的 Rust Preview 0.4.0 Windows 安装包。
+下文的阶段验证说明包含早期安装包和迁移时的历史状态，当前能力与下一项以该进度清单为准。C1 的 agent::compact::Summarizer 仅提供普通模型的结构化摘要草稿；自动触发、低水位检查和写入检查点尚未接入聊天链路。
+
+Java 服务端的分阶段 Rust 重构，目标是随 Tauri 桌面客户端打包，移除 JRE 和独立 MySQL 服务依赖。当前已实现连接配置管理、原生 SSH 终端、SFTP 文件管理/传输及本地文件/附件存储。当前源码已支持模型设置、基础文本 AI 对话、停止和原生历史；工具执行、聊天附件和自动压缩仍待后续阶段。客户端 test-rust-ui 分支现已将本库直接嵌入 Tauri，并生成独立的 Rust Preview 0.4.0 Windows 安装包。
 
 ## 开发与使用
 
