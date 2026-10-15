@@ -60,6 +60,7 @@ pub struct Status {
 pub(crate) enum Update {
     Measured(InputUsage),
     Started(Method),
+    ToolStarted(Option<String>),
     Committed(String),
     Failed { code: String, fallback: bool },
     Finished(Option<String>),
@@ -186,6 +187,16 @@ impl Observation {
                 status.error_code = None;
                 status.fallback = false;
             }
+            Update::ToolStarted(base) => {
+                // A fresh tool boundary can compact again within the same turn. An old queued
+                // start must not undo a checkpoint already committed before the UI ACK.
+                if status.checkpoint_id == base || status.checkpoint_id.is_none() {
+                    status.phase = Phase::Running;
+                    status.method = Some(Method::Summary);
+                    status.error_code = None;
+                    status.fallback = false;
+                }
+            }
             Update::Committed(id) => {
                 let exists:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM agent_checkpoints WHERE id=?1 AND session_id=?2)",params![id,self.session],|r|r.get(0)).map_err(db_error)?;
                 if !exists {
@@ -204,6 +215,11 @@ impl Observation {
                 }
             }
             Update::Finished(code) => {
+                // A completed/failed attempt is immutable. In particular, a late run-guard
+                // cleanup must not rewrite updatedAt after the caller has observed Done.
+                if status.phase != Phase::Running {
+                    return Ok(None);
+                }
                 if status.phase == Phase::Running {
                     status.phase = match code.as_deref() {
                         Some("AGENT_CANCELLED") => Phase::Cancelled,
@@ -299,10 +315,15 @@ mod tests {
         reporter.emit(Update::Committed(checkpoint.id));
         observation.apply(updates.try_recv().unwrap()).unwrap(); // delayed start must not undo commit
         drop(updates);
-        observation
+        let before = read(store.clone(), "model", "owner", &r.session_id)
+            .unwrap()
+            .updated_at;
+        assert!(observation
             .apply(Update::Finished(Some("AGENT_CANCELLED".into())))
-            .unwrap();
+            .unwrap()
+            .is_none());
         let status = read(store, "model", "owner", &r.session_id).unwrap();
+        assert_eq!(status.updated_at, before);
         assert_eq!(status.phase, Phase::Succeeded);
         assert_eq!(status.compaction_count, 1);
     }
@@ -363,6 +384,78 @@ mod tests {
         let status = read(store, "model", "owner", &r.session_id).unwrap();
         assert_eq!(status.request_id, "next");
         assert_eq!(status.phase, Phase::Running);
+    }
+    #[test]
+    fn tool_boundaries_report_new_attempts_without_undoing_a_delayed_committed_checkpoint() {
+        let store = Arc::new(Store::in_memory().unwrap());
+        let r = request(&store, "tool-status");
+        let repo = Repository::new(store.clone());
+        let event = repo
+            .append(
+                &r.session_id,
+                "owner",
+                0,
+                "user",
+                crate::agent::Payload::UserMessage {
+                    text: "logs".into(),
+                },
+            )
+            .unwrap()
+            .event;
+        let observation = Observation::begin(store.clone(), &r).unwrap();
+        let (reporter, mut updates) = Reporter::channel(observation.clone());
+        reporter.emit(Update::ToolStarted(None));
+        let snapshot = repo.snapshot(&r.session_id, "owner").unwrap();
+        let checkpoint = repo
+            .save_checkpoint(
+                &snapshot,
+                crate::agent::CheckpointContent {
+                    task: None,
+                    summary: "summary".into(),
+                    next_steps: vec![],
+                    evidence_event_ids: vec![event.id],
+                    retained_user_facts: vec![],
+                    pending_tool_call_ids: vec![],
+                    uncertain_tool_call_ids: vec![],
+                },
+            )
+            .unwrap();
+        reporter.emit(Update::Committed(checkpoint.id.clone()));
+        observation.apply(updates.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            read(store.clone(), "model", "owner", &r.session_id)
+                .unwrap()
+                .phase,
+            Phase::Succeeded
+        );
+        observation
+            .apply(Update::ToolStarted(Some(checkpoint.id.clone())))
+            .unwrap();
+        assert_eq!(
+            read(store.clone(), "model", "owner", &r.session_id)
+                .unwrap()
+                .phase,
+            Phase::Running
+        );
+        observation
+            .apply(Update::Failed {
+                code: "summary_failed".into(),
+                fallback: true,
+            })
+            .unwrap();
+        let status = read(store.clone(), "model", "owner", &r.session_id).unwrap();
+        assert_eq!(status.phase, Phase::Failed);
+        assert_eq!(status.compaction_count, 1);
+        assert_eq!(status.checkpoint_id, Some(checkpoint.id.clone()));
+        observation
+            .apply(Update::ToolStarted(Some(checkpoint.id)))
+            .unwrap();
+        observation
+            .apply(Update::Finished(Some("AGENT_CANCELLED".into())))
+            .unwrap();
+        let status = read(store, "model", "owner", &r.session_id).unwrap();
+        assert_eq!(status.phase, Phase::Cancelled);
+        assert_eq!(status.compaction_count, 1);
     }
     #[test]
     fn unfinished_or_uncommitted_compaction_never_reports_success() {

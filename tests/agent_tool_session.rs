@@ -1059,3 +1059,642 @@ async fn user_supplement_during_approval_invalidates_the_dispatch_plan_inside_ad
         .is_empty());
     b.terminals.shutdown().await;
 }
+
+// D5 uses the actual desktop Manager: persistent turn receipt + bound SSH + human decisions.
+async fn desktop(
+    b: &Bound,
+) -> (
+    Arc<shellpilot_server::agent::chat::Manager>,
+    shellpilot_server::agent::chat::Request,
+) {
+    use shellpilot_server::agent::chat::*;
+    let manager = Arc::new(Manager::with_terminals(
+        b.store.clone(),
+        CancellationToken::new(),
+        b.terminals.clone(),
+    ));
+    let root = manager
+        .create_general_session("model".into(), "default".into())
+        .await
+        .unwrap();
+    let session = manager
+        .server_scope(
+            "model".into(),
+            "default".into(),
+            root.id,
+            b.target.terminal_session_id.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+    manager
+        .bind_execution(
+            "model".into(),
+            "default".into(),
+            session.id.clone(),
+            b.target.terminal_session_id.clone(),
+        )
+        .await
+        .unwrap();
+    let request = Request {
+        request_id: "desktop-turn".into(),
+        agent_id: "model".into(),
+        user_id: "default".into(),
+        session_id: session.id,
+        terminal_session_id: b.target.terminal_session_id.clone(),
+        message: "只检查日志，不要重启服务".into(),
+        attachments: vec![],
+    };
+    (manager, request)
+}
+async fn pending_approval(
+    manager: &shellpilot_server::agent::chat::Manager,
+    request: &shellpilot_server::agent::chat::Request,
+) -> shellpilot_server::agent::approvals::Receipt {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let list = manager
+                .execution_requests(
+                    "model".into(),
+                    "default".into(),
+                    request.session_id.clone(),
+                    "".into(),
+                )
+                .await
+                .unwrap();
+            if let Some(receipt) = list.into_iter().find(|r| r.state == ApprovalState::Pending) {
+                return receipt;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("desktop must present a real pending approval")
+}
+#[tokio::test]
+async fn desktop_d5_approval_output_history_reopen_and_replay_never_repeat_ssh() {
+    use shellpilot_server::agent::chat::StreamEvent;
+    let b = Bound::new(
+        vec![
+            Step::Calls(vec![exec("desktop-exec", "__exec_chunked__")]),
+            Step::Final,
+        ],
+        90,
+        true,
+        false,
+    )
+    .await;
+    let (manager, request) = desktop(&b).await;
+    let frames = Arc::new(Mutex::new(vec![]));
+    let events = frames.clone();
+    let m = manager.clone();
+    let r = request.clone();
+    let run = tokio::spawn(async move {
+        m.chat_desktop(r, None, true, &CancellationToken::new(), move |e| {
+            events.lock().unwrap().push(e);
+            async { Ok(()) }
+        })
+        .await
+    });
+    let approval = pending_approval(&manager, &request).await;
+    assert_eq!(b.execs(), 0);
+    assert_eq!(approval.command.command, "__exec_chunked__");
+    assert_eq!(approval.binding.tool.target, b.target);
+    assert!(manager
+        .execution_decision(
+            "other-model".into(),
+            "default".into(),
+            request.session_id.clone(),
+            approval.id.clone(),
+            "approveOnce".into()
+        )
+        .await
+        .is_err());
+    assert!(manager
+        .execution_decision(
+            "model".into(),
+            "intruder".into(),
+            request.session_id.clone(),
+            approval.id.clone(),
+            "approveOnce".into()
+        )
+        .await
+        .is_err());
+    manager
+        .execution_decision(
+            "model".into(),
+            "default".into(),
+            request.session_id.clone(),
+            approval.id,
+            "approveOnce".into(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(8), run)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(b.execs(), 1);
+    {
+        let frames = frames.lock().unwrap();
+        assert!(frames
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ToolCall { .. })));
+        assert!(frames
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ToolResult { .. })));
+        assert!(matches!(frames.last(), Some(StreamEvent::Done { .. })));
+    }
+    let history = manager
+        .history(
+            "model".into(),
+            "default".into(),
+            request.session_id.clone(),
+            0,
+            20,
+        )
+        .await
+        .unwrap();
+    assert_eq!(history.turns.len(), 1);
+    assert_eq!(
+        history.turns[0].state,
+        shellpilot_server::agent::chat::TurnState::Completed
+    );
+    assert_eq!(history.turns[0].tool_events.len(), 2);
+    let output = raw_references(&history.turns[0].tool_events, "desktop-exec")
+        .into_iter()
+        .find(|o| o.channel == OutputChannel::Stdout)
+        .unwrap();
+    let range = manager
+        .execution_output(
+            "model".into(),
+            "default".into(),
+            request.session_id.clone(),
+            output.id.clone(),
+            65534,
+            512,
+        )
+        .await
+        .unwrap();
+    let actual: Vec<u8> = serde_json::from_value(range["bytes"].clone()).unwrap();
+    assert_eq!(
+        actual,
+        (65534..66046).map(|i| (i % 251) as u8).collect::<Vec<_>>()
+    );
+    assert!(manager
+        .execution_output(
+            "model".into(),
+            "intruder".into(),
+            request.session_id.clone(),
+            output.id.clone(),
+            0,
+            1
+        )
+        .await
+        .is_err());
+    b.terminals.shutdown().await;
+    b.model_task.abort();
+    let reopened = Arc::new(Store::open(&b.path).unwrap());
+    let restored = shellpilot_server::agent::chat::Manager::new(reopened, CancellationToken::new());
+    restored
+        .chat_desktop(
+            request.clone(),
+            None,
+            true,
+            &CancellationToken::new(),
+            |_| async { Ok(()) },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        restored
+            .history(
+                "model".into(),
+                "default".into(),
+                request.session_id.clone(),
+                0,
+                20
+            )
+            .await
+            .unwrap()
+            .turns[0]
+            .tool_events
+            .len(),
+        2
+    );
+    restored
+        .execution_output(
+            "model".into(),
+            "default".into(),
+            request.session_id,
+            output.id,
+            0,
+            32,
+        )
+        .await
+        .unwrap();
+    assert_eq!(b.execs(), 1);
+}
+#[tokio::test]
+async fn desktop_d5_deny_stop_and_policy_do_not_send_unapproved_commands() {
+    for action in ["deny", "stop", "policy"] {
+        let b = Bound::new(
+            vec![
+                Step::Calls(vec![exec("decline", "__exec_chunked__")]),
+                Step::Final,
+            ],
+            90,
+            true,
+            false,
+        )
+        .await;
+        let (manager, request) = desktop(&b).await;
+        let m = manager.clone();
+        let r = request.clone();
+        let run = tokio::spawn(async move {
+            m.chat_desktop(r, None, true, &CancellationToken::new(), |_| async {
+                Ok(())
+            })
+            .await
+        });
+        let approval = pending_approval(&manager, &request).await;
+        match action {
+            "stop" => {
+                assert!(manager
+                    .stop_request(
+                        "model".into(),
+                        "default".into(),
+                        request.session_id.clone(),
+                        Some(request.request_id.clone())
+                    )
+                    .await
+                    .unwrap());
+            }
+            "policy" => {
+                manager
+                    .execution_policy(
+                        "model".into(),
+                        "default".into(),
+                        request.session_id.clone(),
+                        Some((0, shellpilot_server::agent::approvals::Policy::Deny)),
+                    )
+                    .await
+                    .unwrap();
+            }
+            _ => {
+                manager
+                    .execution_decision(
+                        "model".into(),
+                        "default".into(),
+                        request.session_id.clone(),
+                        approval.id,
+                        "deny".into(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        let result = tokio::time::timeout(Duration::from_secs(8), run)
+            .await
+            .unwrap()
+            .unwrap();
+        if action == "stop" {
+            assert!(result.is_err());
+        } else {
+            result.unwrap();
+        }
+        assert_eq!(b.execs(), 0);
+        assert!(
+            manager
+                .history(
+                    "model".into(),
+                    "default".into(),
+                    request.session_id.clone(),
+                    0,
+                    20
+                )
+                .await
+                .unwrap()
+                .turns[0]
+                .state
+                != shellpilot_server::agent::chat::TurnState::Running
+        );
+        assert!(manager
+            .execution_requests(
+                "model".into(),
+                "default".into(),
+                request.session_id,
+                "".into()
+            )
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.state != ApprovalState::Pending));
+        b.terminals.shutdown().await;
+    }
+}
+#[tokio::test]
+async fn desktop_d5_fixed_target_busy_guard_and_dropped_ssh_are_not_replayed() {
+    let b = Bound::new(
+        vec![Step::Calls(vec![exec("quiet", "__exec_quiet__")])],
+        90,
+        true,
+        false,
+    )
+    .await;
+    let (manager, request) = desktop(&b).await;
+    let m = manager.clone();
+    let r = request.clone();
+    let run = tokio::spawn(async move {
+        m.chat_desktop(r, None, true, &CancellationToken::new(), |_| async {
+            Ok(())
+        })
+        .await
+    });
+    let receipt = pending_approval(&manager, &request).await;
+    let mut other = request.clone();
+    other.request_id = "another-turn".into();
+    assert!(matches!(
+        manager
+            .chat_desktop(other, None, true, &CancellationToken::new(), |_| async {
+                Ok(())
+            })
+            .await,
+        Err(shellpilot_server::agent::chat::Error::Busy)
+    ));
+    let second = b
+        .terminals
+        .connect(open(&b.target.connection_id))
+        .await
+        .unwrap();
+    assert!(matches!(
+        manager
+            .bind_execution(
+                "model".into(),
+                "default".into(),
+                request.session_id.clone(),
+                second.session_id.clone()
+            )
+            .await,
+        Err(shellpilot_server::agent::chat::Error::Busy)
+    ));
+    manager
+        .execution_decision(
+            "model".into(),
+            "default".into(),
+            request.session_id.clone(),
+            receipt.id,
+            "approveOnce".into(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while b.execs() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    run.abort();
+    assert!(run.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if manager
+                .history(
+                    "model".into(),
+                    "default".into(),
+                    request.session_id.clone(),
+                    0,
+                    20,
+                )
+                .await
+                .unwrap()
+                .turns[0]
+                .state
+                != shellpilot_server::agent::chat::TurnState::Running
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(manager
+        .chat_desktop(
+            request.clone(),
+            None,
+            true,
+            &CancellationToken::new(),
+            |_| async { Ok(()) }
+        )
+        .await
+        .is_err());
+    assert_eq!(b.execs(), 1);
+    let mut wrong = request.clone();
+    wrong.request_id = "wrong-target".into();
+    wrong.terminal_session_id = second.session_id;
+    assert!(matches!(
+        manager
+            .chat_desktop(wrong, None, true, &CancellationToken::new(), |_| async {
+                Ok(())
+            })
+            .await,
+        Err(shellpilot_server::agent::chat::Error::TargetMismatch)
+    ));
+    let events = b
+        .repo
+        .events(&request.session_id, "default", 0, 200)
+        .unwrap();
+    assert_eq!(result(&events, "quiet")["error"], "result_unknown");
+    b.terminals.shutdown().await;
+}
+#[tokio::test]
+async fn desktop_d5_batch_compaction_reports_real_checkpoint_and_grants_can_be_revoked() {
+    let b = Bound::new(
+        vec![
+            Step::Calls(vec![
+                exec("one", "__exec_large__"),
+                exec("two", "__exec_large__"),
+                exec("three", "__exec_large__"),
+                exec("four", "__exec_large__"),
+            ]),
+            Step::Final,
+        ],
+        35,
+        true,
+        false,
+    )
+    .await;
+    let (manager, request) = desktop(&b).await;
+    let m = manager.clone();
+    let r = request.clone();
+    let run = tokio::spawn(async move {
+        m.chat_desktop(r, None, true, &CancellationToken::new(), |_| async {
+            Ok(())
+        })
+        .await
+    });
+    let receipt = pending_approval(&manager, &request).await;
+    let id = receipt.id.clone();
+    manager
+        .execution_decision(
+            "model".into(),
+            "default".into(),
+            request.session_id.clone(),
+            id.clone(),
+            "approveTaskCommand".into(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(b.execs(), 4);
+    assert_eq!(b.wire.script.lock().unwrap().summaries, 1);
+    let status = manager
+        .context_status("model".into(), "default".into(), request.session_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(status.compaction_count, 1);
+    assert!(status.usage.is_some());
+    assert_eq!(
+        status.phase,
+        shellpilot_server::agent::context_status::Phase::Succeeded
+    );
+    assert_eq!(
+        manager
+            .history(
+                "model".into(),
+                "default".into(),
+                request.session_id.clone(),
+                0,
+                20
+            )
+            .await
+            .unwrap()
+            .turns[0]
+            .tool_events
+            .len(),
+        8
+    );
+    manager
+        .execution_decision(
+            "model".into(),
+            "default".into(),
+            request.session_id.clone(),
+            id.clone(),
+            "revoke".into(),
+        )
+        .await
+        .unwrap();
+    let approvals = manager
+        .execution_requests(
+            "model".into(),
+            "default".into(),
+            request.session_id,
+            "".into(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        approvals
+            .iter()
+            .find(|r| r.id == id)
+            .unwrap()
+            .grant
+            .as_ref()
+            .unwrap()
+            .revoked
+    );
+    b.terminals.shutdown().await;
+}
+#[tokio::test]
+async fn desktop_d5_overbudget_input_never_creates_a_turn_or_contacts_model() {
+    let b = Bound::new(vec![], 90, true, false).await;
+    let (manager, mut request) = desktop(&b).await;
+    let models = ModelRepository::new(b.store.clone());
+    let mut model = models.get("model", "default").unwrap();
+    model.config.context_window = 4096;
+    models
+        .save(
+            "model",
+            "default",
+            model.revision,
+            ModelConfigUpdate {
+                config: model.config,
+                api_key: KeyChange::Keep,
+            },
+        )
+        .unwrap();
+    request.message = "汉".repeat(4000);
+    assert!(manager
+        .chat_desktop(
+            request.clone(),
+            None,
+            true,
+            &CancellationToken::new(),
+            |_| async { Ok(()) }
+        )
+        .await
+        .is_err());
+    assert!(manager
+        .history("model".into(), "default".into(), request.session_id, 0, 20)
+        .await
+        .unwrap()
+        .turns
+        .is_empty());
+    assert_eq!(b.execs(), 0);
+    assert!(b.normal().is_empty());
+    b.terminals.shutdown().await;
+}
+
+#[tokio::test]
+async fn desktop_d5_persisted_stop_blocks_admission_before_token_delivery() {
+    let b = Bound::new(
+        vec![
+            Step::Calls(vec![exec("stopped", "__exec_chunked__")]),
+            Step::Final,
+        ],
+        90,
+        true,
+        false,
+    )
+    .await;
+    let (manager, request) = desktop(&b).await;
+    let m = manager.clone();
+    let r = request.clone();
+    let run = tokio::spawn(async move {
+        m.chat_desktop(r, None, true, &CancellationToken::new(), |_| async {
+            Ok(())
+        })
+        .await
+    });
+    let receipt = pending_approval(&manager, &request).await;
+    // Simulate the exact stop-transaction / token-delivery gap. No token is cancelled here.
+    let db = rusqlite::Connection::open(&b.path).unwrap();
+    db.execute(
+        "UPDATE agent_chat_turns SET cancel_requested=1 WHERE session_id=?1",
+        [&request.session_id],
+    )
+    .unwrap();
+    manager
+        .execution_decision(
+            "model".into(),
+            "default".into(),
+            request.session_id.clone(),
+            receipt.id,
+            "approveOnce".into(),
+        )
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(8), run)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(b.execs(), 0);
+    b.terminals.shutdown().await;
+}

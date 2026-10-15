@@ -191,6 +191,11 @@ impl server::Handler for TestHandler {
             session.close(channel)?;
             return Ok(());
         }
+        // A real server can send flow-control requests before accepting exec.
+        // Keep this on the binary-output scenario so desktop approval/output tests cover it too.
+        if command == "__exec_chunked__" {
+            session.xon_xoff_request(channel, false)?;
+        }
         session.channel_success(channel)?;
         if command == "__exec_quiet__" {
             return Ok(());

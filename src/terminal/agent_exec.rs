@@ -139,45 +139,13 @@ impl PreparedExec {
                 .map_err(|_| ExecError::Unknown)?;
             // No stdin/PTY: this shell is independent of the interactive terminal's cwd/env.
             channel.eof().await.map_err(|_| ExecError::Unknown)?;
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
-            let mut truncated = false;
-            let mut accepted = false;
-            let mut exit_code = None;
-            loop {
-                match channel.wait().await {
-                    Some(ChannelMsg::Success) => accepted = true,
-                    Some(ChannelMsg::Failure) if !accepted && exit_code.is_none() => {
-                        return Err(ExecError::Rejected)
-                    }
-                    Some(ChannelMsg::Data { data }) => {
-                        if let Some(sink) = &sink {
-                            sink.write(false, data.to_vec()).await;
-                        }
-                        capture(&mut stdout, &stderr, &data, &mut truncated)
-                    }
-                    Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
-                        if let Some(sink) = &sink {
-                            sink.write(true, data.to_vec()).await;
-                        }
-                        capture(&mut stderr, &stdout, &data, &mut truncated)
-                    }
-                    Some(ChannelMsg::ExitStatus { exit_status }) if exit_code.is_none() => {
-                        exit_code = Some(exit_status)
-                    }
-                    Some(ChannelMsg::Eof) => {}
-                    Some(ChannelMsg::Close) | None => {
-                        let exit_code = exit_code.ok_or(ExecError::Unknown)?;
-                        return Ok(ExecResult {
-                            exit_code,
-                            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                            stderr: String::from_utf8_lossy(&stderr).into_owned(),
-                            truncated,
-                        });
-                    }
-                    _ => return Err(ExecError::Unknown),
-                }
-            }
+            receive_output(
+                futures_util::stream::unfold(channel, |channel| async move {
+                    channel.wait().await.map(|message| (message, channel))
+                }),
+                sink.as_ref(),
+            )
+            .await
         };
         tokio::select! {
             biased;
@@ -189,6 +157,55 @@ impl PreparedExec {
         // OpeningChannel drops on every path and closes only this exec channel.
     }
 }
+async fn receive_output(
+    messages: impl futures_util::Stream<Item = ChannelMsg>,
+    sink: Option<&Arc<crate::agent::tool_output::Capture>>,
+) -> Result<ExecResult, ExecError> {
+    use futures_util::StreamExt;
+    tokio::pin!(messages);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut truncated = false;
+    let mut accepted = false;
+    let mut exit_code = None;
+    loop {
+        match messages.next().await {
+            Some(ChannelMsg::Success) => accepted = true,
+            Some(ChannelMsg::Failure) if !accepted && exit_code.is_none() => {
+                return Err(ExecError::Rejected)
+            }
+            Some(ChannelMsg::Data { data }) => {
+                if let Some(sink) = &sink {
+                    sink.write(false, data.to_vec()).await;
+                }
+                capture(&mut stdout, &stderr, &data, &mut truncated)
+            }
+            Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
+                if let Some(sink) = &sink {
+                    sink.write(true, data.to_vec()).await;
+                }
+                capture(&mut stderr, &stdout, &data, &mut truncated)
+            }
+            Some(ChannelMsg::ExitStatus { exit_status }) if exit_code.is_none() => {
+                exit_code = Some(exit_status)
+            }
+            // russh already updates its send window before forwarding this informational
+            // event. OpenSSH may send it immediately after exec, before any output.
+            Some(ChannelMsg::WindowAdjusted { .. } | ChannelMsg::XonXoff { .. }) => {}
+            Some(ChannelMsg::Eof) => {}
+            Some(ChannelMsg::Close) | None => {
+                let exit_code = exit_code.ok_or(ExecError::Unknown)?;
+                return Ok(ExecResult {
+                    exit_code,
+                    stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                    truncated,
+                });
+            }
+            _ => return Err(ExecError::Unknown),
+        }
+    }
+}
 fn capture(output: &mut Vec<u8>, other: &[u8], data: &[u8], truncated: &mut bool) {
     // The D4 sink stores raw bytes separately. Keep a bounded combined model preview,
     // continues draining, and never claims truncated data is the complete output.
@@ -197,4 +214,67 @@ fn capture(output: &mut Vec<u8>, other: &[u8], data: &[u8], truncated: &mut bool
         .min(1024usize.saturating_sub(output.len() + other.len()));
     output.extend_from_slice(&data[..take]);
     *truncated |= take < data.len();
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+    #[tokio::test]
+    async fn window_updates_before_between_and_after_output_preserve_exit_code_and_streams() {
+        let frames = vec![
+            ChannelMsg::WindowAdjusted { new_size: 2097152 },
+            ChannelMsg::XonXoff {
+                client_can_do: false,
+            },
+            ChannelMsg::Success,
+            ChannelMsg::Data {
+                data: b"docker_".to_vec().into(),
+            },
+            ChannelMsg::WindowAdjusted { new_size: 4194304 },
+            ChannelMsg::Data {
+                data: b"installed=yes\n".to_vec().into(),
+            },
+            ChannelMsg::ExtendedData {
+                data: b"service inactive\n".to_vec().into(),
+                ext: 1,
+            },
+            ChannelMsg::ExitStatus { exit_status: 7 },
+            ChannelMsg::WindowAdjusted { new_size: 4194320 },
+            ChannelMsg::Eof,
+            ChannelMsg::Close,
+        ];
+        let result = receive_output(futures_util::stream::iter(frames), None)
+            .await
+            .unwrap();
+        assert_eq!(result.stdout, "docker_installed=yes\n");
+        assert_eq!(result.stderr, "service inactive\n");
+        assert_eq!(result.exit_code, 7);
+        assert!(!result.truncated);
+    }
+    #[tokio::test]
+    async fn flow_control_is_neither_execution_acceptance_nor_a_substitute_for_exit_status() {
+        let rejected = receive_output(
+            futures_util::stream::iter(vec![
+                ChannelMsg::WindowAdjusted { new_size: 4096 },
+                ChannelMsg::Failure,
+            ]),
+            None,
+        )
+        .await;
+        assert!(matches!(rejected, Err(ExecError::Rejected)));
+        let missing = receive_output(
+            futures_util::stream::iter(vec![
+                ChannelMsg::Success,
+                ChannelMsg::Data {
+                    data: b"partial".to_vec().into(),
+                },
+                ChannelMsg::WindowAdjusted { new_size: 4096 },
+                ChannelMsg::Eof,
+                ChannelMsg::Close,
+            ]),
+            None,
+        )
+        .await;
+        assert!(matches!(missing, Err(ExecError::Unknown)));
+    }
 }

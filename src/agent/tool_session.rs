@@ -1,5 +1,5 @@
 //! D4 native tool turn: original events, full SSH captures and bounded output reads.
-//! The desktop text-chat IPC is intentionally not wired here; D5 owns that UI lifecycle.
+//! D5 desktop integration uses a host-owned durable turn and bounded event channel.
 mod context;
 use super::{
     provider::{
@@ -50,6 +50,9 @@ pub struct ToolSession {
     repository: Repository,
     started: AtomicBool,
     data: Arc<Mutex<Option<Data>>>,
+    managed: Option<(chat::Request, String)>,
+    events: Option<tokio::sync::mpsc::Sender<chat::StreamEvent>>,
+    reporter: context_status::Reporter,
 }
 async fn worker<T: Send + 'static>(
     action: impl FnOnce() -> tool_loop::Result<T> + Send + 'static,
@@ -69,7 +72,43 @@ impl ToolSession {
             executor,
             started: AtomicBool::new(false),
             data: Arc::new(Mutex::new(None)),
+            managed: None,
+            events: None,
+            reporter: context_status::Reporter::default(),
         }
+    }
+    pub(crate) fn managed(
+        mut self,
+        request: chat::Request,
+        owner: String,
+        events: tokio::sync::mpsc::Sender<chat::StreamEvent>,
+        reporter: context_status::Reporter,
+    ) -> Self {
+        self.managed = Some((request, owner));
+        self.events = Some(events);
+        self.reporter = reporter;
+        self
+    }
+    pub(crate) fn revision(&self) -> Option<u64> {
+        self.data
+            .lock()
+            .ok()?
+            .as_ref()
+            .map(|d| d.snapshot.session.revision)
+    }
+    pub(crate) fn preflight(
+        snapshot: &Snapshot,
+        binding: &ssh_tools::SshBinding,
+        message: &str,
+        runtime: &RuntimeConfig,
+    ) -> tool_loop::Result<()> {
+        context::require_pinned(
+            snapshot,
+            binding,
+            message,
+            runtime,
+            &[ssh_tools::definition(), output_definition()],
+        )
     }
     /// Native storage quotas, never model arguments or execution permission.
     pub fn with_output_limits(mut self, limits: OutputLimits) -> tool_loop::Result<Self> {
@@ -116,6 +155,7 @@ impl ToolSession {
         let message = message.to_owned();
         let data = self.data.clone();
         let tools = registry.definitions();
+        let managed = self.managed.clone();
         let runtime = worker(move || {
             let snapshot = repository.snapshot(&binding.session_id,&binding.user_id).map_err(context_error)?;
             if ToolBinding::from_snapshot(&snapshot).map_err(context_error)? != binding.tool {
@@ -128,7 +168,11 @@ impl ToolSession {
             let running = repository.db(|db| Ok(db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM agent_chat_turns WHERE session_id=?1 AND state='running')",
                 [&binding.session_id], |r|r.get::<_,bool>(0))?)).map_err(context_error)?;
-            if running { return Err(tool_loop::Error::Context); }
+            if running && managed.is_none() { return Err(tool_loop::Error::Context); }
+            if let Some((r,owner))=&managed {
+                let valid=repository.db(|db|Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM agent_chat_turns t JOIN agent_tool_turns k USING(session_id,request_id) WHERE t.session_id=?1 AND t.request_id=?2 AND t.owner=?3 AND t.state='running' AND t.cancel_requested=0 AND t.lease_until>=?4)",rusqlite::params![r.session_id,r.request_id,owner,chrono::Utc::now().timestamp_millis()],|r|r.get::<_,bool>(0))?)).map_err(context_error)?;
+                if !valid{return Err(tool_loop::Error::Context);}
+            }
             let runtime = ModelRepository::new(repository.store.clone())
                 .runtime(&snapshot.session.agent_id,&binding.user_id)
                 .map_err(|_|tool_loop::Error::Context)?;
@@ -137,14 +181,17 @@ impl ToolSession {
                 return Err(tool_loop::Error::Context);
             }
             context::require_pinned(&snapshot,&binding,&message,&runtime,&tools)?;
-            let appended = repository.append(&binding.session_id,&binding.user_id,snapshot.session.revision,
-                &request_id,Payload::UserMessage{text:message.clone()}).map_err(context_error)?;
-            if !appended.inserted { return Err(tool_loop::Error::AlreadyStarted); }
-            let mut snapshot = snapshot;
-            snapshot.session.revision += 1;
-            snapshot.through_event_id = appended.event.id;
+            let (snapshot,latest_user)=if let Some((r,_))=&managed {
+                let cursor=repository.db(|db|Ok(db.query_row("SELECT user_event_id FROM agent_chat_turns WHERE session_id=?1 AND request_id=?2",rusqlite::params![r.session_id,r.request_id],|r|r.get(0))?)).map_err(context_error)?;
+                (snapshot,cursor)
+            } else {
+                let appended=repository.append(&binding.session_id,&binding.user_id,snapshot.session.revision,&request_id,Payload::UserMessage{text:message.clone()}).map_err(context_error)?;
+                if !appended.inserted{return Err(tool_loop::Error::AlreadyStarted);}
+                let mut snapshot=snapshot;snapshot.session.revision+=1;snapshot.through_event_id=appended.event.id;
+                (snapshot,appended.event.id)
+            };
             *data.lock().map_err(|_|tool_loop::Error::Context)? = Some(Data {
-                snapshot,latest_user:appended.event.id,message,runtime:runtime.clone(),pending:vec![],
+                snapshot,latest_user,message,runtime:runtime.clone(),pending:vec![],
             });
             Ok(runtime)
         }).await?;
@@ -157,7 +204,7 @@ impl ToolSession {
         let repository = self.repository.clone();
         let data = self.data.clone();
         let text = reply.content.clone().or_else(|| reply.refusal.clone());
-        if let Some(text) = text.filter(|t| !t.trim().is_empty()) {
+        if let Some(text) = text.filter(|t| !t.trim().is_empty() && self.managed.is_none()) {
             worker(move || {
                 let mut guard = data.lock().map_err(|_| tool_loop::Error::Context)?;
                 let data = guard.as_mut().ok_or(tool_loop::Error::Context)?;
@@ -214,6 +261,7 @@ impl LoopContext for ToolSession {
             let binding = self.executor.binding().tool.clone();
             let calls = calls.to_vec();
             let text = text.filter(|t| !t.trim().is_empty()).map(str::to_owned);
+            let notifications = calls.clone();
             worker(move||{
                 let mut guard=data.lock().map_err(|_|tool_loop::Error::Context)?;
                 let data=guard.as_mut().ok_or(tool_loop::Error::Context)?;
@@ -229,7 +277,22 @@ impl LoopContext for ToolSession {
                 data.snapshot=repository.snapshot(&data.snapshot.session.id,&data.snapshot.session.user_id).map_err(context_error)?;
                 data.pending=calls.into_iter().map(|call|Pending{id:call.id,started:false,capture:None}).collect();
                 Ok(())
-            }).await
+            }).await?;
+            if let Some(events) = &self.events {
+                for call in notifications {
+                    let args: Value =
+                        serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
+                    events
+                        .try_send(chat::StreamEvent::ToolCall {
+                            tool_call_id: call.id,
+                            tool_name: call.function.name,
+                            command: args["command"].as_str().map(str::to_owned),
+                            status: "running".into(),
+                        })
+                        .map_err(|_| tool_loop::Error::Context)?;
+                }
+            }
+            Ok(())
         })
     }
     fn started(&self, call_id: &str) -> tool_loop::Result<()> {
@@ -252,12 +315,38 @@ impl LoopContext for ToolSession {
         let data = self.data.clone();
         let call_id = call_id.to_owned();
         let content = content.to_owned();
-        Box::pin(worker(move || {
-            let mut guard = data.lock().map_err(|_| tool_loop::Error::Context)?;
-            let data = guard.as_mut().ok_or(tool_loop::Error::Context)?;
-            ensure_current(&repository, data)?;
-            publish(&repository, data, &call_id, &content)
-        }))
+        let events = self.events.clone();
+        Box::pin(async move {
+            let id = call_id.clone();
+            let text = content.clone();
+            worker(move || {
+                let mut guard = data.lock().map_err(|_| tool_loop::Error::Context)?;
+                let data = guard.as_mut().ok_or(tool_loop::Error::Context)?;
+                ensure_current(&repository, data)?;
+                publish(&repository, data, &call_id, &content)
+            })
+            .await?;
+            if let Some(events) = events {
+                let value: Value =
+                    serde_json::from_str(&text).map_err(|_| tool_loop::Error::Context)?;
+                let status = if value["ok"] == true {
+                    "success"
+                } else if value["error"] == "result_unknown" {
+                    "unknown"
+                } else {
+                    "error"
+                };
+                events
+                    .send(chat::StreamEvent::ToolResult {
+                        tool_call_id: id,
+                        content: text,
+                        status: status.into(),
+                    })
+                    .await
+                    .map_err(|_| tool_loop::Error::Context)?;
+            }
+            Ok(())
+        })
     }
 }
 fn publish(

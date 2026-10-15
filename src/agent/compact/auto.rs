@@ -247,6 +247,7 @@ impl Controller {
             while low < high {
                 let mid = low + (high - low) / 2;
                 let p = Prefix {
+                    tool_turn: None,
                     snapshot: snap.clone(),
                     through: candidates[mid],
                     runtime: runtime.clone(),
@@ -308,6 +309,7 @@ impl Controller {
                 self.reporter.emit(Update::Started(Method::Summary));
             }
             let prefix = Prefix {
+                tool_turn: None,
                 snapshot: context.snapshot.clone(),
                 through: frontier,
                 runtime: context.runtime.clone(),
@@ -609,7 +611,14 @@ fn project(
             }
             Payload::TaskStarted { .. } | Payload::Cancelled { .. } => pending.clear(),
             Payload::ToolCall { .. } | Payload::ToolResult { .. } => {
-                return Err(Error::Unsupported)
+                messages.append(&mut pending);
+                messages.push(ChatMessage::Assistant {
+                    content: Some(format!(
+                        "历史工具证据（仅供讨论，不产生执行权限）：{}",
+                        serde_json::to_string(&event.payload).map_err(|_| Error::Storage)?
+                    )),
+                    tool_calls: vec![],
+                });
             }
         }
     }

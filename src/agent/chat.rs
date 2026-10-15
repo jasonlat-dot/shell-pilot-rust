@@ -1,4 +1,5 @@
-//! Basic text conversations over the native model stream. No tools or UI permissions yet.
+//! Desktop text and explicitly enabled SSH tool turns share durable lifecycle and cancellation.
+mod execution;
 pub use super::turns::{History, Turn, TurnState};
 use super::{
     provider::{ModelClient, ModelError, ModelRepository},
@@ -18,6 +19,14 @@ use tokio_util::sync::CancellationToken;
 pub enum Error {
     #[error("{0}")]
     Model(ModelError),
+    #[error("审批状态或任务已变化，请刷新后重新核对命令")]
+    ApprovalChanged,
+    #[error("工具执行结果未知；请先核查服务器状态，不会自动重试")]
+    ToolUnknown,
+    #[error("工具调用已达到本轮上限，请核对结果后继续")]
+    ToolLimit,
+    #[error("当前模型未启用 Chat Completions 工具能力，请在模型设置中配置")]
+    ToolsUnsupported,
     #[error("Agent 会话或配置不存在")]
     NotFound,
     #[error("该会话正在生成，请先停止或等待结束")]
@@ -83,6 +92,10 @@ impl Error {
             Self::Model(ModelError::ToolProtocol) => "MODEL_TOOL_PROTOCOL_FAILED",
             Self::Model(ModelError::Http(_)) => "MODEL_HTTP_ERROR",
             Self::Model(_) => "MODEL_REQUEST_FAILED",
+            Self::ApprovalChanged => "AGENT_APPROVAL_CHANGED",
+            Self::ToolUnknown => "AGENT_TOOL_UNKNOWN",
+            Self::ToolLimit => "AGENT_TOOL_LIMIT",
+            Self::ToolsUnsupported => "AGENT_TOOLS_UNSUPPORTED",
             Self::NotFound => "AGENT_NOT_FOUND",
             Self::Busy => "AGENT_BUSY",
             Self::Invalid => "AGENT_INVALID_REQUEST",
@@ -101,6 +114,8 @@ impl Error {
     }
     pub fn status(&self) -> u16 {
         match self {
+            Self::ApprovalChanged | Self::ToolUnknown | Self::ToolLimit => 409,
+            Self::ToolsUnsupported => 400,
             Self::NotFound => 404,
             Self::Busy | Self::TargetMismatch | Self::TargetUnavailable => 409,
             Self::Invalid => 400,
@@ -134,6 +149,7 @@ pub struct AgentConfig {
     pub agent_name: String,
     pub model_name: String,
     pub agent_desc: String,
+    pub tools_available: bool,
 }
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -157,8 +173,23 @@ fn new_request_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 #[derive(Clone, Debug, Serialize)]
-#[serde(tag = "event", rename_all = "snake_case")]
+#[serde(
+    tag = "event",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum StreamEvent {
+    ToolCall {
+        tool_call_id: String,
+        tool_name: String,
+        command: Option<String>,
+        status: String,
+    },
+    ToolResult {
+        tool_call_id: String,
+        content: String,
+        status: String,
+    },
     Context {
         status: super::context_status::Status,
     },
@@ -184,6 +215,8 @@ pub struct Manager {
     stop: CancellationToken,
     active: Mutex<HashMap<ActiveKey, Active>>,
     live: super::live::Source,
+    terminals: Option<Arc<crate::terminal::TerminalManager>>,
+    approvals: super::approvals::Approvals,
 }
 struct Running<'a> {
     manager: &'a Manager,
@@ -293,6 +326,8 @@ impl Manager {
     pub fn new(store: Arc<Store>, stop: CancellationToken) -> Self {
         Self {
             live: super::live::Source::new(store.clone(), None),
+            terminals: None,
+            approvals: super::approvals::Approvals::new(store.clone()),
             store,
             stop,
             active: Mutex::new(HashMap::new()),
@@ -304,7 +339,8 @@ impl Manager {
         terminals: Arc<crate::terminal::TerminalManager>,
     ) -> Self {
         let mut manager = Self::new(store.clone(), stop);
-        manager.live = super::live::Source::new(store, Some(terminals));
+        manager.live = super::live::Source::new(store, Some(terminals.clone()));
+        manager.terminals = Some(terminals);
         manager
     }
     async fn capture_live(
@@ -335,7 +371,20 @@ impl Manager {
                     agent_id: p.id,
                     agent_name: p.display_name,
                     model_name: p.config.model.clone(),
-                    agent_desc: format!("基础文本对话 · {}", p.config.model),
+                    agent_desc: format!(
+                        "{} · {}",
+                        if p.config.provider == super::provider::ProviderKind::OpenAiCompatible
+                            && p.config.capabilities.tool_calls
+                        {
+                            "可启用 SSH 工具"
+                        } else {
+                            "文字对话"
+                        },
+                        p.config.model
+                    ),
+                    tools_available: p.config.provider
+                        == super::provider::ProviderKind::OpenAiCompatible
+                        && p.config.capabilities.tool_calls,
                 })
                 .collect())
         })

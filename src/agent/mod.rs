@@ -1,5 +1,5 @@
 //! Persistent context, native model adapters, text turns and journaled SSH tool turns.
-//! Desktop chat does not dispatch tools until target binding and approval are integrated.
+//! Desktop tools require explicit target binding and durable human approval.
 pub mod approvals;
 pub mod budget;
 pub mod chat;

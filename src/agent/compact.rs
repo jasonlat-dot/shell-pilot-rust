@@ -111,6 +111,7 @@ pub(crate) struct Prefix {
     pub through: u64,
     pub runtime: super::provider::RuntimeConfig,
     pub summary_bytes: usize,
+    pub tool_turn: Option<(String, String)>,
 }
 pub struct Summarizer {
     store: Arc<Store>,
@@ -234,6 +235,7 @@ fn capture(
     session: &str,
     user: &str,
     frontier: Option<u64>,
+    tool_turn: Option<&(String, String)>,
 ) -> Result<(Snapshot, Source)> {
     // Re-read the version after all source reads. A4's commit check remains mandatory even afterwards.
     let snapshot = repository.snapshot(session, user)?;
@@ -249,7 +251,14 @@ fn capture(
         )?)
     })?;
     if running {
-        return Err(Error::Busy);
+        let own = if let Some((request, owner)) = tool_turn {
+            repository.db(|db|Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM agent_chat_turns t JOIN agent_tool_turns k USING(session_id,request_id) WHERE t.session_id=?1 AND t.request_id=?2 AND t.owner=?3 AND t.state='running' AND t.cancel_requested=0 AND t.lease_until>=?4)",rusqlite::params![session,request,owner,chrono::Utc::now().timestamp_millis()],|r|r.get::<_,bool>(0))?))?
+        } else {
+            false
+        };
+        if !own {
+            return Err(Error::Busy);
+        }
     }
     let through = frontier.unwrap_or(snapshot.through_event_id);
     if through < after || through > snapshot.through_event_id {
@@ -351,7 +360,13 @@ fn prepare(
     prefix: Option<&Prefix>,
 ) -> Result<Prepared> {
     let repository = Repository::new(store.clone());
-    let (snapshot, source) = capture(&repository, session, user, prefix.map(|p| p.through))?;
+    let (snapshot, source) = capture(
+        &repository,
+        session,
+        user,
+        prefix.map(|p| p.through),
+        prefix.and_then(|p| p.tool_turn.as_ref()),
+    )?;
     if prefix.is_some_and(|p| p.snapshot != snapshot) {
         return Err(Error::ContextChanged);
     }

@@ -84,6 +84,13 @@ impl ToolSession {
             available,
             None,
         )?;
+        self.reporter
+            .measured(
+                &frame.runtime.config,
+                provider::measure_request(&frame.runtime.config, &initial)?.estimated_input_tokens,
+                context_status::Source::Estimated,
+            )
+            .map_err(|_| tool_loop::Error::Context)?;
         // Use C2's complete-batch gate and the actual tools/framing in every measurement.
         let check =
             compact::auto::check_after_tool_batch(&frame.runtime.config, &initial, &frame.events)
@@ -148,11 +155,18 @@ impl ToolSession {
                 continue;
             }
             let prefix = Prefix {
+                tool_turn: self
+                    .managed
+                    .as_ref()
+                    .map(|(r, owner)| (r.request_id.clone(), owner.clone())),
                 snapshot: frame.snapshot.clone(),
                 through,
                 runtime: frame.runtime.clone(),
                 summary_bytes: if attempt == 0 { 2048 } else { 1024 },
             };
+            self.reporter.emit(context_status::Update::ToolStarted(
+                frame.snapshot.session.checkpoint_id.clone(),
+            ));
             let operation = Summarizer::new(self.repository.store.clone());
             let draft = operation
                 .summarize_prefix(
@@ -194,6 +208,7 @@ impl ToolSession {
             let repository = self.repository.clone();
             let state = self.data.clone();
             let cancellation = cancel.clone();
+            let reporter = self.reporter.clone();
             worker(move || {
                 let mut guard = state.lock().map_err(|_| tool_loop::Error::Context)?;
                 let data = guard.as_mut().ok_or(tool_loop::Error::Context)?;
@@ -207,14 +222,26 @@ impl ToolSession {
                     )
                     .map_err(context_error)?;
                 data.snapshot.session.revision = checkpoint.committed_revision;
-                data.snapshot.session.checkpoint_id = Some(checkpoint.id);
+                data.snapshot.session.checkpoint_id = Some(checkpoint.id.clone());
+                reporter.emit(context_status::Update::Committed(checkpoint.id));
                 Ok(())
             })
             .await?;
+            self.reporter
+                .measured(
+                    &frame.runtime.config,
+                    measured.estimated_input_tokens,
+                    context_status::Source::Estimated,
+                )
+                .map_err(|_| tool_loop::Error::Context)?;
             return Ok(projected);
         }
         // A failed summary never discards raw evidence or creates a retry of an SSH call.
         // Soft-limit fallback is allowed only with unchanged, hard-fitting original input.
+        self.reporter.emit(context_status::Update::Failed {
+            code: "AGENT_COMPACTION_FAILED".into(),
+            fallback: original_fits,
+        });
         let current = self.frame().await?;
         if cancel.is_cancelled() {
             return Err(tool_loop::Error::Cancelled);

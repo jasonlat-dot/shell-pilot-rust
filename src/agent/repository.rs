@@ -379,8 +379,8 @@ fn read_snapshot(db: &Connection, id: &str, user_id: &str) -> Result<Snapshot> {
         uncertain_tool_call_ids,
     })
 }
-type EventRow = (u64, String, Option<String>, String, String, i64);
-fn read_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
+pub(super) type EventRow = (u64, String, Option<String>, String, String, i64);
+pub(super) fn read_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
     Ok((
         row.get(0)?,
         row.get(1)?,
@@ -390,7 +390,7 @@ fn read_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
         row.get(5)?,
     ))
 }
-fn decode_event(row: EventRow) -> Result<Event> {
+pub(super) fn decode_event(row: EventRow) -> Result<Event> {
     let (id, session_id, task_id, request_id, payload, created_at) = row;
     Ok(Event {
         id,

@@ -673,3 +673,44 @@ async fn server_scope_identity_and_opening_trust_cannot_be_replaced_by_saved_con
     assert!(b.fixture.stats.execs.lock().unwrap().is_empty());
     b.terminals.shutdown().await;
 }
+
+#[tokio::test]
+async fn informational_ssh_flow_control_before_exec_reply_keeps_result_and_terminal_alive() {
+    let b = Bound::new(Spec::default(), TerminalSettings::default()).await;
+    let executor = b.executor().await.with_authorizer(Arc::new(Permit));
+    let result = executor
+        .execute_command(
+            "flow-control",
+            &command("__exec_chunked__"),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.exit_code, 0);
+    assert!(!result.stdout.is_empty());
+    assert!(result.truncated);
+    assert_eq!(
+        b.fixture.stats.execs.lock().unwrap().as_slice(),
+        ["__exec_chunked__"]
+    );
+    assert_eq!(b.fixture.stats.connections.load(Ordering::SeqCst), 1);
+    assert!(
+        b.terminals
+            .connected(&b.target.terminal_session_id)
+            .connected
+    );
+    b.terminals
+        .write(
+            &b.target.terminal_session_id,
+            "still interactive after exec".into(),
+        )
+        .await
+        .unwrap();
+    output_contains(
+        &b.terminals,
+        &b.target.terminal_session_id,
+        "still interactive after exec",
+    )
+    .await;
+    b.terminals.shutdown().await;
+}

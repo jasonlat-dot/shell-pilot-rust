@@ -96,6 +96,12 @@ pub(crate) struct Input {
 /// No Debug: the displayed command/output can contain user secrets. Never log this.
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct Grant {
+    pub expires_at: i64,
+    pub revoked: bool,
+}
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Receipt {
     pub id: String,
     pub call_id: String,
@@ -106,6 +112,7 @@ pub struct Receipt {
     pub result: Option<CommandResult>,
     pub created_at: i64,
     pub expires_at: i64,
+    pub grant: Option<Grant>,
 }
 struct Row {
     id: String,
@@ -115,6 +122,7 @@ struct Row {
     result: Option<CommandResult>,
     created: i64,
     expires: i64,
+    grant: Option<Grant>,
 }
 impl Row {
     fn receipt(self) -> Receipt {
@@ -128,12 +136,26 @@ impl Row {
             result: self.result,
             created_at: self.created,
             expires_at: self.expires,
+            grant: self.grant,
         }
     }
 }
 fn row(db: &Database, id: &str, user: &str) -> Result<Row> {
     let raw=db.query_row("SELECT id,call_id,request_json,state,result_json,created_at,expires_at FROM agent_execution_requests WHERE id=?1 AND user_id=?2",params![id,user],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,i64>(5)?,r.get::<_,i64>(6)?))).optional()?.ok_or(Error::NotFound)?;
+    let grant = db
+        .query_row(
+            "SELECT expires_at,revoked FROM agent_execution_grants WHERE request_id=?1",
+            [id],
+            |r| {
+                Ok(Grant {
+                    expires_at: r.get(0)?,
+                    revoked: r.get(1)?,
+                })
+            },
+        )
+        .optional()?;
     Ok(Row {
+        grant,
         id: raw.0,
         call: raw.1,
         input: serde_json::from_str(&raw.2)?,
@@ -319,6 +341,7 @@ impl Approvals {
         self.db(move|db|{
    read_session(db,&session,&user).map_err(|_|Error::NotFound)?;
    let cursor=if after.is_empty(){None}else{Some(db.query_row("SELECT rowid FROM agent_execution_requests WHERE id=?1 AND session_id=?2 AND user_id=?3",params![after,session,user],|r|r.get::<_,i64>(0)).optional()?.ok_or(Error::NotFound)?)};
+   db.execute("UPDATE agent_execution_requests SET state='expired',updated_at=?3 WHERE session_id=?1 AND user_id=?2 AND state IN ('pending','approved') AND expires_at<=?3",params![session,user,now()])?;
    let mut q=db.prepare("SELECT id FROM agent_execution_requests WHERE session_id=?1 AND user_id=?2 AND (?3 IS NULL OR rowid<?3) ORDER BY rowid DESC LIMIT 50")?;
    let ids=q.query_map(params![session,user,cursor],|r|r.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
    ids.into_iter().map(|id|Ok(row(db,&id,&user)?.receipt())).collect()
@@ -424,6 +447,9 @@ impl Approvals {
      return Err(Error::Stale);
     }
    }
+   let binding=&old.input.context.binding;
+   let desktop:Option<(String,bool,i64)>=tx.query_row("SELECT t.state,t.cancel_requested,t.lease_until FROM agent_chat_turns t JOIN agent_tool_turns k USING(session_id,request_id) WHERE t.session_id=?1 AND t.user_event_id<(SELECT id FROM agent_events WHERE session_id=?1 AND call_id=?2 AND kind='tool_call') ORDER BY t.user_event_id DESC LIMIT 1",params![binding.session_id,old.call],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+   if desktop.is_some_and(|(state,cancel,lease)|state!="running"||cancel||lease<now()){return Err(Error::Denied);}
    if old.state!=State::Approved{return Err(Error::Denied);}
    if old.expires<=now(){return Err(Error::Expired);}
    current(&tx,&old.input.context)?;
@@ -771,7 +797,7 @@ mod tests {
                 .db(|db| Ok(db.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))?))
                 .await
                 .unwrap(),
-            12
+            13
         );
     }
 }

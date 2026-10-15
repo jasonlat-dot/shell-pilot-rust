@@ -1,6 +1,6 @@
 # Rust SSH Agent 实施清单与续接入口
 
-更新日期：2026-10-15。状态：阶段 5 实施中，A/B/C 当前文字阶段及 D1–D4 原生工具链已完成；下一项 D5：前端/IPC 产品接入、明确服务器绑定、审批与工具结果 UI。桌面仍为文字 Agent，不将原生内核完成描述为桌面命令能力已启用。
+更新日期：2026-10-15。状态：阶段 5 实施中，A/B/C 当前文字阶段及 D1–D5 工具产品链路已完成本地联验；下一项 E1：聊天附件/媒体能力与预算。桌面已接显式服务器工具入口；真实模型、用户远端和完整 GUI 验收仍归 E6。
 用户要求：参考 Codex CLI 优化上下文和工具决策；先列清单，每完成一项更新标记，供换窗口后续接。当前不打包。需要修改前端的阶段同步修改 test-rust-ui。
 源码参考与设计依据：[CODEX_AGENT_REFERENCE.md](CODEX_AGENT_REFERENCE.md)。本文件是进度唯一入口，完成标记必须有代码与验证证据，不以“已设计”替代“已实现”。
 
@@ -8,7 +8,7 @@ Rust 重构交接、已完成工作与运行方式见 [WORK_HANDOFF_2026-10-14.m
 
 ## 工作区与约束
 
-- 客户端分支 test-rust-ui，基线 9585898；Rust 分支 main，基线 8706399（包含 D3/6c5111f、D2/05da511 和聊天测试修复）。D4 开始前两仓库均干净；本次 Rust D4 代码、回归与文档未提交，客户端未修改；远端推送状态未核对。
+- 客户端分支 test-rust-ui，基线 9585898；Rust 分支 main，基线 abfa685（D4，包含 D3 和聊天测试修复）。D5 开始前两仓库均干净；本轮前后端 D5 代码、回归与文档未提交，远端推送状态未核对。
 - 项目、参考源码和工具位置由本机环境决定；跨电脑续接时按实际位置核对 Cargo 依赖，不沿用旧电脑的绝对路径。
 - 当前源码未重新打包；已有 0.4.0 安装包不能代表最新功能。
 - 保留各仓库已有未提交变更；不连接用户远端、不执行实际变更命令来做测试。
@@ -27,7 +27,7 @@ Rust 重构交接、已完成工作与运行方式见 [WORK_HANDOFF_2026-10-14.m
 - [x] A3 请求预算器：模型窗口、输出/系统/工具/媒体/安全预留、UTF-8 估算、完整工具组选择和硬上限。
 - [x] A4 检查点持久化：结构化目标/约束/证据/待办，版本快照与比较提交，压缩中用户变更/取消不能被覆盖。
 - [x] A5 工具完整输出存储与按范围回查；只将有界结果投入模型窗口。
-- [x] A6 内核测试：多会话、错误主机、任务继续、重复副作用、超限、过期检查点、重启与保留原始证据。内核组合回归已通过，用户已手动确认勾选；真实 SSH 执行副作用去重的最终联验仍归 D3。
+- [x] A6 内核测试：多会话、错误主机、任务继续、重复副作用、超限、过期检查点、重启与保留原始证据。内核组合回归已通过，用户已手动确认勾选；D3/D5 已完成本地模拟 SSH 的真实协议副作用去重；用户远端验收仍归 E6。
 
 ### B. 模型配置与基本对话
 - [x] B1 模型适配器与配置：供应商能力、模型窗口、API 地址/密钥安全保存、基础参数校验。OpenAI 兼容 Chat Completions 非流式适配与回环测试完成；前端配置入口已由 B4 接入。
@@ -38,7 +38,7 @@ Rust 重构交接、已完成工作与运行方式见 [WORK_HANDOFF_2026-10-14.m
 
 ### C. 检查点压缩
 - [x] C1 普通模型语义摘要适配器与摘要结构校验，不开放副作用工具。本阶段返回经校验的摘要草稿；13 项专门测试、相关 Agent 97 项及原生 IPC 15 项通过，自动触发/低水位/提交已由 C2 接入。
-- [x] C2 自动压缩状态机：当前文字模型请求前自动检查、较低水位、有限重试和检查点提交；工具批次预算边界已提供并验证，真实工具循环接入留给 D1/D4。失败保留日志/旧检查点；Agent 112、桌面 IPC 17、前端 51 项通过。
+- [x] C2 自动压缩状态机：当前文字模型请求前自动检查、较低水位、有限重试和检查点提交；工具批次预算边界已提供并验证，真实工具循环已由 D4/D5 接入。失败保留日志/旧检查点；Agent 112、桌面 IPC 17、前端 51 项通过。
 - [x] C3 支持的 Responses 供应商远端压缩能力分支；完整保存/复用返回窗口，用供应商输入计数验证预算，绑定原模型/接口/凭据，前端明确配置能力。专测 17、相关 Agent 130、桌面 IPC 19、前端 58 项通过。
 - [x] C4 压缩后重新注入实时目标、环境、可信授权与最新用户请求。宿主共享真实终端身份/生命周期，当前文字权限不从摘要产生；Agent 136、终端 22、桌面 IPC 20、前端 63 项及构建/静态检查通过，详细记录见本文件 C4。
 - [x] C4R 持久项目/作用域与重启恢复：schema 9/10 保留原日志/检查点/窗口，同身份重连接续、离线文字讨论、不同项目隔离。Rust 173、桌面 IPC 22、前端 74 项及构建/静态检查通过；随后按新参考图调整为左侧会话/SSH、中央对话、右侧终端及统一主导航，见末尾 UI 记录。
@@ -46,11 +46,11 @@ Rust 重构交接、已完成工作与运行方式见 [WORK_HANDOFF_2026-10-14.m
 - [x] C6 当前文字阶段的跨整理约束、新消息插入、模型缩窗、超大输入/附件拒绝边界与中断恢复。补齐 4 个连续场景，修复未回复用户补充遗漏与中断误标失败；自动整理 25、状态 4 项及严格 Clippy 通过。实际图片/PDF 输入与媒体计数尚未接入，验证归 E1，不能把拒绝测试当作媒体能力已完成。
 
 ### D. 工具决策与执行
-- [x] D1 主模型工具循环与严格参数校验：Chat Completions 非流式原生内核、宿主工具白名单、闭合 schema 子集、本地参数校验、有界循环与取消/未知结果保护；9 项定向测试及严格 Clippy 通过。原生持久执行准入/日志及批次整理由 D3/D4 接入；桌面聊天与 Responses 工具协议仍未开放。辅助意图标签不作为授权或强制路由。
-- [x] D2 SSH 工具执行绑定 connectionId/terminalSessionId/taskId；实际目标状态复核。新增可注册的 ssh_execute 原生处理器、同认证传输的独立 exec 通道、任务/归属/主机身份/连接配置复核及未知结果保护；默认授权拒绝。新增 8、D1 9、既有终端 22 项及严格 Clippy 通过；前端仍未开放。
-- [x] D3 命令策略和明确执行确认；持久授权范围，取消/结果未知/恢复时不盲目重执行。新增 schema 12 的原生审批请求、任务/命令精确授权、策略 CAS、原子 admitted 准入、完成回执与 unknown 永久阻断；前端审批入口和结果展示归 D5。
-- [x] D4 工具批次、输出回查与错误分类；执行失败不自动判为意图偏差。原生 ToolSession 接通整批日志、完整 SSH 输出、read_tool_output、批次整理与分类结果；新增 12 项端到端回归通过，桌面产品接入归 D5，详见末尾完成证据。
-- [ ] D5 前端执行确认/绑定服务器/工具结果 UI 和真实本地 SSH 协议回归。
+- [x] D1 主模型工具循环与严格参数校验：Chat Completions 非流式原生内核、宿主工具白名单、闭合 schema 子集、本地参数校验、有界循环与取消/未知结果保护；9 项定向测试及严格 Clippy 通过。原生持久执行准入/日志及批次整理由 D3/D4 接入；桌面工具已由 D5 接通；Responses 工具协议仍未开放。辅助意图标签不作为授权或强制路由。
+- [x] D2 SSH 工具执行绑定 connectionId/terminalSessionId/taskId；实际目标状态复核。新增可注册的 ssh_execute 原生处理器、同认证传输的独立 exec 通道、任务/归属/主机身份/连接配置复核及未知结果保护；默认授权拒绝。新增 8、D1 9、既有终端 22 项及严格 Clippy 通过；前端入口已由 D5 接通。
+- [x] D3 命令策略和明确执行确认；持久授权范围，取消/结果未知/恢复时不盲目重执行。新增 schema 12 的原生审批请求、任务/命令精确授权、策略 CAS、原子 admitted 准入、完成回执与 unknown 永久阻断；前端审批入口和结果展示已由 D5 接通。
+- [x] D4 工具批次、输出回查与错误分类；执行失败不自动判为意图偏差。原生 ToolSession 接通整批日志、完整 SSH 输出、read_tool_output、批次整理与分类结果；新增 12 项端到端回归通过，桌面产品入口已由 D5 接通，详见末尾完成证据。
+- [x] D5 前端执行确认/绑定服务器/工具结果 UI 和真实本地 SSH 协议回归。显式启用、审批/拒绝/撤销、固定目标、结果/原始输出和历史恢复已接通；工具 18、native IPC 24、前端 54 项通过。真实 GUI/模型/用户服务器仍待 E6。
 
 ### E. 附件、记忆与高级 Agent
 - [ ] E1 图片/PDF/文本附件到模型的转换、能力/预算/所有权检查。
@@ -62,15 +62,15 @@ Rust 重构交接、已完成工作与运行方式见 [WORK_HANDOFF_2026-10-14.m
 
 ## 当前进度与下一项
 
-A0–A6、B1–B5、C1–C6/C4R 当前文字阶段和 D1–D4 原生工具链已完成。D4 原生 ToolSession 复用 D1 模型循环、D2 固定 SSH 目标、D3 可信审批与 A5 输出库，接通原始批次、回查和受保护整理；默认授权仍拒绝，摘要/模型参数不产生权限。桌面仍使用既有文字流，D5 再接 IPC/Channel、任务绑定、审批和结果 UI。
+A0–A6、B1–B5、C1–C6/C4R 当前文字阶段和 D1–D5 已完成本地联验。桌面已有明确启用的 SSH 工具轮次：固定 task/connection/terminal 目标，可信用户逐条审批或短期精确任务命令授权，工具结果及完整输出回查；普通文字仍不派发工具，断线后可讨论历史证据。
 
-2026-10-15 本轮核对客户端 test-rust-ui/9585898、Rust main/8706399；D3/6c5111f 与聊天测试修复/8706399 已提交。schema 12 保持，本轮无新依赖、迁移或端口；D4 改动未提交、推送或打包。客户端 Cargo 相对依赖与本机目录一致；远端推送状态未核对。
+2026-10-15 核对 Rust main/abfa685、客户端 test-rust-ui/9585898；D5 开始前两仓库均干净。本次前后端 D5 未提交、未推送、未打包；schema 13 只新增幂等 agent_tool_turns 标记表，无新依赖、服务端口或独立后端部署。已有安装包不代表当前功能。
 
-D4 相关兼容回归当时为 141/141；收尾 lib + 审批 + SSH + D4 回归 54/54，并单独再验证最终 D4 12/12。全目标严格 Clippy、修改文件格式和 diff 检查通过；各轮有重复项，不合计成新的总数。全部使用临时 SQLite、回环模型协议和本地模拟 SSH，不使用真实模型 Key、用户服务器或 OS shell。没有运行全项目、前端或 Tauri/GUI 测试；详细命令与版本边界见末尾 D4 记录。
+最终工具集成 18/18（D4 12 + D5 6）、native IPC 24/24、前端定向 54/54、Rust lib 25/25 和自动整理 25/25 通过。聊天 17 项先通过，响应上限单项因负载意外超时后单独复测通过；上下文 18 项先通过，schema 断言修正后恢复单项通过；模型/Responses 两项迁移验证通过。各轮测试有重复，不加总成新的单次全量通过数。Rust 全目标严格 Clippy、TypeScript、Vite 资源构建及修改文件格式/diff 检查通过；桌面原有 lint 的限制和豁免检查见 D5 收尾记录。
 
-C4R 持久项目/作用域与历史恢复逻辑保留。用户随后提供新参考图并明确要求只修改页面：当前调整为左侧会话/SSH 上下分区、中央 Agent、右侧终端，设置分类与“终端”同级合并到左侧主导航，不保留设置页右侧重复栏；这项新要求覆盖之前 UI 撤销时的布局约束。历史仍按同一 sessionId/原 agentId 恢复，再连接/核对身份；新聊天才创建独立上下文，不合并不同服务器历史。
+现有左侧历史/SSH、中央 Agent、右侧终端和统一主导航布局保留。普通会话不继承当前终端；启用服务器工具时明确绑定，切换页签不改变在途任务目标。前端按持久 requestId 恢复工具证据与中断状态，unknown 不重试。
 
-下一项 D5：将原生 ToolSession 与桌面聊天生命周期、IPC/Channel/C5 状态、显式服务器任务绑定、审批/拒绝/撤销与工具结果/输出回查 UI 接通，并做本地 SSH 产品联验；同步修改 test-rust-ui 的功能和样式。Responses 工具协议、附件/媒体和高级能力仍未开放，当前不打包。
+下一项 **E1：聊天附件/媒体转换、能力/预算和归属校验**。Responses 工具协议、本地 shell、多 Agent/MCP/Skills 未开放。明暗主题、窄窗口、实际 WebView 与真实模型/用户远端仍待 E6，不能把回环协议和组件测试描述为实际 GUI 验收通过。当前不打包。
 
 ## 验证与完成记录
 
@@ -230,7 +230,7 @@ C4R 持久项目/作用域与历史恢复逻辑保留。用户随后提供新参
 - 新增 Rust 协议测试 3 项、原生 IPC 组合测试 3 项、前端 IPC 3 项、界面组件 3 项；总验证 Rust 55、原生 15、前端 48 项全部通过。
 - 前端 App.tsx 固定恢复中的轮次 ID 并防止重复停止，5 秒确认超时后重读权威历史；AgentPanel.tsx/ModelSettings.css 同步补等待、禁用及现有图标，保留 B4 模型设置布局。
 - TypeScript/Vite 构建、Rust Clippy -D warnings、桌面 Clippy 与修改 Rust 文件格式检查通过；桌面只有两项既有告警，大 chunk 提示保留。
-- 实际浏览器验收工具 Tabbit diagnose 返回 69；用户明确要求不处理该项、由代理判断继续，因此 B5 按自动回归勾选。没有真实桌面截图、明暗/窄屏视觉验收、真实模型矩阵或用户服务器操作，验证边界与后续实际检查保留在本文件 B5 / E6 记录中。
+- B5 按自动回归勾选。没有真实桌面截图、明暗/窄屏视觉验收、真实模型矩阵或用户服务器操作，验证边界与后续实际检查保留在本文件 B5 / E6 记录中。
 - B1–B4 没有重写；schema 7、稳定配置 ID、名称、DPAPI 密钥和历史关联未改变。未提交、未推送、未打包。下一项 C1。
 
 #### B5 验证命令与结果
@@ -644,3 +644,43 @@ D3 完成边界：审批 API 只有可信原生宿主可调用，桌面审批入
 D4 完成的是原生宿主执行/上下文链路，不是桌面已开放服务器自动执行。生产默认授权仍拒绝；模型参数、摘要和读取到的内容均不能启用工具或扩大权限。`ToolSession` 是新原生入口，尚未与现有桌面文字聊天的请求生命周期、原生 Channel/C5 状态、审批 UI 及历史恢复面板合并；不能将其重复 requestId 拒绝行为描述为桌面已具备工具回合回放/恢复功能。Responses 工具协议和工具流仍未开放。
 
 下一项 **D5：接入前后端产品调用链、显式服务器任务绑定、执行审批/拒绝/撤销、工具结果与输出回查 UI，以及实际 IPC/Channel + 本地 SSH 联验**；需要同步修改 test-rust-ui 的功能和样式。真实模型、用户远端及完整 GUI 验收继续归 E6；当前不打包。
+
+
+### D5：2026-10-15 完成前后端产品接入与本地联验
+
+#### 实际范围与代码位置
+
+- [x] D5.1 **显式启用、固定目标及桌面生命周期**：`src/agent/chat/execution.rs` 的 `bind_execution` / `chat_desktop` / `chat_tools`；启用前核对持久 scope 身份与真实终端。运行中禁止重绑；工具轮次复用既有 requestId 回执、会话互斥、停止、租约和历史。`src/agent/turns.rs` 与 `migrations/013_agent_tool_turns.sql` 原子标记工具轮次，模型批次由 D4 记原始日志，最终回复只由宿主版本校验提交，避免双写。恢复时未完成调用保守闭合为 unknown，admitted 不回收重试。
+- [x] D5.2 **可信审批和执行准入**：`src/agent/chat/execution.rs` 的 execution_requests / execution_decision / execution_policy / execution_output，及客户端 `src-tauri/src/backend_ipc.rs` 原生路由。仅开放 approveOnce、精确任务/命令 5 分钟授权、deny、cancel、revoke 和 confirm/deny 策略 CAS；没有 allow-all。`src/agent/approvals.rs` 显示持久 grant 过期/撤销状态，并在 admitted 同一事务内检查桌面停止标记、轮次状态和租约，关闭停止提交/令牌送达竞态。
+- [x] D5.3 **工具 Channel 与上下文整理**：`src/agent/tool_session.rs` 复用宿主已准入用户事件，采用容量 64 的有界工具事件通道；`src/agent/tool_session/context.rs` 与 compact.rs 仅允许当前有主人的工具轮次在完整批次边界整理。`src/agent/context_status.rs` 报告真实测量、提交和多次整理状态；迟到的 Finished 不重写已结束状态的 updatedAt。`src/agent/compact/auto.rs` / live.rs 保留工具后离线文字讨论，历史工具证据不产生执行权限。
+- [x] D5.4 **前端入口、确认与结果/回查**：客户端 `src/api/agent.ts`、`src/App.tsx`、`src/components/AgentPanel.tsx`、新增 `src/components/AgentExecution.tsx/.css`，及 `src/state/agentHistory.ts`。服务器聊天中显式启用，固定终端 ID；卡片显示准确服务器、完整命令和超时，支持批准/拒绝/取消/撤销/禁止后续执行。结果显示退出码、错误、截断和原始 stdout/stderr 引用，按 4 KiB 字节分页回读，非 UTF-8 可查十六进制。历史保留失败/未知及部分输出引用，不用重执行取输出。复用主题变量、flex 换行与窄容器样式；没有改动三栏布局。
+- [x] D5.5 **模型能力显式设置**：`src/agent/chat.rs` 公布 toolsAvailable；客户端 ModelSettings.tsx 高级参数增加「函数工具能力」，默认关闭，仅支持 Chat Completions。`executionEnabled` 只作为宿主订阅参数，缺省 false，不进入模型参数或摘要。
+
+固定参考仍为 `E:/project/ai-ssh/artifacts/codex-reference` 的 f82e36592278a0a782fb0d0fc97e5fa10e832ac2；核对 tools/router.rs 的宿主派发，不新增每轮意图分类器，不将本机沙箱视为 SSH 授权。
+
+#### 验证与修正记录
+
+- `cargo test --offline --test agent_tool_session -- --test-threads=1`：**18/18**，含 D4 12 项与 D5 6 项。D5 子场景包括：批准前零 exec、准确绑定、错误归属拒绝、批准后一次发送、跨 64 KiB 块读取原始字节、重开历史/只读输出、重复 requestId 不再执行、拒绝/停止/deny 不发送、在途重绑拒绝、drop 后 unknown、已写入停止标记而尚未取消 token 时仍不发送、完整批次压缩和 grant 撤销、过预算不建立轮次/不请求模型。
+- `cargo test --offline --lib --test agent_auto_compact --test agent_chat --test agent_context --test agent_tool_session -- --test-threads=1` 的最终生产源码：lib **25/25**、auto_compact **25/25**；聊天先 **17/18**，响应上限用例意外得到 MODEL_TIMEOUT（原期待 MODEL_RESPONSE_LIMIT），仅用原命令过滤该单项复测 **1/1**，没有放宽生产超时或断言。其余未执行套件随后单独运行。
+- 上下文初轮 **18/19**，失败为 schema 仍断言 12，统一修正 context/models/responses 的版本断言为 13；仅复测 `restart_restores_checkpoint_raw_events_and_uncertain_actions` **1/1**；`cargo test --offline --test agent_models --test agent_responses schema_ -- --test-threads=1` **2/2**。审批相关 `--test agent_approvals` 在收尾前 **11/11**，之后未修改审批生产代码。
+- C6 曾复现已完成状态的后台 Finished 重写时间戳，使「拒绝输入不改状态」断言失败；已修复真实竞态，最终 auto_compact **25/25**。新增两项单元回归分别验证 tool-turn 过期恢复 unknown，以及同轮再次整理/失败/取消保留先前真实检查点、迟到收尾不改时间戳，包含于 lib 25。
+- 客户端 `cargo test --offline --manifest-path src-tauri/Cargo.toml --lib backend_ipc::tests -- --test-threads=1`：**24/24**。新增 D5 回环 HTTP 模型 + 本地 SSH + 真实原生路由/逐帧 Channel ACK 联验，核对等待审批零发送、所有权、准确目标、一次 exec、结果/历史、跨块输出、断线后文字分析、缓存回放及离线读取。没有实际 WebView 自动化。
+- 前端使用项目已有兼容 Node（本机系统 Node 过旧），`--import tsx --test` 运行 agent-execution-ui、agent-ipc、agent-history、model-compaction-ui、chat-target、project-conversation、agent-context-status：**54/54**。包括审批真实点击、过期/unknown 不显示可批准、持久 grant 撤销、原始字节、固定会话路由、无效工具帧取消和历史恢复。修复旧测试夹具遗漏 TokenBudgetInput/React hooks，并按当前占用圆环实际聚焦行为验证，没有改动 C5 展示组件。新测试树的空格归一化断言也已修正。
+- `cargo clippy --offline --all-targets -- -D warnings`（Rust 库）、前端 TypeScript 和 `vite build` 资源构建通过；没有生成安装包。修改文件 rustfmt/diff 检查通过。桌面默认严格 Clippy 命中 HEAD 原有 `src-tauri/src/chat_history.rs` unnecessary_sort_by 和 `src-tauri/src/backend_process.rs` 测试夹具 zombie_processes 两项；未改动这些无关文件，已通过 `git show HEAD` 确认属于原有代码，未修改无关文件；`cargo clippy --offline --manifest-path src-tauri/Cargo.toml --lib --tests -- -D warnings -A clippy::unnecessary_sort_by -A clippy::zombie_processes` 通过。此结果不冒充未豁免的桌面严格检查通过。
+
+#### 前台验证入口与边界
+
+在当前源码启动的开发版中：模型设置 → 高级参数 → 开启「函数工具能力」（供应商须支持 Chat Completions function tools）；选择项目/服务器聊天并连接对应服务器 →「启用 SSH 工具」→ 发送任务 →「审批与记录」核对命令并批准/拒绝 → 查看结果和原始输出。工具 exec 不继承可见终端当前目录；停止生成不保证终止远端进程，unknown 必须先核查，不自动重发。
+
+- [ ] E6 仍待：真实模型、用户服务器、明暗主题/窄窗口/实际 WebView 完整验收。本轮没有截图证据。
+- 所有已跑协议测试使用临时 SQLite、回环 HTTP 模型和本地模拟 SSH，不调用真实 Key、用户服务器或 OS shell 来执行模拟命令。
+- 本轮未提交、未推送、未打包。下一项 E1；D5 的本地产品链路完成不代表附件、Responses 工具、本地 shell 或高级 Agent 已开放。
+
+
+### D5 试用反馈修复：批准后立即 unknown（2026-10-15，验证中）
+
+- 用户截图反馈：点击允许后立即失败，未显示工具输出。仅以只读方式核对本机相关执行回执和输出长度，没有读取凭据、连接或重跑用户服务器命令。
+- 已定位并复现：`src/terminal/agent_exec.rs` 将 SSH 的 WindowAdjusted / XonXoff 正常控制帧落入未知错误分支，提早关闭独立 exec，后续 stdout/stderr 和退出码未读到。`tests/support/mod.rs` 在 __exec_chunked__ 响应前发送真实 XON/XOFF 控制帧；新增 `tests/agent_ssh_tools.rs::informational_ssh_flow_control_before_exec_reply_keeps_result_and_terminal_alive` 在修复前约 0.1 秒稳定失败为 OutcomeUnknown。
+- [x] 修复代码：接收循环容忍窗口调整与流控，继续读取输出和真实 ExitStatus；未放宽审批、目标核对、超时、缺少退出码或断线仍 unknown 的规则。
+- [ ] 验证：提取同一生产接收循环用于 WindowAdjusted 前/中/后及非零退出码测试；本地 SSH / D4-D5 工具与 native IPC 审批回归正在运行。
+- 前端审批卡片补充「输出显示在对话中」；右侧 PTY 不回显独立 exec 是现有设计，不能用它推断执行成功。保留原有 D5 改动和用户自行生成的 icon.icns 变更；不提交、不打包。

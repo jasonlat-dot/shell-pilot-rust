@@ -60,7 +60,9 @@ impl Source {
                 Value::Null
             }
             Some(scope) => {
-                if target.is_some() {
+                if target.is_some()
+                    && target != &session.task.as_ref().and_then(|t| t.target.clone())
+                {
                     return Err(Error::TargetMismatch);
                 }
                 let expected = scope.identity.as_ref().ok_or(Error::Storage)?;

@@ -41,6 +41,7 @@ pub struct Turn {
     pub cursor: u64,
     pub created_at: i64,
     pub updated_at: i64,
+    pub tool_events: Vec<super::Event>,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -99,6 +100,7 @@ fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
             cursor: r.get("user_event_id")?,
             created_at: r.get("created_at")?,
             updated_at: r.get("updated_at")?,
+            tool_events: vec![],
         },
         input,
         owner: r.get("owner")?,
@@ -168,7 +170,13 @@ fn finish_row(
     )?;
     let mut state = state;
     let mut code = code;
-    if s.revision != old.revision
+    let tool_failure = state != TurnState::Completed
+        && storage(db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_tool_turns WHERE session_id=?1 AND request_id=?2)",
+            params![session, old.turn.request_id],
+            |r| r.get::<_, bool>(0),
+        ))?;
+    if (s.revision != old.revision && !tool_failure)
         || s.task.as_ref().map(|t| t.id.as_str()) != old.task_id.as_deref()
     {
         state = TurnState::Interrupted;
@@ -253,6 +261,40 @@ fn recover(db: &Connection, session: &str) -> Result<()> {
     drop(statement);
     for old in rows {
         let partial = old.turn.partial_text.clone();
+        let tools: bool = storage(db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_tool_turns WHERE session_id=?1 AND request_id=?2)",
+            params![session, old.turn.request_id],
+            |r| r.get(0),
+        ))?;
+        if tools {
+            let mut q=storage(db.prepare("SELECT c.call_id,c.task_id FROM agent_events c WHERE c.session_id=?1 AND c.kind='tool_call' AND c.id>?2 AND NOT EXISTS(SELECT 1 FROM agent_events r WHERE r.session_id=c.session_id AND r.call_id=c.call_id AND r.kind='tool_result') ORDER BY c.id"))?;
+            let pending = storage(q.query_map(params![session, old.turn.cursor], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            }))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| Error::Storage)?;
+            drop(q);
+            for (call, task) in pending {
+                insert_event(
+                    db,
+                    session,
+                    task.as_deref(),
+                    &uuid::Uuid::new_v4().to_string(),
+                    &Payload::ToolResult {
+                        call_id: call,
+                        outcome: super::Outcome::Unknown,
+                        exit_code: None,
+                        text: "{\"ok\":false,\"error\":\"result_unknown\"}".into(),
+                        outputs: vec![],
+                    },
+                )?;
+                storage(db.execute(
+                    "UPDATE agent_sessions SET revision=revision+1 WHERE id=?1",
+                    [session],
+                ))?;
+            }
+            storage(db.execute("UPDATE agent_execution_requests SET state=CASE WHEN state='admitted' THEN 'unknown' ELSE 'cancelled' END,updated_at=?3 WHERE session_id=?1 AND call_id IN (SELECT call_id FROM agent_events WHERE session_id=?1 AND id>?2 AND kind='tool_call') AND state IN ('pending','approved','admitted')",params![session,old.turn.cursor,now()]))?;
+        }
         finish_row(
             db,
             session,
@@ -304,6 +346,25 @@ impl Turns {
         owner: &str,
         expected: u64,
     ) -> Result<(Turn, bool)> {
+        self.begin_kind(request, target, owner, expected, false)
+    }
+    pub fn begin_tools(
+        &self,
+        request: &Request,
+        target: Target,
+        owner: &str,
+        expected: u64,
+    ) -> Result<(Turn, bool)> {
+        self.begin_kind(request, Some(target), owner, expected, true)
+    }
+    fn begin_kind(
+        &self,
+        request: &Request,
+        target: Option<Target>,
+        owner: &str,
+        expected: u64,
+        tools: bool,
+    ) -> Result<(Turn, bool)> {
         self.db(|db| {
             let tx=storage(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
             let mut s=read_session(&tx,&request.session_id,&request.user_id)?;verify(&s,&request.agent_id)?;
@@ -330,6 +391,7 @@ impl Turns {
             let json=serde_json::to_string(&input(request,target)).map_err(|_|Error::Storage)?;
             storage(tx.execute("INSERT INTO agent_chat_turns(session_id,request_id,input_json,owner,state,user_event_id,revision,task_id,lease_until,created_at,updated_at) VALUES(?1,?2,?3,?4,'running',?5,?6,?7,?8,?9,?9)",
                 params![s.id,request.request_id,json,owner,event.id,s.revision,s.task.as_ref().map(|t|&t.id),now()+LEASE_MS,now()]))?;
+            if tools {storage(tx.execute("INSERT INTO agent_tool_turns(session_id,request_id) VALUES(?1,?2)",params![s.id,request.request_id]))?;}
             let turn=row(&tx,&s.id,&request.request_id)?.ok_or(Error::Storage)?.turn;
             storage(tx.commit())?;Ok((turn,true))
         })
@@ -395,6 +457,26 @@ impl Turns {
             Ok(turn)
         })
     }
+    pub fn finish_tools(
+        &self,
+        request: &Request,
+        owner: &str,
+        state: TurnState,
+        text: &str,
+        code: Option<&str>,
+        expected: u64,
+    ) -> Result<Turn> {
+        self.db(|db| {
+            let tx=storage(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
+            verify(&read_session(&tx,&request.session_id,&request.user_id)?,&request.agent_id)?;
+            let mut old=row(&tx,&request.session_id,&request.request_id)?.ok_or(Error::NotFound)?;
+            let is_tool:bool=storage(tx.query_row("SELECT EXISTS(SELECT 1 FROM agent_tool_turns WHERE session_id=?1 AND request_id=?2)",params![request.session_id,request.request_id],|r|r.get(0)))?;
+            if !is_tool {return Err(Error::Conflict);}
+            old.revision=expected;
+            let turn=finish_row(&tx,&request.session_id,old,Some(owner),Finalization{state,text,code,completion:None})?;
+            storage(tx.commit())?;Ok(turn)
+        })
+    }
     pub fn history(
         &self,
         agent: &str,
@@ -415,6 +497,12 @@ impl Turns {
             let mut turns=rows.map(|r|r.map(|r|r.turn)).collect::<std::result::Result<Vec<_>,_>>().map_err(|_|Error::Storage)?;
             let has_more=turns.len()>limit;turns.truncate(limit);
             let next_after=turns.last().map(|t|t.cursor).unwrap_or(after);drop(stmt);
+            for turn in &mut turns {
+                let end:Option<u64>=storage(tx.query_row("SELECT MIN(user_event_id) FROM agent_chat_turns WHERE session_id=?1 AND user_event_id>?2",params![session.id,turn.cursor],|r|r.get(0)))?;
+                let mut q=storage(tx.prepare("SELECT id,session_id,task_id,request_id,payload,created_at FROM agent_events WHERE session_id=?1 AND id>?2 AND (?3 IS NULL OR id<?3) ORDER BY id LIMIT 600"))?;
+                let rows=storage(q.query_map(params![session.id,turn.cursor,end],super::repository::read_event_row))?;
+                turn.tool_events=rows.map(|r|super::repository::decode_event(r.map_err(|_|Error::Storage)?).map_err(Error::from)).collect::<Result<Vec<_>>>()?.into_iter().filter(|e|matches!(e.payload,Payload::ToolCall{..}|Payload::ToolResult{..})).collect();
+            }
             storage(tx.commit())?;Ok(History {session,turns,has_more,next_after})
         })
     }
@@ -681,5 +769,75 @@ mod tests {
             turns.history("model", "other", &r.session_id, 0, 1),
             Err(Error::NotFound)
         ));
+    }
+}
+
+#[cfg(test)]
+mod tool_recovery_tests {
+    use super::*;
+    #[test]
+    fn expired_tool_turn_closes_pending_calls_as_unknown_without_reexecuting_or_deleting_evidence()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recover.sqlite");
+        let store = Arc::new(Store::open(&path).unwrap());
+        let repo = super::super::Repository::new(store.clone());
+        let s = repo.create_session("model", "default").unwrap();
+        let target = Target {
+            connection_id: "connection".into(),
+            terminal_session_id: "terminal".into(),
+        };
+        let request = Request {
+            request_id: "tool-turn".into(),
+            agent_id: "model".into(),
+            user_id: "default".into(),
+            session_id: s.id.clone(),
+            terminal_session_id: "terminal".into(),
+            message: "check logs".into(),
+            attachments: vec![],
+        };
+        Turns::new(store.clone())
+            .begin_tools(&request, target, "old-owner", 0)
+            .unwrap();
+        let s = repo.session(&s.id, "default").unwrap();
+        repo.append(
+            &s.id,
+            "default",
+            s.revision,
+            "call",
+            Payload::ToolCall {
+                call_id: "uncertain".into(),
+                tool_name: "ssh_execute".into(),
+                arguments: serde_json::json!({"command":"test"}),
+            },
+        )
+        .unwrap();
+        store
+            .database
+            .lock()
+            .unwrap()
+            .execute("UPDATE agent_chat_turns SET lease_until=0", [])
+            .unwrap();
+        drop(repo);
+        drop(store);
+        let reopened = Arc::new(Store::open(&path).unwrap());
+        let history = Turns::new(reopened.clone())
+            .history("model", "default", &s.id, 0, 20)
+            .unwrap();
+        assert_eq!(history.turns[0].state, TurnState::Interrupted);
+        assert_eq!(
+            history.turns[0].error_code.as_deref(),
+            Some("AGENT_INTERRUPTED")
+        );
+        assert_eq!(history.turns[0].tool_events.len(), 2);
+        let snapshot = super::super::Repository::new(reopened.clone())
+            .snapshot(&s.id, "default")
+            .unwrap();
+        assert!(snapshot.pending_tool_call_ids.is_empty());
+        assert_eq!(snapshot.uncertain_tool_call_ids, ["uncertain"]);
+        let again = Turns::new(reopened)
+            .history("model", "default", &s.id, 0, 20)
+            .unwrap();
+        assert_eq!(again.turns[0].tool_events.len(), 2);
     }
 }
