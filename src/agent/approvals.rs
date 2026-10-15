@@ -1,6 +1,7 @@
 //! Native-only approval, exact task-command grants and at-most-once dispatch admission.
 //! There is no remote exactly-once guarantee: an admitted request without a durable
 //! result is uncertain and can never be reclaimed for automatic execution.
+pub(crate) mod reviewer;
 use super::{
     repository::read_session,
     ssh_tools::{Command, CommandResult, Profile, SshBinding},
@@ -50,6 +51,26 @@ impl From<serde_json::Error> for Error {
 pub enum Policy {
     Deny,
     Confirm,
+    Auto,
+    FullAccess,
+}
+impl Policy {
+    fn text(self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::Confirm => "confirm",
+            Self::Auto => "auto",
+            Self::FullAccess => "fullAccess",
+        }
+    }
+    fn from_text(mode: &str) -> Self {
+        match mode {
+            "deny" => Self::Deny,
+            "auto" => Self::Auto,
+            "fullAccess" => Self::FullAccess,
+            _ => Self::Confirm,
+        }
+    }
 }
 #[derive(Clone, Copy)]
 pub enum Decision {
@@ -87,6 +108,8 @@ pub(crate) struct Context {
     pub task: Task,
     pub scope: Option<Scope>,
     pub profile: Profile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_input_revision: Option<u64>,
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Input {
@@ -113,6 +136,15 @@ pub struct Receipt {
     pub created_at: i64,
     pub expires_at: i64,
     pub grant: Option<Grant>,
+    pub review: Option<Review>,
+}
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Review {
+    pub mode: Policy,
+    pub decision: String,
+    pub risk: String,
+    pub reason: String,
 }
 struct Row {
     id: String,
@@ -123,6 +155,7 @@ struct Row {
     created: i64,
     expires: i64,
     grant: Option<Grant>,
+    review: Option<Review>,
 }
 impl Row {
     fn receipt(self) -> Receipt {
@@ -137,6 +170,7 @@ impl Row {
             created_at: self.created,
             expires_at: self.expires,
             grant: self.grant,
+            review: self.review,
         }
     }
 }
@@ -154,7 +188,13 @@ fn row(db: &Database, id: &str, user: &str) -> Result<Row> {
             },
         )
         .optional()?;
+    let review = db.query_row(
+        "SELECT mode,decision,risk,reason FROM agent_execution_policy_reviews WHERE request_id=?1",
+        [id],
+        |r| Ok(Review { mode: Policy::from_text(&r.get::<_, String>(0)?), decision:r.get(1)?, risk:r.get(2)?, reason:r.get(3)? }),
+    ).optional()?;
     Ok(Row {
+        review,
         grant,
         id: raw.0,
         call: raw.1,
@@ -201,11 +241,10 @@ fn policy(db: &Database, c: &Context) -> Result<Policy> {
             |r| r.get::<_, String>(0),
         )
         .optional()?;
-    Ok(if mode.as_deref() == Some("deny") {
-        Policy::Deny
-    } else {
-        Policy::Confirm
-    })
+    Ok(mode
+        .as_deref()
+        .map(Policy::from_text)
+        .unwrap_or(Policy::Confirm))
 }
 #[derive(Clone)]
 pub struct Approvals {
@@ -251,14 +290,34 @@ impl Approvals {
         user: String,
         task: String,
     ) -> Result<(Policy, u64)> {
+        self.read_policy(session, user, task, true).await
+    }
+    /// Configuration remains readable after a failed/stopped turn. This does
+    /// not authorize execution; policy() and admission still require an active task.
+    pub(crate) async fn policy_view(
+        &self,
+        session: String,
+        user: String,
+        task: String,
+    ) -> Result<(Policy, u64)> {
+        self.read_policy(session, user, task, false).await
+    }
+    async fn read_policy(
+        &self,
+        session: String,
+        user: String,
+        task: String,
+        require_active: bool,
+    ) -> Result<(Policy, u64)> {
         self.db(move|db|{
             let s=read_session(db,&session,&user).map_err(|_|Error::NotFound)?;
-            if !s.task.as_ref().is_some_and(|t|t.id==task&&t.status==TaskStatus::Active){return Err(Error::Stale);}
+            if !s.task.as_ref().is_some_and(|t|t.id==task&&(!require_active||t.status==TaskStatus::Active)){return Err(Error::Stale);}
             let row=db.query_row("SELECT task_id,mode,revision FROM agent_execution_policies WHERE session_id=?1",[session],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u64>(2)?))).optional()?;
-            Ok(match row{Some((id,mode,rev))=>(if id==task&&mode=="deny"{Policy::Deny}else{Policy::Confirm},rev),None=>(Policy::Confirm,0)})
+            Ok(match row{Some((id,mode,rev))=>(if id==task{Policy::from_text(&mode)}else{Policy::Confirm},rev),None=>(Policy::Confirm,0)})
         }).await
     }
-    /// Native host only, with optimistic revision. There is deliberately no "allow all" mode.
+    /// Task-wide tool policy, shared by native tool authorization adapters.
+    /// Human-facing native host only; it never changes a tool's pinned target.
     pub async fn set_policy(
         &self,
         session: String,
@@ -270,13 +329,21 @@ impl Approvals {
         let result=self.db(move|db|{
    let tx=db.transaction()?;
    let s=read_session(&tx,&session,&user).map_err(|_|Error::NotFound)?;
-   if !s.task.as_ref().is_some_and(|t|t.id==task&&t.status==TaskStatus::Active&&t.target.is_some()){return Err(Error::Stale);}
+   let active=s.task.as_ref().filter(|t|t.id==task).ok_or(Error::Stale)?.status==TaskStatus::Active;
    let rev:u64=tx.query_row("SELECT revision FROM agent_execution_policies WHERE session_id=?1",[&session],|r|r.get(0)).optional()?.unwrap_or(0);
    if rev!=expected{return Err(Error::Conflict);}let next=rev.checked_add(1).ok_or(Error::Invalid)?;
    tx.execute("INSERT INTO agent_execution_policies(session_id,task_id,mode,revision) VALUES(?1,?2,?3,?4) ON CONFLICT(session_id) DO UPDATE SET task_id=excluded.task_id,mode=excluded.mode,revision=excluded.revision",
-    params![session,task,if mode==Policy::Deny{"deny"}else{"confirm"},next])?;
-   // Every explicit policy change invalidates remembered grants; deny also cancels pending permits.
+    params![session,task,mode.text(),next])?;
+   // Pending work adopts the new policy. Admitted commands are never interrupted.
+   // Return unconsumed automatic/grant approvals to pending before retiring their
+   // provenance; an explicit one-call human approval remains valid unless denied.
+   tx.execute("UPDATE agent_execution_requests SET state='pending',grant_id=NULL,updated_at=?2 WHERE session_id=?1 AND state='approved' AND (grant_id IS NOT NULL OR id IN (SELECT request_id FROM agent_execution_policy_reviews WHERE decision='allow'))",params![session,now()])?;
    tx.execute("UPDATE agent_execution_grants SET revoked=1 WHERE session_id=?1",[&session])?;
+   tx.execute("DELETE FROM agent_execution_policy_reviews WHERE request_id IN (SELECT id FROM agent_execution_requests WHERE session_id=?1 AND state='pending')",[&session])?;
+   if mode==Policy::FullAccess&&active {
+    tx.execute("INSERT INTO agent_execution_policy_reviews(request_id,mode,revision,decision,risk,reason) SELECT id,'fullAccess',?3,'allow','notReviewed','当前任务已由用户选择完全访问权限' FROM agent_execution_requests WHERE session_id=?1 AND task_id=?2 AND state='pending' AND expires_at>?4",params![session,task,next,now()])?;
+    tx.execute("UPDATE agent_execution_requests SET state='approved',updated_at=?3 WHERE session_id=?1 AND task_id=?2 AND state='pending' AND expires_at>?3",params![session,task,now()])?;
+   }
    if mode==Policy::Deny{tx.execute("UPDATE agent_execution_requests SET state='denied',updated_at=?2 WHERE session_id=?1 AND state IN ('pending','approved')",params![session,now()])?;}
    tx.commit()?;Ok(next)
   }).await;
@@ -295,7 +362,7 @@ impl Approvals {
    if let Decision::ApproveTaskCommand{seconds}=decision{
     if !(1..=3600).contains(&seconds){return Err(Error::Invalid);}
     tx.execute("INSERT INTO agent_execution_grants(request_id,session_id,task_id,context_json,command_json,expires_at) VALUES(?1,?2,?3,?4,?5,?6)",
-     params![id,old.input.context.binding.session_id,old.input.context.task.id,serde_json::to_string(&old.input.context)?,serde_json::to_string(&old.input.command)?,now()+i64::from(seconds)*1000])?;
+     params![id,old.input.context.binding.session_id,old.input.context.task.id,serde_json::to_string(&old.input.context)?,serde_json::to_string(&old.input.command.approval_key())?,now()+i64::from(seconds)*1000])?;
    }
    tx.execute("UPDATE agent_execution_requests SET state=?2,updated_at=?3 WHERE id=?1 AND state='pending'",params![id,state,now()])?;
    tx.commit()?;Ok(())
@@ -368,12 +435,18 @@ impl Approvals {
    let uncertain:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM agent_execution_requests WHERE session_id=?1 AND task_id=?2 AND json_extract(request_json,'$.command.command')=?3 AND state IN ('admitted','unknown'))",
     params![input.context.binding.session_id,input.context.task.id,input.command.command],|r|r.get(0))?;
    if uncertain{return Err(Error::Unknown);}
-   let denied=policy(&tx,&input.context)?==Policy::Deny;
+   let mode=policy(&tx,&input.context)?;
+   let denied=mode==Policy::Deny;
+   let full_access=allow_grants&&mode==Policy::FullAccess;
    let grant:Option<String>=if denied||!allow_grants{None}else{tx.query_row("SELECT request_id FROM agent_execution_grants WHERE session_id=?1 AND task_id=?2 AND context_json=?3 AND command_json=?4 AND revoked=0 AND expires_at>?5 ORDER BY rowid DESC LIMIT 1",
-    params![input.context.binding.session_id,input.context.task.id,serde_json::to_string(&input.context)?,serde_json::to_string(&input.command)?,now()],|r|r.get(0)).optional()?};
-   let id=uuid::Uuid::new_v4().to_string();let state=if denied{"denied"}else if grant.is_some(){"approved"}else{"pending"};
+    params![input.context.binding.session_id,input.context.task.id,serde_json::to_string(&input.context)?,serde_json::to_string(&input.command.approval_key())?,now()],|r|r.get(0)).optional()?};
+   let id=uuid::Uuid::new_v4().to_string();let state=if denied{"denied"}else if full_access||grant.is_some(){"approved"}else{"pending"};
    tx.execute("INSERT INTO agent_execution_requests(id,session_id,user_id,task_id,call_id,request_json,state,created_at,expires_at,updated_at,grant_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?8,?10)",
     params![id,input.context.binding.session_id,input.context.binding.user_id,input.context.task.id,call,serde_json::to_string(&input)?,state,now(),now()+lifetime,grant])?;
+   if full_access {
+    let revision:u64=tx.query_row("SELECT revision FROM agent_execution_policies WHERE session_id=?1 AND task_id=?2",params![input.context.binding.session_id,input.context.task.id],|r|r.get(0))?;
+    tx.execute("INSERT INTO agent_execution_policy_reviews(request_id,mode,revision,decision,risk,reason) VALUES(?1,'fullAccess',?2,'allow','notReviewed','当前任务已由用户选择完全访问权限')",params![id,revision])?;
+   }
    tx.commit()?;
    if denied{return Err(Error::Denied);}
    Ok(Start::New(Ticket{store,id,user:input.context.binding.user_id,armed:true}))
@@ -389,6 +462,9 @@ impl Approvals {
                 current(db, &r.input.context)
             })
             .await?;
+            // A policy change can move an outstanding request into auto review.
+            // The reviewer itself retires stale decisions when the mode changes.
+            self.review_pending(ticket, cancel).await?;
             let receipt = self.receipt(ticket.id.clone(), ticket.user.clone()).await?;
             match receipt.state {
                 State::Approved => return Ok(()),
@@ -450,11 +526,19 @@ impl Approvals {
    let binding=&old.input.context.binding;
    let desktop:Option<(String,bool,i64)>=tx.query_row("SELECT t.state,t.cancel_requested,t.lease_until FROM agent_chat_turns t JOIN agent_tool_turns k USING(session_id,request_id) WHERE t.session_id=?1 AND t.user_event_id<(SELECT id FROM agent_events WHERE session_id=?1 AND call_id=?2 AND kind='tool_call') ORDER BY t.user_event_id DESC LIMIT 1",params![binding.session_id,old.call],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
    if desktop.is_some_and(|(state,cancel,lease)|state!="running"||cancel||lease<now()){return Err(Error::Denied);}
+   let steering_pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM agent_turn_inputs i JOIN agent_chat_turns t USING(session_id,request_id) WHERE i.session_id=?1 AND i.event_id IS NULL AND t.state='running')",[&binding.session_id],|r|r.get(0))?;
+   if steering_pending{return Err(Error::Denied);}
    if old.state!=State::Approved{return Err(Error::Denied);}
    if old.expires<=now(){return Err(Error::Expired);}
    current(&tx,&old.input.context)?;
    if policy(&tx,&old.input.context)?==Policy::Deny{return Err(Error::Denied);}
    let source:Option<String>=tx.query_row("SELECT grant_id FROM agent_execution_requests WHERE id=?1",[&id],|r|r.get(0))?;
+   let automatic:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM agent_execution_policy_reviews WHERE request_id=?1 AND decision='allow')",[&id],|r|r.get(0))?;
+   if automatic {
+    let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM agent_execution_policy_reviews r JOIN agent_execution_policies p ON p.session_id=?2 AND p.task_id=?3 AND p.mode=r.mode AND p.revision=r.revision WHERE r.request_id=?1 AND r.decision='allow')",
+     params![id,binding.session_id,old.input.context.task.id],|r|r.get(0))?;
+    if !valid{return Err(Error::Denied);}
+   }
    if let Some(source)=source{
     let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM agent_execution_grants WHERE request_id=?1 AND revoked=0 AND expires_at>?2)",params![source,now()],|r|r.get(0))?;
     if !valid{return Err(Error::Denied);}
@@ -567,10 +651,12 @@ mod tests {
                 task,
                 scope: None,
                 profile: Profile::from(connection),
+                terminal_input_revision: None,
             },
             command: Command {
                 command: "unchanged command".into(),
                 timeout_seconds: 2,
+                explanation: None,
             },
         };
         (store, input)
@@ -580,6 +666,177 @@ mod tests {
             Start::New(ticket) => ticket,
             _ => panic!("new approval expected"),
         }
+    }
+    async fn mode(service: &Approvals, input: &Input, revision: u64, policy: Policy) -> u64 {
+        service
+            .set_policy(
+                input.context.binding.session_id.clone(),
+                input.context.binding.user_id.clone(),
+                input.context.task.id.clone(),
+                revision,
+                policy,
+            )
+            .await
+            .unwrap()
+    }
+    fn verdict(decision: &str, risk: &str) -> Review {
+        Review {
+            mode: Policy::Auto,
+            decision: decision.into(),
+            risk: risk.into(),
+            reason: "test review".into(),
+        }
+    }
+    #[tokio::test]
+    async fn full_access_is_durable_scoped_and_revoked_before_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("modes.sqlite");
+        let (store, input) = setup(&path);
+        let service = Approvals::new(store.clone());
+        let revision = mode(&service, &input, 0, Policy::FullAccess).await;
+        let t = ticket(&service, input.clone(), "full").await;
+        assert!(service.is_approved(&t).await.unwrap());
+        assert_eq!(
+            service
+                .receipt(t.id.clone(), t.user.clone())
+                .await
+                .unwrap()
+                .review
+                .unwrap()
+                .mode
+                .text(),
+            "fullAccess"
+        );
+        let reopened = Approvals::new(Arc::new(Store::open(&path).unwrap()));
+        assert_eq!(
+            reopened
+                .policy(
+                    input.context.binding.session_id.clone(),
+                    t.user.clone(),
+                    input.context.task.id.clone()
+                )
+                .await
+                .unwrap()
+                .0
+                .text(),
+            "fullAccess"
+        );
+        assert!(service
+            .set_policy(
+                input.context.binding.session_id.clone(),
+                t.user.clone(),
+                input.context.task.id.clone(),
+                0,
+                Policy::Confirm
+            )
+            .await
+            .is_err());
+        mode(&service, &input, revision, Policy::Confirm).await;
+        assert!(service.admit(&t, || true).await.is_err());
+        let next = ticket(&service, input, "manual").await;
+        assert!(!service.is_approved(&next).await.unwrap());
+    }
+    #[tokio::test]
+    async fn auto_review_only_low_risk_passes_and_policy_changes_retire_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, input) = setup(&dir.path().join("review.sqlite"));
+        let service = Approvals::new(store.clone());
+        let revision = mode(&service, &input, 0, Policy::Auto).await;
+        let session_revision = Repository::new(store)
+            .session(
+                &input.context.binding.session_id,
+                &input.context.binding.user_id,
+            )
+            .unwrap()
+            .revision;
+        let low = ticket(&service, input.clone(), "low").await;
+        assert!(!service.is_approved(&low).await.unwrap());
+        service
+            .commit_review(&low, revision, session_revision, verdict("allow", "low"))
+            .await
+            .unwrap();
+        assert!(service.is_approved(&low).await.unwrap());
+        let risky = ticket(&service, input.clone(), "risk").await;
+        service
+            .commit_review(&risky, revision, session_revision, verdict("ask", "high"))
+            .await
+            .unwrap();
+        assert!(!service.is_approved(&risky).await.unwrap());
+        let late = ticket(&service, input.clone(), "late").await;
+        mode(&service, &input, revision, Policy::Confirm).await;
+        assert!(service
+            .commit_review(&late, revision, session_revision, verdict("allow", "low"))
+            .await
+            .is_err());
+        assert!(service.admit(&low, || true).await.is_err());
+        // A human can still approve the previously flagged exact command.
+        service
+            .decide(risky.id.clone(), risky.user.clone(), Decision::ApproveOnce)
+            .await
+            .unwrap();
+        service.admit(&risky, || true).await.unwrap();
+    }
+    #[tokio::test]
+    async fn missing_review_model_falls_back_to_human_and_never_autoapproves() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, input) = setup(&dir.path().join("fallback.sqlite"));
+        let service = Approvals::new(store);
+        mode(&service, &input, 0, Policy::Auto).await;
+        let t = ticket(&service, input, "fallback").await;
+        service
+            .review_pending(&t, &CancellationToken::new())
+            .await
+            .unwrap();
+        let receipt = service.receipt(t.id.clone(), t.user.clone()).await.unwrap();
+        assert_eq!(receipt.state, State::Pending);
+        assert_eq!(receipt.review.unwrap().decision, "ask");
+        assert!(service.admit(&t, || true).await.is_err());
+    }
+    #[tokio::test]
+    async fn isolated_reviewer_roundtrip_has_no_tools_and_persists_low_and_high_risk_results() {
+        use axum::{extract::State as HttpState, routing::post, Json, Router};
+        use crate::agent::provider::{ModelConfig, ModelConfigUpdate, ModelRepository, KeyChange};
+        use serde_json::{json, Value};
+        let requests=Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        async fn review(HttpState(requests):HttpState<Arc<std::sync::Mutex<Vec<Value>>>>,Json(request):Json<Value>)->Json<Value>{
+            let evidence:Value=serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+            let low=evidence["command"]["command"]=="whoami";
+            requests.lock().unwrap().push(request);
+            Json(json!({"id":"review","model":"reviewer-test","choices":[{"index":0,"message":{"role":"assistant","content":json!({"decision":if low{"allow"}else{"ask"},"risk":if low{"low"}else{"high"},"reason":if low{"只读查询"}else{"删除数据需要确认"}}).to_string()},"finish_reason":"stop"}]}))
+        }
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address=listener.local_addr().unwrap();
+        let router=Router::new().route("/v1/chat/completions",post(review)).with_state(requests.clone());
+        let server=tokio::spawn(async move { axum::serve(listener,router).await.unwrap(); });
+        let dir=tempfile::tempdir().unwrap();
+        let (store,mut input)=setup(&dir.path().join("roundtrip.sqlite"));
+        let config:ModelConfig=serde_json::from_value(json!({
+            "provider":"openAiCompatible","baseUrl":format!("http://{address}/v1/"),"completionsPath":"chat/completions","model":"reviewer-test",
+            "contextWindow":8192,"outputReserve":512,"safetyReserve":256,"compactPercent":75,
+            "outputTokenParameter":"maxTokens","capabilities":{"toolCalls":false,"developerRole":false,"temperature":false,"reasoningEffort":false,"vision":false},
+            "temperature":null,"reasoningEffort":null,"timeoutSeconds":3,"maxResponseBytes":16384,"requireApiKey":false
+        })).unwrap();
+        ModelRepository::new(store.clone()).save("model","default",0,ModelConfigUpdate{config,api_key:KeyChange::Keep}).unwrap();
+        let service=Approvals::new(store);
+        mode(&service,&input,0,Policy::Auto).await;
+        input.command.command="whoami".into();
+        let low=ticket(&service,input.clone(),"review-low").await;
+        service.review_pending(&low,&CancellationToken::new()).await.unwrap();
+        assert!(service.is_approved(&low).await.unwrap());
+        input.command.command="rm -rf /server-data".into();
+        let high=ticket(&service,input,"review-high").await;
+        service.review_pending(&high,&CancellationToken::new()).await.unwrap();
+        assert!(!service.is_approved(&high).await.unwrap());
+        service.review_pending(&high,&CancellationToken::new()).await.unwrap();
+        let recorded=requests.lock().unwrap();
+        assert_eq!(recorded.len(),2);
+        for request in recorded.iter() {
+            assert!(request.get("tools").is_none() || request["tools"].as_array().is_some_and(|tools|tools.is_empty()));
+            assert_eq!(request["messages"].as_array().unwrap().len(),2);
+            assert!(request["messages"][0]["content"].as_str().unwrap().contains("independent SSH command approval reviewer"));
+        }
+        drop(recorded);
+        server.abort();
     }
     #[tokio::test]
     async fn durable_admission_without_result_is_never_reclaimed_after_restart_even_with_new_call_id(
@@ -797,7 +1054,7 @@ mod tests {
                 .db(|db| Ok(db.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))?))
                 .await
                 .unwrap(),
-            13
+            15
         );
     }
 }

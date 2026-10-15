@@ -50,6 +50,8 @@ impl Store {
             "../migrations/012_agent_execution_approvals.sql"
         ))?;
         database.execute_batch(include_str!("../migrations/013_agent_tool_turns.sql"))?;
+        database.execute_batch(include_str!("../migrations/014_agent_steering.sql"))?;
+        database.execute_batch(include_str!("../migrations/015_agent_approval_modes.sql"))?;
         Ok(Self {
             database: Mutex::new(database),
             data_directory: None,

@@ -136,7 +136,8 @@ impl Bound {
 fn command(text: &str) -> Command {
     Command {
         command: text.into(),
-        timeout_seconds: 2,
+        timeout_seconds: 30,
+        explanation: None,
     }
 }
 fn run(
@@ -326,7 +327,8 @@ async fn task_grant_is_exact_including_timeout_not_prefix_or_different_target_an
             "changed-timeout",
             Command {
                 command: "__exec_unicode__".into(),
-                timeout_seconds: 3,
+                timeout_seconds: 31,
+                explanation: None,
             },
         ),
         ("compound", command("__exec_unicode__; unexpected")),
@@ -578,7 +580,8 @@ async fn unknown_after_send_cancellation_or_drop_blocks_new_ids_and_survives_reo
                     "changed-call",
                     &Command {
                         command: "__exec_quiet__".into(),
-                        timeout_seconds: 5
+                        timeout_seconds: 5,
+                        explanation: None,
                     },
                     &CancellationToken::new()
                 )

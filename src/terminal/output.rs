@@ -113,6 +113,16 @@ impl Output {
                 }
             }
         }
+        self.trim(limit);
+        self.last_active = Instant::now();
+    }
+    /// Display-only text is already decoded; never mix it into the PTY's pending UTF-8 bytes.
+    pub fn append_display(&mut self, text: &str, limit: usize) {
+        self.text.push_str(text);
+        self.trim(limit);
+        self.last_active = Instant::now();
+    }
+    fn trim(&mut self, limit: usize) {
         if self.text.len() > limit {
             let mut cut = self.text.len() - limit;
             while !self.text.is_char_boundary(cut) {
@@ -121,7 +131,6 @@ impl Output {
             self.text.drain(..cut);
             self.overflow = true;
         }
-        self.last_active = Instant::now();
     }
 }
 
@@ -132,6 +141,14 @@ pub(super) struct Session {
     pub transport: std::sync::Weak<super::PooledTransport>,
     pub trust_profile: (bool, Option<String>),
     pub writer: Mutex<Option<std::sync::Arc<russh::ChannelWriteHalf<russh::client::Msg>>>>,
+    pub input_gate: std::sync::Arc<tokio::sync::Mutex<()>>,
+    pub input_revision: std::sync::atomic::AtomicU64,
+    pub input_dirty: std::sync::atomic::AtomicBool,
+    pub shell_uncertain: std::sync::atomic::AtomicBool,
+    pub shell_probe: Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>,
+    pub shell_display: Mutex<Option<super::shared_shell::ShellDisplay>>,
+    pub terminal_size: Mutex<(u32, u32)>,
+    pub size_changed: Notify,
     pub output: Mutex<Output>,
     pub changed: Notify,
     pub stop: CancellationToken,
@@ -192,5 +209,14 @@ mod tests {
         assert!(!DisconnectReason::ClientClosed.reconnect_allowed());
         assert!(!DisconnectReason::IdleTimeout.reconnect_allowed());
         assert!(!DisconnectReason::SessionNotFound.reconnect_allowed());
+    }
+    #[test]
+    fn display_mirror_does_not_corrupt_pending_pty_utf8() {
+        let mut output = Output::new();
+        let bytes = "你好".as_bytes();
+        output.append(&bytes[..2], 1024);
+        output.append_display("AI 结果\r\n", 1024);
+        output.append(&bytes[2..], 1024);
+        assert_eq!(output.text, "AI 结果\r\n你好");
     }
 }

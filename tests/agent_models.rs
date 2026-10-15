@@ -198,10 +198,10 @@ fn incomplete_duplicate_or_unknown_tool_history_is_rejected() {
         Err(ModelError::ToolProtocol)
     ));
     c.capabilities.tool_calls = false;
-    assert!(matches!(
-        prepare_request(&c, &r),
-        Err(ModelError::Invalid(_))
-    ));
+    r.messages.pop();
+    // Legacy opt-out values no longer disable product tool support.
+    assert!(c.clone().normalized().unwrap().capabilities.tool_calls);
+    assert!(prepare_request(&c, &r).is_ok());
 }
 #[test]
 fn oversized_context_is_not_silently_truncated() {
@@ -339,7 +339,7 @@ fn schema_upgrade_preserves_existing_agent_sessions() {
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        13
+        15
     );
     assert_eq!(
         db.query_row("SELECT count(*) FROM agent_sessions", [], |r| r
@@ -534,19 +534,21 @@ fn copying_or_corrupting_key_ciphertext_does_not_reassign_credentials() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("keys.sqlite");
     let repo = ModelRepository::new(Arc::new(Store::open(&path).unwrap()));
+    let mut c = config();
+    c.require_api_key = true;
     repo.save(
         "a",
         "alice",
         0,
         update(
-            config(),
+            c.clone(),
             KeyChange::Set {
                 value: SecretKey::new(TEST_KEY).unwrap(),
             },
         ),
     )
     .unwrap();
-    repo.save("b", "alice", 0, update(config(), KeyChange::Keep))
+    repo.save("b", "alice", 0, update(c, KeyChange::Keep))
         .unwrap();
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute("UPDATE agent_model_profiles SET api_key=(SELECT api_key FROM agent_model_profiles WHERE id='a') WHERE id='b'",[]).unwrap();
@@ -741,6 +743,73 @@ async fn native_credentials_are_sent_as_bearer_header_only() {
     let requests = mock.state.requests.lock().unwrap();
     assert_eq!(requests[0].1["authorization"], format!("Bearer {TEST_KEY}"));
     assert!(!requests[0].2.to_string().contains(TEST_KEY));
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn saved_credentials_obey_auth_toggle_and_replacement_after_restart() {
+    let mock = MockModel::start(reply().to_string(), StatusCode::OK, Duration::ZERO, None).await;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("auth-toggle.sqlite");
+    let mut c = config();
+    c.base_url = mock.base.clone();
+    c.require_api_key = true;
+    let repo = ModelRepository::new(Arc::new(Store::open(&path).unwrap()));
+    repo.save("model", "alice", 0, update(c.clone(), KeyChange::Set {
+        value: SecretKey::new(TEST_KEY).unwrap(),
+    })).unwrap();
+    ModelClient::new(repo.runtime("model", "alice").unwrap()).unwrap()
+        .complete(&request(), &CancellationToken::new()).await.unwrap();
+
+    // Blank input keeps the encrypted key, but disabling authentication must
+    // remove it from the actual HTTP request, not just hide it in the UI.
+    c.require_api_key = false;
+    let saved = repo.save("model", "alice", 1, update(c.clone(), KeyChange::Keep)).unwrap();
+    assert!(saved.api_key_configured && saved.ready);
+    ModelClient::new(repo.runtime("model", "alice").unwrap()).unwrap()
+        .complete(&request(), &CancellationToken::new()).await.unwrap();
+
+    // Re-enabling with blank input reuses the old key.
+    c.require_api_key = true;
+    repo.save("model", "alice", 2, update(c.clone(), KeyChange::Keep)).unwrap();
+    ModelClient::new(repo.runtime("model", "alice").unwrap()).unwrap()
+        .complete(&request(), &CancellationToken::new()).await.unwrap();
+
+    const REPLACEMENT: &str = "unit-test-replacement-key";
+    c.require_api_key = false;
+    repo.save("model", "alice", 3, update(c.clone(), KeyChange::Set {
+        value: SecretKey::new(REPLACEMENT).unwrap(),
+    })).unwrap();
+    ModelClient::new(repo.runtime("model", "alice").unwrap()).unwrap()
+        .complete(&request(), &CancellationToken::new()).await.unwrap();
+    drop(repo);
+
+    let repo = ModelRepository::new(Arc::new(Store::open(&path).unwrap()));
+    let saved = repo.get("model", "alice").unwrap();
+    assert!(saved.api_key_configured && saved.ready);
+    assert!(!saved.config.require_api_key);
+    let public = serde_json::to_string(&saved).unwrap();
+    assert!(!public.contains(TEST_KEY) && !public.contains(REPLACEMENT));
+    c.require_api_key = true;
+    repo.save("model", "alice", 4, update(c, KeyChange::Keep)).unwrap();
+    ModelClient::new(repo.runtime("model", "alice").unwrap()).unwrap()
+        .complete(&request(), &CancellationToken::new()).await.unwrap();
+
+    let requests = mock.state.requests.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    for (index, key) in [Some(TEST_KEY), None, Some(TEST_KEY), None, Some(REPLACEMENT)].into_iter().enumerate() {
+        let (uri, headers, body) = &requests[index];
+        match key {
+            Some(key) => assert_eq!(headers["authorization"], format!("Bearer {key}")),
+            None => {
+                assert!(headers.get("authorization").is_none());
+                assert!(!format!("{headers:?}").contains(TEST_KEY));
+                assert!(!format!("{headers:?}").contains(REPLACEMENT));
+            }
+        }
+        assert!(!uri.contains(TEST_KEY) && !uri.contains(REPLACEMENT));
+        assert!(!body.to_string().contains(TEST_KEY) && !body.to_string().contains(REPLACEMENT));
+    }
 }
 #[tokio::test]
 async fn model_function_calls_are_validated_without_executing_a_tool() {

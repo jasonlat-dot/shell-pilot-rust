@@ -9,7 +9,7 @@ use shellpilot_server::{
     terminal::{OpenRequest, TerminalManager, TerminalSettings},
 };
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -28,6 +28,8 @@ pub struct Stats {
     pub sizes: Mutex<Vec<(u32, u32)>>,
     pub rejected_channels: AtomicUsize,
     pub execs: Mutex<Vec<String>>,
+    pub inputs: Mutex<Vec<Vec<u8>>>,
+    pub collectors: AtomicUsize,
 }
 #[derive(Clone, Default)]
 pub struct Spec {
@@ -52,6 +54,8 @@ impl server::Server for TestServer {
             spec: self.spec.clone(),
             client_key: self.client_key.clone(),
             channels: HashSet::new(),
+            collectors: HashMap::new(),
+            shell_users: HashMap::new(),
         }
     }
 }
@@ -60,6 +64,8 @@ struct TestHandler {
     spec: Spec,
     client_key: PublicKey,
     channels: HashSet<ChannelId>,
+    collectors: HashMap<String, ChannelId>,
+    shell_users: HashMap<ChannelId, String>,
 }
 impl Drop for TestHandler {
     fn drop(&mut self) {
@@ -182,6 +188,19 @@ impl server::Handler for TestHandler {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         let command = String::from_utf8_lossy(data).into_owned();
+        if let Some(token) = command
+            .strip_prefix("# ShellPilot collector ")
+            .and_then(|s| s.lines().next())
+        {
+            self.stats.collectors.fetch_add(1, Ordering::SeqCst);
+            self.collectors.insert(token.into(), channel);
+            session.channel_success(channel)?;
+            session.data(
+                channel,
+                format!("SHELLPILOT_READY_{token} /tmp/shellpilot-tool.{token} /dev/pts/9999\n").into_bytes(),
+            )?;
+            return Ok(());
+        }
         self.stats.execs.lock().unwrap().push(command.clone());
         if command == "__exec_reject__" {
             session.channel_failure(channel)?;
@@ -227,6 +246,93 @@ impl server::Handler for TestHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        self.stats.inputs.lock().unwrap().push(data.to_vec());
+        let text = String::from_utf8_lossy(data);
+        if text == "sudo -i\r" || text == "sudo -i\n" {
+            self.shell_users.insert(channel, "root".into());
+        }
+        if let Some(tail) = text.strip_prefix("command printf '\\033]777;ShellPilot=") {
+            let token = tail.split(';').next().unwrap();
+            session.data(
+                channel,
+                format!("\x1b]777;ShellPilot={token};ready\x07").into_bytes(),
+            )?;
+            return Ok(());
+        }
+        if let Some(tail) = text.strip_prefix("# ShellPilot command ") {
+            let token = tail.lines().next().unwrap();
+            let collector = self.collectors.remove(token).unwrap();
+            let encoded = text
+                .split_once("command printf '%b' '")
+                .unwrap()
+                .1
+                .split_once("')\"")
+                .unwrap()
+                .0
+                .replace("'\\\n'", "");
+            let command = String::from_utf8(
+                encoded
+                    .as_bytes()
+                    .chunks(5)
+                    .map(|part| {
+                        u8::from_str_radix(std::str::from_utf8(&part[2..]).unwrap(), 8).unwrap()
+                    })
+                    .collect(),
+            )
+            .unwrap();
+            self.stats.execs.lock().unwrap().push(command.clone());
+            // Echo the private wire payload exactly as a PTY would. It must be hidden in the UI.
+            session.data(channel, data.to_vec())?;
+            session.data(
+                channel,
+                format!("\x1b]777;ShellPilot={token};begin\x07").into_bytes(),
+            )?;
+            // PTY noise must remain visible to the user but absent from every tool result.
+            session.data(channel, b"MANUAL_BACKGROUND_NOT_A_TOOL_RESULT\n".to_vec())?;
+            if command == "__exec_quiet__" {
+                return Ok(());
+            }
+            let stdout = match command.as_str() {
+                "whoami" => format!(
+                    "{}\n",
+                    self.shell_users
+                        .get(&channel)
+                        .map(String::as_str)
+                        .unwrap_or("tester")
+                )
+                .into_bytes(),
+                "__exec_chunked__" => (0..131073).map(|i| (i % 251) as u8).collect(),
+                "__exec_large__" => vec![b'x'; 4096],
+                _ => "执行完成\n".as_bytes().to_vec(),
+            };
+            session.data(collector, stdout)?;
+            session.extended_data(collector, 1, b"test stderr\n".to_vec())?;
+            if command != "__exec_no_status__" {
+                session.exit_status_request(
+                    collector,
+                    if command == "__exec_fail__" { 7 } else { 0 },
+                )?;
+            }
+            session.eof(collector)?;
+            if self.channels.remove(&collector) {
+                self.stats.channels.fetch_sub(1, Ordering::SeqCst);
+            }
+            session.close(collector)?;
+            let user = self
+                .shell_users
+                .get(&channel)
+                .map(String::as_str)
+                .unwrap_or("tester");
+            session.data(
+                channel,
+                format!(
+                    "\x1b]777;ShellPilot={token};done\x07{user}@fixture:~{} ",
+                    if user == "root" { "#" } else { "$" }
+                )
+                .into_bytes(),
+            )?;
+            return Ok(());
+        }
         match data {
             b"__disconnect__" => return Err(russh::Error::Disconnect),
             b"__channel_close__" => {

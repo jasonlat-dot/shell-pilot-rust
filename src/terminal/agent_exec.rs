@@ -3,14 +3,16 @@ use super::*;
 
 #[derive(Clone)]
 pub(crate) struct Lease {
-    session: Arc<Session>,
+    pub(super) session: Arc<Session>,
 }
 pub(crate) struct PreparedExec {
-    opening: OpeningChannel,
-    session: Arc<Session>,
+    pub(super) opening: OpeningChannel,
+    pub(super) session: Arc<Session>,
     _transport: Arc<PooledTransport>,
     _slot: tokio::sync::OwnedSemaphorePermit,
-    shutdown: CancellationToken,
+    pub(super) shutdown: CancellationToken,
+    pub(super) display_limit: usize,
+    shared: Option<super::shared_shell::PreparedShell>,
 }
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ExecError {
@@ -22,6 +24,12 @@ pub(crate) enum ExecError {
     Rejected,
     #[error("SSH execution outcome is unknown")]
     Unknown,
+    #[error(
+        "SSH command produced no output before the inactivity deadline; remote outcome is unknown"
+    )]
+    IdleTimeout,
+    #[error("共享终端尚未就绪，请先回到 Shell 提示符；上次结果未知时需核查并重连")]
+    ShellNotReady,
 }
 pub(crate) struct ExecResult {
     pub exit_code: u32,
@@ -30,6 +38,9 @@ pub(crate) struct ExecResult {
     pub truncated: bool,
 }
 impl Lease {
+    pub fn input_revision(&self) -> u64 {
+        self.session.input_revision.load(Ordering::SeqCst)
+    }
     pub fn matches_trust(&self, strict: bool, known_hosts: Option<&str>) -> bool {
         self.session.trust_profile.0 == strict
             && self.session.trust_profile.1.as_deref() == known_hosts
@@ -77,8 +88,14 @@ impl TerminalManager {
         &self,
         lease: &Lease,
         cancel: &CancellationToken,
+        shared: bool,
     ) -> Result<PreparedExec, ExecError> {
         self.check_agent_lease(lease)?;
+        let shared = if shared {
+            Some(super::shared_shell::PreparedShell::prepare(lease)?)
+        } else {
+            None
+        };
         let entry = lease
             .session
             .transport
@@ -116,6 +133,8 @@ impl TerminalManager {
             _transport: entry,
             _slot: slot,
             shutdown: self.shutdown.clone(),
+            display_limit: self.settings.buffer_bytes,
+            shared,
         })
     }
 }
@@ -127,39 +146,55 @@ impl PreparedExec {
         cancel: &CancellationToken,
         sink: Option<Arc<crate::agent::tool_output::Capture>>,
     ) -> Result<ExecResult, ExecError> {
+        if let Some(shared) = self.shared.take() {
+            return shared.run(self, command, timeout, cancel, sink).await;
+        }
         if cancel.is_cancelled() || self.session.stop.is_cancelled() || self.shutdown.is_cancelled()
         {
             return Err(ExecError::Unavailable);
         }
+        let mirror = TerminalMirror::new(self.session.clone(), self.display_limit);
         let operation = async {
             let channel = self.opening.0.as_mut().expect("owned exec channel");
-            channel
-                .exec(true, command.as_bytes())
-                .await
-                .map_err(|_| ExecError::Unknown)?;
-            // No stdin/PTY: this shell is independent of the interactive terminal's cwd/env.
-            channel.eof().await.map_err(|_| ExecError::Unknown)?;
+            // Bound dispatch separately; do not wrap the entire command in a total deadline.
+            tokio::time::timeout(timeout, async {
+                channel
+                    .exec(true, command.as_bytes())
+                    .await
+                    .map_err(|_| ExecError::Unknown)?;
+                // No stdin/PTY: this shell is independent of the interactive terminal's cwd/env.
+                channel.eof().await.map_err(|_| ExecError::Unknown)
+            })
+            .await
+            .map_err(|_| ExecError::Unknown)??;
+            mirror.start(command);
             receive_output(
                 futures_util::stream::unfold(channel, |channel| async move {
                     channel.wait().await.map(|message| (message, channel))
                 }),
                 sink.as_ref(),
+                Some(&mirror),
+                timeout,
             )
             .await
         };
-        tokio::select! {
+        let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(ExecError::Unknown),
             _ = self.session.stop.cancelled() => Err(ExecError::Unknown),
             _ = self.shutdown.cancelled() => Err(ExecError::Unknown),
-            result = tokio::time::timeout(timeout, operation) => result.unwrap_or(Err(ExecError::Unknown)),
-        }
+            result = operation => result,
+        };
+        mirror.finish(&result);
+        result
         // OpeningChannel drops on every path and closes only this exec channel.
     }
 }
-async fn receive_output(
+pub(super) async fn receive_output(
     messages: impl futures_util::Stream<Item = ChannelMsg>,
     sink: Option<&Arc<crate::agent::tool_output::Capture>>,
+    mirror: Option<&TerminalMirror>,
+    idle_timeout: Duration,
 ) -> Result<ExecResult, ExecError> {
     use futures_util::StreamExt;
     tokio::pin!(messages);
@@ -168,19 +203,40 @@ async fn receive_output(
     let mut truncated = false;
     let mut accepted = false;
     let mut exit_code = None;
+    let mut deadline = tokio::time::Instant::now() + idle_timeout;
     loop {
-        match messages.next().await {
+        // Only this command's nonempty stdout/stderr refresh the deadline.
+        // Flow-control, empty packets and terminal resize events do not count.
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ExecError::IdleTimeout);
+        }
+        let message = tokio::time::timeout_at(deadline, messages.next())
+            .await
+            .map_err(|_| ExecError::IdleTimeout)?;
+        match message {
             Some(ChannelMsg::Success) => accepted = true,
             Some(ChannelMsg::Failure) if !accepted && exit_code.is_none() => {
                 return Err(ExecError::Rejected)
             }
             Some(ChannelMsg::Data { data }) => {
+                if !data.is_empty() {
+                    deadline = tokio::time::Instant::now() + idle_timeout;
+                }
+                if let Some(mirror) = mirror {
+                    mirror.output(&data);
+                }
                 if let Some(sink) = &sink {
                     sink.write(false, data.to_vec()).await;
                 }
                 capture(&mut stdout, &stderr, &data, &mut truncated)
             }
             Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
+                if !data.is_empty() {
+                    deadline = tokio::time::Instant::now() + idle_timeout;
+                }
+                if let Some(mirror) = mirror {
+                    mirror.output(&data);
+                }
                 if let Some(sink) = &sink {
                     sink.write(true, data.to_vec()).await;
                 }
@@ -203,6 +259,115 @@ async fn receive_output(
                 });
             }
             _ => return Err(ExecError::Unknown),
+        }
+    }
+}
+/// UI output only: never call the PTY writer, send stdin, or feed these bytes back to a tool.
+/// The original session Arc keeps late output pinned even if the user reconnects another tab.
+pub(super) struct TerminalMirror {
+    session: Arc<Session>,
+    limit: usize,
+    state: Mutex<MirrorState>,
+    plain: bool,
+}
+struct MirrorState {
+    started: bool,
+    finished: bool,
+    previous_cr: bool,
+    decoder: Output,
+}
+impl TerminalMirror {
+    pub(super) fn new(session: Arc<Session>, limit: usize) -> Self {
+        Self {
+            session,
+            limit,
+            state: Mutex::new(MirrorState {
+                started: false,
+                finished: false,
+                previous_cr: false,
+                decoder: Output::new(),
+            }),
+            plain: false,
+        }
+    }
+    pub(super) fn plain(session: Arc<Session>, limit: usize) -> Self {
+        let mut display = Self::new(session, limit);
+        display.plain = true;
+        display
+    }
+    fn start(&self, command: &str) {
+        self.start_with_label(
+            command,
+            &format!("SSH 登录账号 {}", self.session.identity.username),
+        );
+    }
+    pub(super) fn start_with_label(&self, command: &str, label: &str) {
+        self.state.lock().unwrap().started = true;
+        let command = command
+            .chars()
+            .map(|c| {
+                if c.is_control() && c != '\n' && c != '\t' {
+                    c.escape_default().to_string()
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect::<String>();
+        if self.plain {
+            self.output(format!("{command}\n").as_bytes());
+            return;
+        }
+        self.output(format!("\n[AI 工具 · {label}]\n$ {command}\n").as_bytes());
+    }
+    fn output(&self, bytes: &[u8]) {
+        let mut state = self.state.lock().unwrap();
+        let mut display = Vec::with_capacity(bytes.len());
+        for &byte in bytes {
+            if byte == b'\n' && !state.previous_cr {
+                display.push(b'\r');
+            }
+            display.push(byte);
+            state.previous_cr = byte == b'\r';
+        }
+        // Decode independently of the PTY, so fragmented Unicode from either stream stays intact.
+        state.decoder.append(&display, self.limit);
+        let text = std::mem::take(&mut state.decoder.text);
+        drop(state);
+        let mut output = self.session.output.lock().unwrap();
+        if output.reason.is_some() {
+            return;
+        }
+        output.append_display(&text, self.limit);
+        drop(output);
+        self.session.changed.notify_waiters();
+    }
+    pub(super) fn finish(&self, result: &Result<ExecResult, ExecError>) {
+        let started = {
+            let mut state = self.state.lock().unwrap();
+            state.finished = true;
+            state.started
+        };
+        if !started {
+            return;
+        }
+        if self.plain {
+            return;
+        }
+        let status = match result {
+            Ok(result) => format!("退出码 {}", result.exit_code),
+            Err(ExecError::Rejected) => "请求被服务器拒绝".into(),
+            Err(_) => "结果未知，请先核查；未自动重试".into(),
+        };
+        self.output(format!("\n[AI 工具 · {status}]\n").as_bytes());
+    }
+}
+impl Drop for TerminalMirror {
+    fn drop(&mut self) {
+        let state = self.state.lock().unwrap();
+        let (started, finished) = (state.started, state.finished);
+        drop(state);
+        if started && !finished && !self.plain {
+            self.output("\n[AI 工具 · 结果未知，请先核查；未自动重试]\n".as_bytes());
         }
     }
 }
@@ -243,9 +408,14 @@ mod protocol_tests {
             ChannelMsg::Eof,
             ChannelMsg::Close,
         ];
-        let result = receive_output(futures_util::stream::iter(frames), None)
-            .await
-            .unwrap();
+        let result = receive_output(
+            futures_util::stream::iter(frames),
+            None,
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.stdout, "docker_installed=yes\n");
         assert_eq!(result.stderr, "service inactive\n");
         assert_eq!(result.exit_code, 7);
@@ -259,6 +429,8 @@ mod protocol_tests {
                 ChannelMsg::Failure,
             ]),
             None,
+            None,
+            Duration::from_secs(1),
         )
         .await;
         assert!(matches!(rejected, Err(ExecError::Rejected)));
@@ -273,6 +445,8 @@ mod protocol_tests {
                 ChannelMsg::Close,
             ]),
             None,
+            None,
+            Duration::from_secs(1),
         )
         .await;
         assert!(matches!(missing, Err(ExecError::Unknown)));

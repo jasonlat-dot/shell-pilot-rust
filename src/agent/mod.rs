@@ -13,6 +13,7 @@ pub mod provider;
 mod repository;
 mod scopes;
 pub mod ssh_tools;
+pub mod steering;
 mod tool_journal;
 pub mod tool_loop;
 pub(crate) mod tool_output;

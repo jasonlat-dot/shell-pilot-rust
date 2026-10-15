@@ -25,7 +25,7 @@ pub enum Error {
     ToolUnknown,
     #[error("工具调用已达到本轮上限，请核对结果后继续")]
     ToolLimit,
-    #[error("当前模型未启用 Chat Completions 工具能力，请在模型设置中配置")]
+    #[error("当前工具执行链需要支持 Chat Completions 函数工具的模型")]
     ToolsUnsupported,
     #[error("Agent 会话或配置不存在")]
     NotFound,
@@ -179,6 +179,9 @@ fn new_request_id() -> String {
     rename_all_fields = "camelCase"
 )]
 pub enum StreamEvent {
+    Input {
+        input: super::steering::Input,
+    },
     ToolCall {
         tool_call_id: String,
         tool_name: String,
@@ -376,7 +379,7 @@ impl Manager {
                         if p.config.provider == super::provider::ProviderKind::OpenAiCompatible
                             && p.config.capabilities.tool_calls
                         {
-                            "可启用 SSH 工具"
+                            "工具默认可用"
                         } else {
                             "文字对话"
                         },
@@ -620,6 +623,32 @@ impl Manager {
         })
         .await
     }
+    pub async fn steer(
+        &self,
+        agent: String,
+        user: String,
+        session: String,
+        expected_request: String,
+        id: String,
+        message: String,
+    ) -> Result<super::steering::Input> {
+        if self.stop.is_cancelled() {
+            return Err(Error::Stopped);
+        }
+        let repo = Repository::new(self.store.clone());
+        worker(move || {
+            super::steering::accept(
+                &repo,
+                &agent,
+                &user,
+                &session,
+                &expected_request,
+                &id,
+                &message,
+            )
+        })
+        .await
+    }
     pub async fn sessions(
         &self,
         agent: String,
@@ -821,8 +850,8 @@ impl Manager {
             return Err(ModelError::Cancelled.into());
         }
         let runtime = prepared.runtime;
-        let response_prepared = prepared.responses;
-        let chat = prepared.request;
+        let mut response_prepared = prepared.responses;
+        let mut chat = prepared.request;
         let revision = prepared.revision;
         let target_for_admission = target.clone();
         let turns = Turns::new(self.store.clone());
@@ -868,17 +897,67 @@ impl Manager {
         let mut last_save = std::time::Instant::now();
         self.capture_live(request.clone(), admission.0.target.clone())
             .await?;
-        let result = tokio::select! {biased;_=cancel.cancelled()=>Err(ModelError::Cancelled),
-        result=client.stream_with_responses(&chat, response_prepared,&token,|content| {
-            let current={let mut text=partial.lock().unwrap();text.push_str(&content);text.clone()};
-            let save=persisted==0||current.len().saturating_sub(persisted)>=1024||last_save.elapsed()>=std::time::Duration::from_millis(250);
-            if save{persisted=current.len();last_save=std::time::Instant::now();}
-            let future=send(StreamEvent::Text{content});let turns=turns.clone();let r=request.clone();let who=owner.clone();
-            async move {
-                if save && !matches!(worker(move||turns.checkpoint_partial(&r,&who,Some(&current))).await,Ok(true)){return Err(ModelError::Cancelled);}
-                future.await.map_err(|e|match e{Error::Model(error)=>error,_=>ModelError::Cancelled})
+        let repo = Repository::new(self.store.clone());
+        let r = request.clone();
+        let mut current_revision =
+            worker(move || Ok(super::steering::snapshot(&repo, &r)?.session.revision)).await?;
+        let mut rounds = 0;
+        let result = loop {
+            rounds += 1;
+            let result = tokio::select! {biased;_=cancel.cancelled()=>Err(ModelError::Cancelled),
+            result=client.stream_with_responses(&chat, response_prepared.take(),&token,|content| {
+                let (current,exceeded)={let mut text=partial.lock().unwrap();let exceeded=text.len()+content.len()>16000;if !exceeded{text.push_str(&content);}(text.clone(),exceeded)};
+                let save=persisted==0||current.len().saturating_sub(persisted)>=1024||last_save.elapsed()>=std::time::Duration::from_millis(250);
+                if save{persisted=current.len();last_save=std::time::Instant::now();}
+                let future=send(StreamEvent::Text{content});let turns=turns.clone();let r=request.clone();let who=owner.clone();
+                async move {
+                    if exceeded{return Err(ModelError::ResponseTooLarge);}
+                    if save && !matches!(worker(move||turns.checkpoint_partial(&r,&who,Some(&current))).await,Ok(true)){return Err(ModelError::Cancelled);}
+                    future.await.map_err(|e|match e{Error::Model(error)=>error,_=>ModelError::Cancelled})
+                }
+            })=>result};
+            let mut completion = match result {
+                Ok(c) => c,
+                Err(error) => break Err(error),
+            };
+            let repo = Repository::new(self.store.clone());
+            let r = request.clone();
+            let c = completion.clone();
+            let inputs =
+                worker(move || super::steering::drain(&repo, &r, current_revision, Some(&c), true))
+                    .await?;
+            if inputs.is_empty() {
+                completion.message.content = Some(partial.lock().unwrap().clone());
+                break Ok(completion);
             }
-        })=>result};
+            let repo = Repository::new(self.store.clone());
+            let r = request.clone();
+            current_revision =
+                worker(move || Ok(super::steering::snapshot(&repo, &r)?.session.revision)).await?;
+            if let Some(window) = completion.response_output.take() {
+                chat.messages
+                    .push(super::provider::ChatMessage::Responses { window });
+            } else {
+                chat.messages.push(super::provider::ChatMessage::Assistant {
+                    content: completion.message.content.clone(),
+                    tool_calls: vec![],
+                });
+            }
+            for input in inputs {
+                chat.messages.push(super::provider::ChatMessage::User {
+                    content: input.message.clone(),
+                });
+                send(StreamEvent::Input { input }).await?;
+            }
+            if rounds >= 8 {
+                break Err(ModelError::ResponseTooLarge);
+            }
+            partial.lock().unwrap().push_str("\n\n");
+            send(StreamEvent::Text {
+                content: "\n\n".into(),
+            })
+            .await?;
+        };
         let (state, code, text) = match &result {
             Ok(c) => (
                 TurnState::Completed,

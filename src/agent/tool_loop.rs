@@ -97,6 +97,29 @@ pub enum ToolOutcome {
     OutcomeUnknown,
 }
 pub trait ToolExecutor: Send + Sync {
+    /// Shared admission hook for EVERY tool category, not just shell commands.
+    /// The native host must use the current task's approval policy and a trusted
+    /// tool adapter. Registering a function alone never grants execution rights.
+    /// Adapters with durable approvals must still recheck permission at dispatch.
+    fn authorize<'a>(
+        &'a self,
+        _call: &'a ValidatedCall,
+        _cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async { false })
+    }
+
+    /// Native-only normalization of parsed arguments, before schema validation.
+    /// The default preserves arguments. The complete schema is checked afterwards.
+    fn normalize_arguments(&self, _tool_name: &str, _arguments: &mut Value) {}
+
+    /// Native policy only: whether this tool is bounded by Limits::tool_timeout.
+    /// Tools that opt out must enforce their own timeout and respect cancellation.
+    /// New tools (including MCP tools) use the total timeout unless opted out here.
+    fn uses_total_timeout(&self, _tool_name: &str) -> bool {
+        true
+    }
+
     /// Native-only. Bind the task/target outside model arguments and recheck permissions
     /// on every dispatch. Respect cancellation; do not detach untracked side effects.
     fn execute<'a>(
@@ -107,6 +130,13 @@ pub trait ToolExecutor: Send + Sync {
 }
 /// Trusted native persistence and context hooks; model payloads cannot install them.
 pub trait LoopContext: Send + Sync {
+    fn continue_after_reply<'a>(
+        &'a self,
+        _reply: &'a AssistantReply,
+        _cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async { Ok(false) })
+    }
     fn before_model<'a>(
         &'a self,
         request: &'a ChatRequest,
@@ -244,6 +274,11 @@ impl<'a> ToolLoop<'a> {
             self.model_rounds += 1;
             let reply = client.complete(&self.request, cancel).await?.message;
             if reply.tool_calls.is_empty() {
+                if let Some(context) = self.context {
+                    if context.continue_after_reply(&reply, cancel).await? {
+                        continue;
+                    }
+                }
                 self.request.messages.push(ChatMessage::Assistant {
                     content: reply.content.clone().or_else(|| reply.refusal.clone()),
                     tool_calls: vec![],
@@ -267,7 +302,11 @@ impl<'a> ToolLoop<'a> {
                     self.registry
                         .tools
                         .get(&call.function.name)
-                        .and_then(|(_, schema)| schema.parse(&call.function.arguments))
+                        .and_then(|(_, schema)| {
+                            schema.parse(&call.function.arguments, |arguments| {
+                                executor.normalize_arguments(&call.function.name, arguments);
+                            })
+                        })
                         .map(|arguments| ValidatedCall {
                             call: call.clone(),
                             arguments,
@@ -332,6 +371,24 @@ impl<'a> ToolLoop<'a> {
                     return Err(Error::Cancelled);
                 }
                 let slot = result_start + index;
+                // Authorization precedes dispatch and the "possibly executed"
+                // marker. Unknown/new tool adapters fail closed by default.
+                let authorized = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(Error::Cancelled),
+                    allowed = executor.authorize(call, cancel) => allowed,
+                };
+                if !authorized {
+                    let content = failure("denied").to_string();
+                    self.request.messages[slot] = result_message(call.id(), failure("denied"));
+                    if let Some(context) = self.context {
+                        context.result(call.id(), &content).await?;
+                    }
+                    continue;
+                }
+                if cancel.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
                 // Set unknown *before* awaiting: even dropping this future cannot make
                 // an in-flight call look unexecuted. A started loop cannot be replayed.
                 self.request.messages[slot] = result_message(call.id(), failure("result_unknown"));
@@ -343,8 +400,16 @@ impl<'a> ToolLoop<'a> {
                 let outcome = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => ToolOutcome::OutcomeUnknown,
-                    outcome = tokio::time::timeout(self.limits.tool_timeout, async { executor.execute(call, &child).await }) =>
-                        outcome.unwrap_or(ToolOutcome::OutcomeUnknown),
+                    outcome = async {
+                        let execution = executor.execute(call, &child);
+                        if executor.uses_total_timeout(call.name()) {
+                            tokio::time::timeout(self.limits.tool_timeout, execution)
+                                .await
+                                .unwrap_or(ToolOutcome::OutcomeUnknown)
+                        } else {
+                            execution.await
+                        }
+                    } => outcome,
                 };
                 child.cancel();
                 let (value, unknown) = match outcome {

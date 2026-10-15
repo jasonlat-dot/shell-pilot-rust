@@ -66,12 +66,12 @@ C5 已在 AI 面板展示最近输入占用、估算/供应商计数来源和真
 | `outputReserve`、`safetyReserve` | 输出与安全预留；输出必须大于 0，两者之和必须小于窗口。 |
 | `compactPercent` | 可用输入预算的整理触发比例，1–99；默认 75。C2 据此触发摘要，提交前须降至其 80% 的较低水位（默认 60%）。前端高级参数可编辑。 |
 | `outputTokenParameter` | `maxCompletionTokens` 发 `max_completion_tokens`；兼容供应商需要旧字段时用 `maxTokens`，一次只发送一种字段；Responses 固定使用 max_output_tokens。 |
-| `capabilities` | 明确声明函数工具、developer 角色、temperature、reasoning 参数等支持情况。声明是配置，不代表已通过真实服务探测。当前只处理文本；vision 标记留给 E1。 |
+| `capabilities` | 函数工具默认启用，读取/保存旧配置时将 toolCalls 归一为 true，前台不再提供开关；实际工具协议仍仅支持 Chat Completions。其他字段声明 developer 角色、temperature、reasoning 参数等支持情况，不代表已通过真实服务探测；vision 标记留给 E1。 |
 | `temperature` | `null` 表示不发送；设置时必须支持该参数，值在 0–2 之间。 |
 | `reasoningEffort` | `null` 表示不发送；可配置 `none/minimal/low/medium/high/xhigh`，需要能力开关。具体模型接受哪些值需按供应商文档选择。 |
 | `timeoutSeconds` | 整次请求总时限，包含发请求和读取响应，1–600 秒；连接时限最多 30 秒。 |
 | `maxResponseBytes` | 成功响应正文上限，1024–8388608 字节；按实际读取字节检查，不仅依赖 Content-Length。 |
-| `requireApiKey` | 为 true 且无密钥时，允许保存草稿但 `ready=false`，不能发模型请求；无认证的本地模型可设 false。 |
+| `requireApiKey` | 为 true 且无密钥时，允许保存草稿但 `ready=false`，不能发模型请求；false 时不解密、不携带已保存的密钥，密钥仍加密保留，重新启用后可复用。前端输入框留空发送 keep，有新值才发送 set。 |
 
 预算计入序列化后的完整消息、工具定义、参数和消息开销；超限直接报 `BudgetExceeded`，不悄悄裁掉消息。UTF-8 估算仍是启发式，不是精确 tokenizer；响应 usage 会返回实际 token 统计，C2 在普通发送之前尝试有界自动整理，实际发送仍经过完整硬上限校验；持续 usage 校准尚未实现。
 

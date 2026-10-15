@@ -42,6 +42,7 @@ pub struct Turn {
     pub created_at: i64,
     pub updated_at: i64,
     pub tool_events: Vec<super::Event>,
+    pub inputs: Vec<super::steering::Input>,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -101,6 +102,7 @@ fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
             created_at: r.get("created_at")?,
             updated_at: r.get("updated_at")?,
             tool_events: vec![],
+            inputs: vec![],
         },
         input,
         owner: r.get("owner")?,
@@ -194,7 +196,9 @@ fn finish_row(
         && s.task.as_ref().map(|t| t.id.as_str()) == old.task_id.as_deref()
     {
         let payload = if completed {
-            Payload::AssistantMessage { text: text.into() }
+            Payload::AssistantMessage {
+                text: super::steering::final_text(db, session, &old.turn.request_id, text)?,
+            }
         } else {
             Payload::Cancelled {
                 reason: code.unwrap_or("AGENT_INTERRUPTED").into(),
@@ -498,6 +502,7 @@ impl Turns {
             let has_more=turns.len()>limit;turns.truncate(limit);
             let next_after=turns.last().map(|t|t.cursor).unwrap_or(after);drop(stmt);
             for turn in &mut turns {
+                turn.inputs=super::steering::list(&tx,&session.id,&turn.request_id)?;
                 let end:Option<u64>=storage(tx.query_row("SELECT MIN(user_event_id) FROM agent_chat_turns WHERE session_id=?1 AND user_event_id>?2",params![session.id,turn.cursor],|r|r.get(0)))?;
                 let mut q=storage(tx.prepare("SELECT id,session_id,task_id,request_id,payload,created_at FROM agent_events WHERE session_id=?1 AND id>?2 AND (?3 IS NULL OR id<?3) ORDER BY id LIMIT 600"))?;
                 let rows=storage(q.query_map(params![session.id,turn.cursor,end],super::repository::read_event_row))?;

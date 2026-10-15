@@ -1132,6 +1132,86 @@ async fn pending_approval(
     .expect("desktop must present a real pending approval")
 }
 #[tokio::test]
+async fn desktop_steering_replans_pending_command_without_interrupting_or_executing_it() {
+    use shellpilot_server::agent::chat::{StreamEvent, TurnState};
+    let b = Bound::new(
+        vec![
+            Step::Calls(vec![exec("old-plan", "__exec_unicode__")]),
+            Step::Final,
+        ],
+        90,
+        true,
+        false,
+    )
+    .await;
+    let (manager, request) = desktop(&b).await;
+    let m = manager.clone();
+    let r = request.clone();
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let events = frames.clone();
+    let run = tokio::spawn(async move {
+        m.chat_desktop(r, None, true, &CancellationToken::new(), move |e| {
+            events.lock().unwrap().push(e);
+            async { Ok(()) }
+        })
+        .await
+    });
+    let approval = pending_approval(&manager, &request).await;
+    manager
+        .steer(
+            "model".into(),
+            "default".into(),
+            request.session_id.clone(),
+            request.request_id.clone(),
+            "steer-tool".into(),
+            "补充：不要执行命令，只讨论方案".into(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(8), run)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(b.execs(), 0);
+    let receipts = manager
+        .execution_requests(
+            "model".into(),
+            "default".into(),
+            request.session_id.clone(),
+            "".into(),
+        )
+        .await
+        .unwrap();
+    assert!(receipts
+        .iter()
+        .any(|r| r.id == approval.id && r.state == ApprovalState::Cancelled));
+    let history = manager
+        .history(
+            "model".into(),
+            "default".into(),
+            request.session_id.clone(),
+            0,
+            20,
+        )
+        .await
+        .unwrap();
+    assert_eq!(history.turns.len(), 1);
+    assert_eq!(history.turns[0].state, TurnState::Completed);
+    assert!(history.turns[0].inputs[0].event_id.is_some());
+    let bodies = &b.wire.script.lock().unwrap().requests;
+    assert!(bodies.last().unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["role"] == "user" && m["content"] == "补充：不要执行命令，只讨论方案"));
+    assert!(frames
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| matches!(e, StreamEvent::Input { .. })));
+}
+#[tokio::test]
 async fn desktop_d5_approval_output_history_reopen_and_replay_never_repeat_ssh() {
     use shellpilot_server::agent::chat::StreamEvent;
     let b = Bound::new(

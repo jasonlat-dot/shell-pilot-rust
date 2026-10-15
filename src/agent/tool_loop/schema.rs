@@ -1,5 +1,5 @@
 //! A deliberately closed JSON Schema subset. Unsupported keywords fail at registration;
-//! the schema advertised to the model and the native validator cannot drift apart.
+//! normalized arguments must still satisfy the schema advertised to the model.
 use serde::{de, Deserialize, Deserializer};
 use serde_json::{Map, Value};
 use std::{collections::HashSet, fmt};
@@ -102,11 +102,13 @@ impl Schema {
         }
         (value["type"] == "object" && check(value, 0, &mut 0)).then(|| Self(value.clone()))
     }
-    pub fn parse(&self, arguments: &str) -> Option<Value> {
+    pub fn parse(&self, arguments: &str, normalize: impl FnOnce(&mut Value)) -> Option<Value> {
         if arguments.len() > 65536 {
             return None;
         }
-        let value = serde_json::from_str::<UniqueValue>(arguments).ok()?.0;
+        // Reject malformed JSON and duplicate fields before any normalization.
+        let mut value = serde_json::from_str::<UniqueValue>(arguments).ok()?.0;
+        normalize(&mut value);
         accepts(&self.0, &value).then_some(value)
     }
 }

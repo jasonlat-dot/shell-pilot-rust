@@ -72,7 +72,8 @@ impl Manager {
         })
         .await
     }
-    /// Explicit user action. Rebinding is never inferred from the active terminal tab.
+    /// Native binding to the conversation's verified server scope. The desktop
+    /// prepares it automatically before sending; the active tab cannot retarget it.
     pub async fn bind_execution(
         &self,
         agent: String,
@@ -105,8 +106,20 @@ impl Manager {
             if running{return Err(Error::Busy);}
             let target=Some(Target{connection_id:connection,terminal_session_id:terminal});
             if s.task.as_ref().is_some_and(|t|t.target==target && t.status==super::super::TaskStatus::Active){return Ok(s);}
+            let previous=s.task.clone();
             repo.start_task(&session,&user,s.revision,&uuid::Uuid::new_v4().to_string(),TaskRequest{goal:s.task.as_ref().map_or_else(||"在已绑定服务器协助用户；所有命令须明确审批".into(),|t|t.goal.clone()),constraints:s.task.map_or_else(Vec::new,|t|t.constraints),target})?;
-            Ok(repo.session(&session,&user)?)
+            let resumed=repo.session(&session,&user)?;
+            if let (Some(previous),Some(current))=(previous,resumed.task.as_ref()) {
+                // Rebinding this same conversation after failure/reconnect is
+                // not an explicit new task. Carry only its policy preference,
+                // never approvals/grants, and only on the verified same server.
+                if previous.target.as_ref().map(|t|&t.connection_id)==current.target.as_ref().map(|t|&t.connection_id)
+                    &&previous.goal==current.goal&&previous.constraints==current.constraints {
+                    repo.db(|db|Ok(db.execute("UPDATE agent_execution_policies SET task_id=?3,revision=revision+1 WHERE session_id=?1 AND task_id=?2",
+                        rusqlite::params![session,previous.id,current.id])?))?;
+                }
+            }
+            Ok(resumed)
         }).await
     }
     pub async fn execution_requests(
@@ -173,7 +186,7 @@ impl Manager {
         }
         let (mode, revision) = self
             .approvals
-            .policy(session, user, task)
+            .policy_view(session, user, task)
             .await
             .map_err(approval_error)?;
         Ok(json!({"mode":mode,"revision":revision}))
@@ -211,7 +224,33 @@ impl Manager {
         F: FnMut(StreamEvent) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
-        if execution_enabled {
+        // The legacy transport flag is not a user-facing capability switch.
+        // Unbound/offline chats and unsupported protocols retain text chat.
+        let session = self
+            .owned(
+                request.agent_id.clone(),
+                request.user_id.clone(),
+                request.session_id.clone(),
+            )
+            .await?;
+        let tools_supported = if execution_enabled
+            && !request.terminal_session_id.is_empty()
+            && session
+                .scope
+                .as_ref()
+                .is_some_and(|scope| scope.kind == ScopeKind::Server)
+        {
+            let models = ModelRepository::new(self.store.clone());
+            let agent = request.agent_id.clone();
+            let user = request.user_id.clone();
+            worker(move || {
+                Ok(models.get(&agent, &user)?.config.provider == ProviderKind::OpenAiCompatible)
+            })
+            .await?
+        } else {
+            false
+        };
+        if tools_supported {
             self.chat_tools(request, cancel, send).await
         } else {
             self.chat(request, target, cancel, send).await
@@ -308,6 +347,7 @@ impl Manager {
             crate::agent::ssh_tools::Error::TargetUnavailable => Error::TargetUnavailable,
             _ => Error::TargetMismatch,
         })?
+        .with_terminal_shell()
         .with_approvals(self.approvals.clone())
         .map_err(|_| Error::Storage)?;
         let models = ModelRepository::new(self.store.clone());
@@ -415,6 +455,15 @@ impl Manager {
             })
             .await
         } else {
+            // This is the result of the current invocation, not a replay.
+            // Preserve its real error instead of claiming the caller reused an ID.
+            if turn.state == TurnState::Failed {
+                if let Err(error) = result {
+                    if turn.error_code.as_deref() == Some(error.code()) {
+                        return Err(error);
+                    }
+                }
+            }
             Err(recorded(&turn))
         }
     }

@@ -2,6 +2,7 @@ pub(crate) mod agent_exec;
 mod host_key;
 mod http;
 mod output;
+mod shared_shell;
 use crate::{
     error::Error,
     model::{Connection, ConnectionRequest, Credentials},
@@ -454,6 +455,14 @@ impl TerminalManager {
                     transport: Arc::downgrade(&entry),
                     trust_profile: entry.transport.trust_profile.clone(),
                     writer: Mutex::new(Some(writer.clone())),
+                    input_gate: Arc::new(AsyncMutex::new(())),
+                    input_revision: std::sync::atomic::AtomicU64::new(0),
+                    input_dirty: std::sync::atomic::AtomicBool::new(false),
+                    shell_uncertain: std::sync::atomic::AtomicBool::new(false),
+                    shell_probe: Mutex::new(None),
+                    shell_display: Mutex::new(None),
+                    terminal_size: Mutex::new((cols, rows)),
+                    size_changed: Notify::new(),
                     output: Mutex::new(Output::new()),
                     changed: Notify::new(),
                     stop: CancellationToken::new(),
@@ -639,6 +648,17 @@ impl TerminalManager {
             return Err(Error::Invalid("单次终端输入不能超过 256 KiB".into()));
         }
         let session = self.session(id)?;
+        let _input = session.input_gate.try_lock().map_err(|_| {
+            Error::Invalid(
+                "AI 工具正在使用此终端，请等待完成或先停止生成；本次手工输入未发送。".into(),
+            )
+        })?;
+        if !input.is_empty() {
+            session.input_revision.fetch_add(1, Ordering::SeqCst);
+            session
+                .input_dirty
+                .store(!input.ends_with(['\r', '\n', '\u{3}']), Ordering::SeqCst);
+        }
         let writer = session
             .writer
             .lock()
@@ -662,11 +682,16 @@ impl TerminalManager {
             .clone()
             .ok_or(Error::TerminalMissing)?;
         session.output.lock().unwrap().last_active = Instant::now();
-        tokio::select! {
+        let result = tokio::select! {
             _ = session.stop.cancelled() => Err(Error::TerminalMissing),
             result = tokio::time::timeout(Duration::from_secs(5), writer.window_change(cols, rows, 0, 0)) =>
                 result.map_err(|_| Error::Ssh)?.map_err(|_| Error::Ssh),
+        };
+        if result.is_ok() {
+            *session.terminal_size.lock().unwrap() = (cols, rows);
+            session.size_changed.notify_one();
         }
+        result
     }
     pub fn close(&self, id: &str) {
         if let Ok(session) = self.session(id) {
@@ -952,8 +977,13 @@ async fn run_reader(
             }
             message = reader.wait() => match message {
                 Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
-                    session.output.lock().unwrap().append(&data, settings.buffer_bytes);
+                    shared_shell::display_pty(&session, &data, settings.buffer_bytes);
                     session.changed.notify_waiters();
+                    if let Some(probe) = session.shell_probe.lock().unwrap().as_ref() {
+                        // This observer only acknowledges a harmless readiness probe. Tool results
+                        // NEVER come from the PTY, including manual/background command output.
+                        let _ = probe.try_send(data.to_vec());
+                    }
                 }
                 Some(ChannelMsg::Eof | ChannelMsg::Close) | None => break DisconnectReason::ChannelDisconnected,
                 Some(ChannelMsg::Failure) => break DisconnectReason::ReaderError,

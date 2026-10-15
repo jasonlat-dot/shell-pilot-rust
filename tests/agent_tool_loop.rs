@@ -148,6 +148,15 @@ impl Host {
     }
 }
 impl ToolExecutor for Host {
+    fn authorize<'a>(
+        &'a self,
+        _call: &'a ValidatedCall,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, bool> {
+        // This test host explicitly authorizes its synthetic in-memory tools.
+        Box::pin(async move { !cancel.is_cancelled() })
+    }
+
     fn execute<'a>(
         &'a self,
         call: &'a ValidatedCall,
@@ -473,7 +482,7 @@ async fn execution_failure_and_oversized_output_are_bounded_model_visible_result
 }
 
 #[tokio::test]
-async fn disabled_capabilities_and_responses_are_rejected_without_network_or_execution() {
+async fn legacy_tool_capability_is_enabled_and_responses_stay_unsupported() {
     for responses in [false, true] {
         let model = Model::new(vec![], |c| {
             if responses {
@@ -484,6 +493,11 @@ async fn disabled_capabilities_and_responses_are_rejected_without_network_or_exe
             }
         })
         .await;
+        if !responses {
+            assert!(model.client.config().capabilities.tool_calls);
+            assert!(model.requests().is_empty());
+            continue;
+        }
         let r = registry();
         let host = Host::new(Behavior::Success(json!(true)));
         let mut loop_ = ToolLoop::new(&r, input(), Limits::default()).unwrap();

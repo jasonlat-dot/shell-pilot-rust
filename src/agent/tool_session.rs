@@ -39,6 +39,7 @@ struct Pending {
     capture: Option<Arc<Capture>>,
 }
 struct Data {
+    intermediate: String,
     snapshot: Snapshot,
     latest_user: u64,
     message: String,
@@ -102,12 +103,17 @@ impl ToolSession {
         message: &str,
         runtime: &RuntimeConfig,
     ) -> tool_loop::Result<()> {
+        // Validate host definitions before a durable running turn is created.
+        // A malformed schema is a configuration error, not a failed SSH action.
+        let mut registry = ToolRegistry::default();
+        registry.register(ssh_tools::definition())?;
+        registry.register(output_definition())?;
         context::require_pinned(
             snapshot,
             binding,
             message,
             runtime,
-            &[ssh_tools::definition(), output_definition()],
+            &registry.definitions(),
         )
     }
     /// Native storage quotas, never model arguments or execution permission.
@@ -191,7 +197,7 @@ impl ToolSession {
                 (snapshot,appended.event.id)
             };
             *data.lock().map_err(|_|tool_loop::Error::Context)? = Some(Data {
-                snapshot,latest_user,message,runtime:runtime.clone(),pending:vec![],
+                snapshot,latest_user,message,runtime:runtime.clone(),pending:vec![],intermediate:String::new(),
             });
             Ok(runtime)
         }).await?;
@@ -200,7 +206,29 @@ impl ToolSession {
             data: self.data.clone(),
         };
         let client = ModelClient::new(runtime)?;
-        let reply = loop_.run(&client, self, cancel).await?;
+        let mut reply = loop_.run(&client, self, cancel).await?;
+        if let Ok(guard) = self.data.lock() {
+            if let Some(data) = guard.as_ref() {
+                if !data.intermediate.is_empty() {
+                    reply.content = Some(format!(
+                        "{}{}",
+                        data.intermediate,
+                        reply
+                            .content
+                            .as_deref()
+                            .or(reply.refusal.as_deref())
+                            .unwrap_or("")
+                    ));
+                }
+            }
+        }
+        if reply
+            .content
+            .as_ref()
+            .is_some_and(|text| text.len() > 16000)
+        {
+            return Err(tool_loop::Error::Limit);
+        }
         let repository = self.repository.clone();
         let data = self.data.clone();
         let text = reply.content.clone().or_else(|| reply.refusal.clone());
@@ -239,6 +267,18 @@ fn ensure_current(repository: &Repository, data: &Data) -> tool_loop::Result<()>
     Ok(())
 }
 impl LoopContext for ToolSession {
+    fn continue_after_reply<'a>(
+        &'a self,
+        reply: &'a AssistantReply,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, tool_loop::Result<bool>> {
+        Box::pin(async move {
+            if cancel.is_cancelled() {
+                return Err(tool_loop::Error::Cancelled);
+            }
+            self.apply_inputs(Some(reply.clone()), true).await
+        })
+    }
     fn before_model<'a>(
         &'a self,
         request: &'a ChatRequest,
@@ -436,6 +476,50 @@ impl Drop for Cleanup {
     }
 }
 impl ToolExecutor for ToolSession {
+    fn authorize<'a>(
+        &'a self,
+        call: &'a ValidatedCall,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            if cancel.is_cancelled() {
+                return false;
+            }
+            let binding = self.executor.binding();
+            // The mode belongs to the task and applies before every dispatch,
+            // including tools that don't execute SSH commands.
+            let mode = super::approvals::Approvals::new(self.repository.store.clone())
+                .policy(
+                    binding.session_id.clone(),
+                    binding.user_id.clone(),
+                    binding.tool.task_id.clone(),
+                )
+                .await;
+            if !matches!(mode, Ok((policy, _)) if policy != super::approvals::Policy::Deny) {
+                return false;
+            }
+            match call.name() {
+                // Trusted, bounded read of this task's captured output. Like
+                // Codex's safe reads, this doesn't prompt on every invocation.
+                READ_OUTPUT => true,
+                // SSH performs its own durable review/decision/admission using
+                // the SAME policy; it is not approved by this routing check.
+                SSH_EXECUTE => self.executor.authorize(call, cancel).await,
+                // MCP/other tools must supply a native approval adapter before
+                // being dispatched. Neither a model name nor a skill can bypass it.
+                _ => false,
+            }
+        })
+    }
+
+    fn normalize_arguments(&self, tool_name: &str, arguments: &mut Value) {
+        self.executor.normalize_arguments(tool_name, arguments);
+    }
+
+    fn uses_total_timeout(&self, tool_name: &str) -> bool {
+        self.executor.uses_total_timeout(tool_name)
+    }
+
     fn execute<'a>(
         &'a self,
         call: &'a ValidatedCall,
@@ -501,6 +585,7 @@ impl ToolExecutor for ToolSession {
                             "target_unavailable"
                         }
                         ssh_tools::Error::Busy => "execution_busy",
+                        ssh_tools::Error::TerminalNotReady => "terminal_shell_not_ready",
                         ssh_tools::Error::Storage => "output_storage_failed",
                         ssh_tools::Error::Conflict => "execution_conflict",
                         ssh_tools::Error::InvalidArguments => "invalid_arguments",
@@ -511,7 +596,7 @@ impl ToolExecutor for ToolSession {
                     };
                     ToolOutcome::Failure {
                         code,
-                        data: json!({}),
+                        data: json!({"message":error.to_string()}),
                     }
                 }
             }

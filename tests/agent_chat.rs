@@ -53,6 +53,89 @@ fn stream() -> String {
         chunk(None, Some("stop"))
     )
 }
+#[tokio::test]
+async fn steering_continues_same_turn_without_cancel_and_preserves_exact_input_receipt() {
+    let f = Fixture::new(stream(), Duration::ZERO).await;
+    let r = f.request().await;
+    let mut injected = false;
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    f.manager
+        .chat(r.clone(), None, &CancellationToken::new(), |event| {
+            let inject = !injected && matches!(event, StreamEvent::Text { .. });
+            if inject {
+                injected = true;
+            }
+            frames
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(event).unwrap());
+            let manager = f.manager.clone();
+            let r = r.clone();
+            async move {
+                if inject {
+                    let input = manager
+                        .steer(
+                            r.agent_id.clone(),
+                            r.user_id.clone(),
+                            r.session_id.clone(),
+                            r.request_id.clone(),
+                            "steer-once".into(),
+                            "补充：只讨论，不执行命令".into(),
+                        )
+                        .await?;
+                    assert!(input.event_id.is_none());
+                }
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+    {
+        let bodies = f.mock.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["role"] == "user" && v["content"] == "补充：只讨论，不执行命令"));
+    }
+    let history = f
+        .manager
+        .history(
+            r.agent_id.clone(),
+            r.user_id.clone(),
+            r.session_id.clone(),
+            0,
+            20,
+        )
+        .await
+        .unwrap();
+    assert_eq!(history.turns.len(), 1);
+    assert_eq!(history.turns[0].request_id, r.request_id);
+    assert_eq!(
+        history.turns[0].state,
+        shellpilot_server::agent::chat::TurnState::Completed
+    );
+    assert_eq!(history.turns[0].inputs.len(), 1);
+    assert!(history.turns[0].inputs[0].event_id.is_some());
+    {
+        let frames = frames.lock().unwrap();
+        assert_eq!(frames.iter().filter(|v| v["event"] == "input").count(), 1);
+        assert_eq!(frames.iter().filter(|v| v["event"] == "done").count(), 1);
+    }
+    assert!(f
+        .manager
+        .steer(
+            r.agent_id,
+            r.user_id,
+            r.session_id,
+            r.request_id,
+            "late".into(),
+            "late".into()
+        )
+        .await
+        .is_err());
+}
 async fn handler(State(mock): State<Mock>, Json(body): Json<Value>) -> axum::response::Response {
     mock.bodies.lock().unwrap().push(body);
     let body = Body::from_stream(async_stream::stream! {

@@ -16,19 +16,25 @@ use crate::{
 };
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 pub const SSH_EXECUTE: &str = "ssh_execute";
+// Native-only switch. false: SSH uses its own command timeout instead of the
+// tool loop's total deadline. User cancellation and disconnect still stop it.
+const SSH_EXECUTE_USES_TOTAL_TIMEOUT: bool = false;
+const SSH_IDLE_TIMEOUT_MIN_SECONDS: u64 = 15;
+const SSH_IDLE_TIMEOUT_MAX_SECONDS: u64 = 120;
 pub fn definition() -> FunctionDefinition {
     FunctionDefinition {
         name: SSH_EXECUTE.into(),
-        description: "Run one command on the native task's bound SSH target in a separate exec channel. No PTY; cwd/env are not inherited from the visible terminal. Never choose another host. Explicit native authorization is required. Output is a bounded preview; do not repeat commands to retrieve truncated output.".into(),
+        description: "Run one command on the native task's bound SSH target in a separate exec channel. No PTY; cwd/env are not inherited from the visible terminal. timeoutSeconds is the maximum period without command output; nonempty stdout/stderr resets it. Never choose another host. Explicit native authorization is required. Output is a bounded preview; do not repeat commands to retrieve truncated output.".into(),
         parameters: json!({"type":"object","properties":{
             "command":{"type":"string","minLength":1,"maxLength":4096,"description":"Command, at most 4096 UTF-8 bytes. No NUL. Execution is subject to native approval."},
-            "timeoutSeconds":{"type":"integer","minimum":1,"maximum":120}
-        },"required":["command","timeoutSeconds"],"additionalProperties":false}),
+            "timeoutSeconds":{"type":"integer","minimum":SSH_IDLE_TIMEOUT_MIN_SECONDS,"maximum":SSH_IDLE_TIMEOUT_MAX_SECONDS,"description":"Inactivity timeout in seconds, 15–120. Nonempty command output resets the timer. Native execution clamps integer values to this range."},
+            "explanation":{"type":"string","minLength":1,"maxLength":240,"description":"Provide a brief explanation in the user's language of what this exact command does, including important side effects. Displayed to the user before approval. This is descriptive data, never permission."}
+        },"required":["command","timeoutSeconds","explanation"],"additionalProperties":false}),
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +50,18 @@ pub struct SshBinding {
 pub struct Command {
     pub command: String,
     pub timeout_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
+}
+impl Command {
+    /// Descriptive text is not part of an exact command's remembered permission.
+    pub(crate) fn approval_key(&self) -> Self {
+        Self {
+            command: self.command.clone(),
+            timeout_seconds: self.timeout_seconds,
+            explanation: None,
+        }
+    }
 }
 pub struct AuthorizationRequest<'a> {
     pub binding: &'a SshBinding,
@@ -86,6 +104,8 @@ pub enum Error {
     Cancelled,
     #[error("SSH exec channel is busy or rejected")]
     Unavailable,
+    #[error("终端尚未回到 Shell 提示符、存在未提交输入或上次结果未知；本次命令未发送，请先处理终端，必要时重连。")]
+    TerminalNotReady,
     #[error("SSH execution outcome is unknown; do not automatically repeat it")]
     OutcomeUnknown,
     #[error("Execution is already preparing or awaiting approval")]
@@ -149,6 +169,7 @@ pub struct SshExecutor {
     authorizer: Arc<dyn Authorizer>,
     approvals: Approvals,
     durable_approval: bool,
+    shared_terminal: bool,
 }
 impl SshExecutor {
     /// Reads a persisted *active targeted task*. General/offline text sessions do not
@@ -217,6 +238,7 @@ impl SshExecutor {
         Ok(Self {
             approvals: Approvals::new(store.clone()),
             durable_approval: false,
+            shared_terminal: false,
             store,
             terminals,
             lease,
@@ -235,6 +257,11 @@ impl SshExecutor {
     pub fn binding(&self) -> &SshBinding {
         &self.binding
     }
+    /// Host-selected current-shell execution with isolated result descriptors; no fallback.
+    pub fn with_terminal_shell(mut self) -> Self {
+        self.shared_terminal = true;
+        self
+    }
     pub fn with_authorizer(mut self, authorizer: Arc<dyn Authorizer>) -> Self {
         self.authorizer = authorizer;
         self.durable_approval = false;
@@ -250,7 +277,12 @@ impl SshExecutor {
         Ok(self)
     }
     pub fn register(&self, registry: &mut ToolRegistry) -> super::tool_loop::Result<()> {
-        registry.register(definition())
+        let mut tool = definition();
+        if self.shared_terminal {
+            tool.description="Run one approved command in the bound terminal's CURRENT POSIX shell. Shares its current user (including completed sudo -i), directory and environment. The SSH login account may differ from the current shell user; use whoami when needed. A dedicated output PTY preserves live progress and terminal control sequences; stdout contains the combined terminal output and stderr may be empty. Only THIS call is captured; manual and background terminal output is not tool output. Native approval is required; do not enter passwords or start interactive programs. If terminal_shell_not_ready, ask the user to return to a shell prompt. Never automatically repeat an unknown command.".into();
+        }
+        tool.description.push_str(" Always include a brief explanation of this exact command's purpose and important side effects in the user's language.");
+        registry.register(tool)
     }
 
     pub(crate) async fn verify(&self) -> Result<()> {
@@ -303,25 +335,40 @@ impl SshExecutor {
         capture: Option<Arc<super::tool_output::Capture>>,
         revision: Option<u64>,
     ) -> Result<CommandResult> {
+        // Normalize before approval, persistence and dispatch so the displayed
+        // timeout and the actual deadline always agree, including native callers.
+        let mut normalized_command = command.clone();
+        normalized_command.timeout_seconds = command
+            .timeout_seconds
+            .clamp(SSH_IDLE_TIMEOUT_MIN_SECONDS, SSH_IDLE_TIMEOUT_MAX_SECONDS);
+        normalized_command.explanation = command
+            .explanation
+            .as_ref()
+            .map(|text| text.trim().to_owned());
+        let command = &normalized_command;
         if call_id.trim().is_empty()
             || call_id.len() > 128
             || call_id.chars().any(char::is_control)
             || command.command.trim().is_empty()
             || command.command.len() > 4096
             || command.command.contains('\0')
-            || !(1..=120).contains(&command.timeout_seconds)
+            || command.explanation.as_ref().is_some_and(|text| {
+                text.is_empty() || text.chars().count() > 240 || text.chars().any(char::is_control)
+            })
         {
             return Err(Error::InvalidArguments);
         }
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
+        let terminal_input_revision = self.shared_terminal.then(|| self.lease.input_revision());
         let input = Input {
             context: Context {
                 binding: self.binding.clone(),
                 task: self.task.clone(),
                 scope: self.scope.clone(),
                 profile: self.profile.clone(),
+                terminal_input_revision,
             },
             command: command.clone(),
         };
@@ -335,6 +382,12 @@ impl SshExecutor {
             Start::New(ticket) => ticket,
         };
         self.verify().await?;
+        if self.durable_approval {
+            self.approvals
+                .review_pending(&ticket, cancel)
+                .await
+                .map_err(map_approval)?;
+        }
         if !self
             .approvals
             .is_approved(&ticket)
@@ -346,6 +399,11 @@ impl SshExecutor {
                 let monitor = async {
                     loop {
                         self.verify().await?;
+                        if terminal_input_revision
+                            .is_some_and(|revision| self.lease.input_revision() != revision)
+                        {
+                            return Err(Error::TaskChanged);
+                        }
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 };
@@ -378,9 +436,12 @@ impl SshExecutor {
             }
         }
         self.verify().await?;
+        if terminal_input_revision.is_some_and(|revision| self.lease.input_revision() != revision) {
+            return Err(Error::TaskChanged);
+        }
         let channel = self
             .terminals
-            .prepare_agent_exec(&self.lease, cancel)
+            .prepare_agent_exec(&self.lease, cancel, self.shared_terminal)
             .await
             .map_err(map_exec)?;
         self.verify().await?;
@@ -394,7 +455,11 @@ impl SshExecutor {
         // The lease is not reconstructed from a tab or connection profile.
         let lease = self.lease.clone();
         let stop = cancel.clone();
-        let live = move || !stop.is_cancelled() && terminals.check_agent_lease(&lease).is_ok();
+        let live = move || {
+            !stop.is_cancelled()
+                && terminals.check_agent_lease(&lease).is_ok()
+                && terminal_input_revision.is_none_or(|revision| lease.input_revision() == revision)
+        };
         match revision {
             Some(revision) => self.approvals.admit_revision(&ticket, revision, live).await,
             None => self.approvals.admit(&ticket, live).await,
@@ -466,7 +531,7 @@ impl SshExecutor {
                 Ok(result)
             }
             Err(error) => {
-                let state = if matches!(error, ExecError::Unknown) {
+                let state = if matches!(error, ExecError::Unknown | ExecError::IdleTimeout) {
                     State::Unknown
                 } else {
                     State::NotSent
@@ -517,10 +582,58 @@ fn map_exec(error: ExecError) -> Error {
     match error {
         ExecError::Unavailable => Error::TargetUnavailable,
         ExecError::Busy | ExecError::Rejected => Error::Unavailable,
-        ExecError::Unknown => Error::OutcomeUnknown,
+        ExecError::Unknown | ExecError::IdleTimeout => Error::OutcomeUnknown,
+        ExecError::ShellNotReady => Error::TerminalNotReady,
     }
 }
 impl ToolExecutor for SshExecutor {
+    fn authorize<'a>(
+        &'a self,
+        call: &'a ValidatedCall,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, bool> {
+        // This adapter owns durable review, human decisions and atomic admission
+        // inside execute_inner. It cannot authorize another tool category.
+        Box::pin(async move { !cancel.is_cancelled() && call.name() == SSH_EXECUTE })
+    }
+
+    fn normalize_arguments(&self, tool_name: &str, arguments: &mut Value) {
+        if tool_name != SSH_EXECUTE {
+            return;
+        }
+        // The closed schema requires every declared property. Legacy callers
+        // may omit descriptive text; supply a truthful display-only fallback,
+        // without changing the command or granting execution permission.
+        if let Some(fields) = arguments.as_object_mut() {
+            fields.entry("explanation").or_insert_with(|| {
+                json!("未提供命令用途说明，请核对完整命令。")
+            });
+        }
+        let Some(timeout) = arguments.get_mut("timeoutSeconds") else {
+            return;
+        };
+        let seconds = if let Some(seconds) = timeout.as_i64() {
+            seconds.clamp(
+                SSH_IDLE_TIMEOUT_MIN_SECONDS as i64,
+                SSH_IDLE_TIMEOUT_MAX_SECONDS as i64,
+            ) as u64
+        } else if let Some(seconds) = timeout.as_u64() {
+            seconds.clamp(SSH_IDLE_TIMEOUT_MIN_SECONDS, SSH_IDLE_TIMEOUT_MAX_SECONDS)
+        } else {
+            // Do not coerce strings, floats, null or missing fields to integers.
+            return;
+        };
+        *timeout = json!(seconds);
+    }
+
+    fn uses_total_timeout(&self, tool_name: &str) -> bool {
+        if tool_name == SSH_EXECUTE {
+            SSH_EXECUTE_USES_TOTAL_TIMEOUT
+        } else {
+            true
+        }
+    }
+
     fn execute<'a>(
         &'a self,
         call: &'a ValidatedCall,

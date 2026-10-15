@@ -223,13 +223,19 @@ impl ModelRepository {
             .map_err(|_| ModelError::Database)?;
         let (revision, json, key) = row(&db, id, user)?.ok_or(ModelError::NotFound)?;
         let profile = view(id, (revision, json, None), id.to_owned())?;
-        let api_key = key
-            .map(|key| {
-                let plain = secrets::unprotect(&key, &entropy(user, id))
-                    .map_err(|_| ModelError::Credentials)?;
-                SecretKey::new(plain).map_err(|_| ModelError::Credentials)
-            })
-            .transpose()?;
+        // Disabling authentication preserves the encrypted credential but never
+        // decrypts or sends it. Re-enabling can reuse the saved key.
+        let api_key = if profile.config.require_api_key {
+            key
+                .map(|key| {
+                    let plain = secrets::unprotect(&key, &entropy(user, id))
+                        .map_err(|_| ModelError::Credentials)?;
+                    SecretKey::new(plain).map_err(|_| ModelError::Credentials)
+                })
+                .transpose()?
+        } else {
+            None
+        };
         if profile.config.require_api_key && api_key.is_none() {
             return Err(ModelError::KeyMissing);
         }

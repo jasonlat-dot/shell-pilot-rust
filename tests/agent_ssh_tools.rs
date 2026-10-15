@@ -21,6 +21,16 @@ use support::*;
 use tokio_util::sync::CancellationToken;
 
 struct Permit;
+struct ShellPermit;
+impl Authorizer for ShellPermit {
+    fn authorize<'a>(
+        &'a self,
+        _: AuthorizationRequest<'a>,
+        _: &'a CancellationToken,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async { true })
+    }
+}
 impl Authorizer for Permit {
     fn authorize<'a>(
         &'a self,
@@ -137,6 +147,7 @@ fn command(text: &str) -> Command {
     Command {
         command: text.into(),
         timeout_seconds: 2,
+        explanation: None,
     }
 }
 
@@ -259,14 +270,17 @@ async fn default_authorization_and_invalid_binding_never_dispatch_ssh() {
         Command {
             command: "x\0y".into(),
             timeout_seconds: 1,
+            explanation: None,
         },
         Command {
             command: "x".repeat(4097),
             timeout_seconds: 1,
+            explanation: None,
         },
         Command {
             command: "x".into(),
             timeout_seconds: 0,
+            explanation: None,
         },
     ] {
         assert!(matches!(
@@ -396,6 +410,7 @@ async fn missing_exit_status_timeout_cancel_and_disconnect_are_unknown_without_r
                         }
                         .into(),
                         timeout_seconds: 1,
+                        explanation: None,
                     },
                     &token,
                 )
@@ -712,5 +727,263 @@ async fn informational_ssh_flow_control_before_exec_reply_keeps_result_and_termi
         "still interactive after exec",
     )
     .await;
+    b.terminals.shutdown().await;
+}
+
+#[tokio::test]
+async fn mirror_shows_command_results_and_exit_status_without_writing_to_the_pty() {
+    let settings = TerminalSettings {
+        poll_wait: Duration::from_millis(20),
+        ..Default::default()
+    };
+    let b = Bound::new(Spec::default(), settings).await;
+    let other = b
+        .terminals
+        .connect(open(&b.target.connection_id))
+        .await
+        .unwrap();
+    let executor = b.executor().await.with_authorizer(Arc::new(Permit));
+    let result = executor
+        .execute_command(
+            "mirror-unicode",
+            &command("__exec_unicode__"),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.stdout, "执行完成\n");
+    assert_eq!(result.stderr, "test stderr\n");
+    let display = output_contains(
+        &b.terminals,
+        &b.target.terminal_session_id,
+        "AI 工具 · 退出码 0",
+    )
+    .await;
+    assert!(display.contains("$ __exec_unicode__\r\n"));
+    assert!(display.contains("执行完成\r\n"));
+    assert!(display.contains("test stderr\r\n"));
+    assert!(!display.contains('\u{fffd}'));
+    assert!(
+        b.fixture.stats.inputs.lock().unwrap().is_empty(),
+        "display must never go over SSH stdin"
+    );
+    let failed = executor
+        .execute_command(
+            "mirror-failed",
+            &command("__exec_fail__"),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(failed.exit_code, 7);
+    output_contains(
+        &b.terminals,
+        &b.target.terminal_session_id,
+        "AI 工具 · 退出码 7",
+    )
+    .await;
+    assert!(!b
+        .terminals
+        .read(&other.session_id)
+        .await
+        .output
+        .contains("AI 工具"));
+    b.terminals
+        .write(
+            &b.target.terminal_session_id,
+            "manual input stays manual".into(),
+        )
+        .await
+        .unwrap();
+    output_contains(
+        &b.terminals,
+        &b.target.terminal_session_id,
+        "manual input stays manual",
+    )
+    .await;
+    assert_eq!(
+        *b.fixture.stats.inputs.lock().unwrap(),
+        vec![b"manual input stays manual".to_vec()]
+    );
+    assert_eq!(
+        b.fixture.stats.execs.lock().unwrap().as_slice(),
+        ["__exec_unicode__", "__exec_fail__"]
+    );
+    b.terminals.shutdown().await;
+}
+
+#[tokio::test]
+async fn mirror_does_not_lock_manual_input_while_an_independent_tool_is_running() {
+    let b = Bound::new(Spec::default(), TerminalSettings::default()).await;
+    let executor = b.executor().await.with_authorizer(Arc::new(Permit));
+    let cancel = CancellationToken::new();
+    let stop = cancel.clone();
+    let running = tokio::spawn(async move {
+        executor
+            .execute_command("mirror-cancel", &command("__exec_quiet__"), &stop)
+            .await
+    });
+    eventually(|| !b.fixture.stats.execs.lock().unwrap().is_empty()).await;
+    b.terminals
+        .write(&b.target.terminal_session_id, "manual while AI runs".into())
+        .await
+        .unwrap();
+    output_contains(
+        &b.terminals,
+        &b.target.terminal_session_id,
+        "manual while AI runs",
+    )
+    .await;
+    cancel.cancel();
+    assert!(matches!(
+        running.await.unwrap(),
+        Err(ssh_tools::Error::OutcomeUnknown)
+    ));
+    output_contains(&b.terminals, &b.target.terminal_session_id, "结果未知").await;
+    assert_eq!(b.fixture.stats.execs.lock().unwrap().len(), 1);
+    assert_eq!(
+        *b.fixture.stats.inputs.lock().unwrap(),
+        vec![b"manual while AI runs".to_vec()]
+    );
+    assert!(
+        b.terminals
+            .connected(&b.target.terminal_session_id)
+            .connected
+    );
+    b.terminals.shutdown().await;
+}
+
+#[tokio::test]
+async fn shared_shell_keeps_root_identity_and_excludes_manual_and_background_output() {
+    let b = Bound::new(Spec::default(), TerminalSettings::default()).await;
+    b.terminals
+        .write(&b.target.terminal_session_id, "sudo -i\r".into())
+        .await
+        .unwrap();
+    let executor = b
+        .executor()
+        .await
+        .with_terminal_shell()
+        .with_authorizer(Arc::new(ShellPermit));
+    let result = executor
+        .execute_command(
+            "current-root",
+            &command("whoami"),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.stdout, "root\n");
+    assert_eq!(result.stderr, "test stderr\n");
+    assert!(!serde_json::to_string(&result)
+        .unwrap()
+        .contains("MANUAL_BACKGROUND"));
+    let display = output_contains(
+        &b.terminals,
+        &b.target.terminal_session_id,
+        "root@fixture:~# ",
+    )
+    .await;
+    assert!(display.contains("MANUAL_BACKGROUND_NOT_A_TOOL_RESULT"));
+    assert!(display.contains("root\r\n"));
+    assert!(display.contains("whoami\r\n"));
+    assert!(!display.contains("AI 工具"));
+    assert!(!display.contains("ShellPilot"));
+    assert!(!display.contains("command eval"));
+    assert!(!display.contains("/tmp/shellpilot-tool"));
+    b.terminals
+        .write(&b.target.terminal_session_id, "MANUAL_AFTER\r".into())
+        .await
+        .unwrap();
+    output_contains(&b.terminals, &b.target.terminal_session_id, "MANUAL_AFTER").await;
+    assert_eq!(b.fixture.stats.execs.lock().unwrap().as_slice(), ["whoami"]);
+    assert_eq!(b.fixture.stats.collectors.load(Ordering::SeqCst), 1);
+    b.terminals.shutdown().await;
+}
+
+#[tokio::test]
+async fn shared_shell_rejects_manual_input_during_capture_and_never_retries_unknown() {
+    let b = Bound::new(Spec::default(), TerminalSettings::default()).await;
+    let executor = b
+        .executor()
+        .await
+        .with_terminal_shell()
+        .with_authorizer(Arc::new(ShellPermit));
+    let cancel = CancellationToken::new();
+    let stop = cancel.clone();
+    let running = tokio::spawn(async move {
+        executor
+            .execute_command("shared-running", &command("__exec_quiet__"), &stop)
+            .await
+    });
+    eventually(|| !b.fixture.stats.execs.lock().unwrap().is_empty()).await;
+    let count = b.fixture.stats.inputs.lock().unwrap().len();
+    let error = b
+        .terminals
+        .write(
+            &b.target.terminal_session_id,
+            "MUST_NOT_ENTER_TOOL\r".into(),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("手工输入未发送"));
+    assert_eq!(b.fixture.stats.inputs.lock().unwrap().len(), count);
+    cancel.cancel();
+    assert!(matches!(
+        running.await.unwrap(),
+        Err(ssh_tools::Error::OutcomeUnknown)
+    ));
+    let next = b
+        .executor()
+        .await
+        .with_terminal_shell()
+        .with_authorizer(Arc::new(ShellPermit));
+    assert!(matches!(
+        next.execute_command(
+            "new-call-after-unknown",
+            &command("whoami"),
+            &CancellationToken::new()
+        )
+        .await,
+        Err(ssh_tools::Error::TerminalNotReady)
+    ));
+    assert_eq!(b.fixture.stats.execs.lock().unwrap().len(), 1);
+    b.terminals
+        .write(&b.target.terminal_session_id, "\u{3}".into())
+        .await
+        .unwrap();
+    b.terminals.shutdown().await;
+}
+
+#[tokio::test]
+async fn shared_shell_manual_changes_during_approval_invalidate_the_old_command() {
+    let b = Bound::new(Spec::default(), TerminalSettings::default()).await;
+    let gate = Arc::new(Gate::new());
+    let executor = b
+        .executor()
+        .await
+        .with_terminal_shell()
+        .with_authorizer(gate.clone());
+    let running = tokio::spawn(async move {
+        executor
+            .execute_command(
+                "approval-before-sudo",
+                &command("whoami"),
+                &CancellationToken::new(),
+            )
+            .await
+    });
+    gate.entered.cancelled().await;
+    b.terminals
+        .write(&b.target.terminal_session_id, "sudo -i\r".into())
+        .await
+        .unwrap();
+    gate.release.cancel();
+    assert!(matches!(
+        running.await.unwrap(),
+        Err(ssh_tools::Error::TaskChanged)
+    ));
+    assert!(b.fixture.stats.execs.lock().unwrap().is_empty());
+    assert_eq!(b.fixture.stats.collectors.load(Ordering::SeqCst), 0);
     b.terminals.shutdown().await;
 }
