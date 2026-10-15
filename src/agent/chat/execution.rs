@@ -498,9 +498,9 @@ impl Manager {
         running.observation = Some(observation.clone());
         let (reporter, mut updates) = Reporter::channel(observation.clone());
         let (tx, mut events) = tokio::sync::mpsc::channel(64);
-        let session =
-            ToolSession::new(executor).managed(request.clone(), owner.clone(), tx, reporter);
-        // Native tool execution is nonstreaming at the provider; Channel emits real tool/result events.
+        let partial=running.partial.clone();
+        let session = ToolSession::new(executor).managed(request.clone(), owner.clone(), tx, reporter,partial.clone());
+        // Model deltas and tool events share the same ordered Channel.
         let operation = session.run(
             &request.request_id,
             &request.message,
@@ -520,7 +520,8 @@ impl Manager {
                 result=&mut operation=>break result.map_err(tool_error),
                 _=tick.tick()=>{
                     let turns=Turns::new(self.store.clone());let r=request.clone();let who=owner.clone();let observed=observation.clone();
-                    if !worker(move||{observed.heartbeat()?;turns.checkpoint_partial(&r,&who,None)}).await?{token.cancel();}
+                    let text=partial.lock().map_err(|_|Error::Storage)?.clone();
+                    if !worker(move||{observed.heartbeat()?;turns.checkpoint_partial(&r,&who,Some(&text))}).await?{token.cancel();}
                 }
             }
         };
@@ -540,7 +541,7 @@ impl Manager {
             .as_ref()
             .ok()
             .and_then(|r| r.content.clone().or_else(|| r.refusal.clone()))
-            .unwrap_or_default();
+            .unwrap_or_else(||partial.lock().map(|text|text.clone()).unwrap_or_default());
         let state = if token.is_cancelled() || cancel.is_cancelled() {
             TurnState::Cancelled
         } else if result.is_ok() {

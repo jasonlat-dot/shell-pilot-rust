@@ -130,6 +130,10 @@ pub trait ToolExecutor: Send + Sync {
 }
 /// Trusted native persistence and context hooks; model payloads cannot install them.
 pub trait LoopContext: Send + Sync {
+    fn streams_replies(&self) -> bool { false }
+    fn text_delta<'a>(&'a self,_text:String,_cancel:&'a CancellationToken)->BoxFuture<'a,super::provider::Result<()>> {
+        Box::pin(async {Ok(())})
+    }
     fn continue_after_reply<'a>(
         &'a self,
         _reply: &'a AssistantReply,
@@ -272,7 +276,9 @@ impl<'a> ToolLoop<'a> {
             }
             self.boundary(client)?;
             self.model_rounds += 1;
-            let reply = client.complete(&self.request, cancel).await?.message;
+            let reply = if let Some(context)=self.context.filter(|context|context.streams_replies()) {
+                client.stream_tools(&self.request,cancel,|text|context.text_delta(text,cancel)).await?.message
+            } else {client.complete(&self.request, cancel).await?.message};
             if reply.tool_calls.is_empty() {
                 if let Some(context) = self.context {
                     if context.continue_after_reply(&reply, cancel).await? {

@@ -53,6 +53,7 @@ pub struct ToolSession {
     data: Arc<Mutex<Option<Data>>>,
     managed: Option<(chat::Request, String)>,
     events: Option<tokio::sync::mpsc::Sender<chat::StreamEvent>>,
+    partial: Arc<Mutex<String>>,
     reporter: context_status::Reporter,
 }
 async fn worker<T: Send + 'static>(
@@ -75,6 +76,7 @@ impl ToolSession {
             data: Arc::new(Mutex::new(None)),
             managed: None,
             events: None,
+            partial: Arc::new(Mutex::new(String::new())),
             reporter: context_status::Reporter::default(),
         }
     }
@@ -84,9 +86,11 @@ impl ToolSession {
         owner: String,
         events: tokio::sync::mpsc::Sender<chat::StreamEvent>,
         reporter: context_status::Reporter,
+        partial: Arc<Mutex<String>>,
     ) -> Self {
         self.managed = Some((request, owner));
         self.events = Some(events);
+        self.partial = partial;
         self.reporter = reporter;
         self
     }
@@ -207,7 +211,10 @@ impl ToolSession {
         };
         let client = ModelClient::new(runtime)?;
         let mut reply = loop_.run(&client, self, cancel).await?;
-        if let Ok(guard) = self.data.lock() {
+        if self.streams_replies() {
+            reply.content = Some(self.partial.lock().map_err(|_|tool_loop::Error::Context)?.clone());
+            reply.refusal = None;
+        } else if let Ok(guard) = self.data.lock() {
             if let Some(data) = guard.as_ref() {
                 if !data.intermediate.is_empty() {
                     reply.content = Some(format!(
@@ -267,6 +274,24 @@ fn ensure_current(repository: &Repository, data: &Data) -> tool_loop::Result<()>
     Ok(())
 }
 impl LoopContext for ToolSession {
+    fn streams_replies(&self)->bool {self.events.is_some()}
+    fn text_delta<'a>(&'a self,text:String,cancel:&'a CancellationToken)->BoxFuture<'a,provider::Result<()>> {
+        Box::pin(async move {
+            if cancel.is_cancelled(){return Err(provider::ModelError::Cancelled);}
+            {
+                let mut partial=self.partial.lock().map_err(|_|provider::ModelError::Database)?;
+                if partial.len().saturating_add(text.len())>16000{return Err(provider::ModelError::ResponseTooLarge);}
+                partial.push_str(&text);
+            }
+            if let Some(events)=&self.events {
+                tokio::select!{biased;
+                    _=cancel.cancelled()=>return Err(provider::ModelError::Cancelled),
+                    result=events.send(chat::StreamEvent::Text{content:text})=>result.map_err(|_|provider::ModelError::Cancelled)?,
+                }
+            }
+            Ok(())
+        })
+    }
     fn continue_after_reply<'a>(
         &'a self,
         reply: &'a AssistantReply,
@@ -276,7 +301,7 @@ impl LoopContext for ToolSession {
             if cancel.is_cancelled() {
                 return Err(tool_loop::Error::Cancelled);
             }
-            self.apply_inputs(Some(reply.clone()), true).await
+            self.apply_inputs(Some(reply.clone()), true,cancel).await
         })
     }
     fn before_model<'a>(
@@ -301,6 +326,7 @@ impl LoopContext for ToolSession {
             let binding = self.executor.binding().tool.clone();
             let calls = calls.to_vec();
             let text = text.filter(|t| !t.trim().is_empty()).map(str::to_owned);
+            let text_present = text.is_some();
             let notifications = calls.clone();
             worker(move||{
                 let mut guard=data.lock().map_err(|_|tool_loop::Error::Context)?;
@@ -318,6 +344,9 @@ impl LoopContext for ToolSession {
                 data.pending=calls.into_iter().map(|call|Pending{id:call.id,started:false,capture:None}).collect();
                 Ok(())
             }).await?;
+            if self.streams_replies()&&text_present {
+                self.text_delta("\n\n".into(),cancel).await?;
+            }
             if let Some(events) = &self.events {
                 for call in notifications {
                     let args: Value =

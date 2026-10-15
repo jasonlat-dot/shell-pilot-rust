@@ -15,6 +15,7 @@ impl ToolSession {
         &self,
         reply: Option<provider::AssistantReply>,
         close: bool,
+        cancel: &CancellationToken,
     ) -> tool_loop::Result<bool> {
         let Some((request, _)) = self.managed.clone() else {
             return Ok(false);
@@ -73,12 +74,11 @@ impl ToolSession {
                         .as_deref()
                         .or(c.message.refusal.as_deref())
                 }) {
-                    events
-                        .send(chat::StreamEvent::Text {
-                            content: format!("{text}\n\n"),
-                        })
-                        .await
-                        .map_err(|_| tool_loop::Error::Context)?;
+                    if self.streams_replies() {
+                        self.text_delta("\n\n".into(),cancel).await?;
+                    } else {
+                        events.send(chat::StreamEvent::Text {content:format!("{text}\n\n")}).await.map_err(|_|tool_loop::Error::Context)?;
+                    }
                 }
                 for input in &inputs.0 {
                     events
@@ -156,7 +156,7 @@ impl ToolSession {
         if cancel.is_cancelled() {
             return Err(tool_loop::Error::Cancelled);
         }
-        self.apply_inputs(None, false).await?;
+        self.apply_inputs(None, false,cancel).await?;
         let frame = self.frame().await?;
         let available = self.executor.verify().await.is_ok();
         let initial = project(

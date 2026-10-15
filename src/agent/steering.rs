@@ -203,10 +203,11 @@ pub(crate) fn final_text(
     request: &str,
     text: &str,
 ) -> Result<String> {
-    let prefix = format!("{request}:step:");
-    let mut q=db.prepare("SELECT payload FROM agent_events WHERE session_id=?1 AND substr(request_id,1,length(?2))=?2 ORDER BY id LIMIT 32").map_err(storage)?;
+    // Tool commentary and steered model steps have already been journaled.
+    // Keep the full visible transcript in the turn, but not twice in model history.
+    let mut q=db.prepare("SELECT payload FROM agent_events WHERE session_id=?1 AND kind='assistant_message' AND id>(SELECT user_event_id FROM agent_chat_turns WHERE session_id=?1 AND request_id=?2) AND id<COALESCE((SELECT MIN(user_event_id) FROM agent_chat_turns WHERE session_id=?1 AND user_event_id>(SELECT user_event_id FROM agent_chat_turns WHERE session_id=?1 AND request_id=?2)),9223372036854775807) ORDER BY id LIMIT 64").map_err(storage)?;
     let values = q
-        .query_map(params![session, prefix], |r| r.get::<_, String>(0))
+        .query_map(params![session, request], |r| r.get::<_, String>(0))
         .map_err(storage)?
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(storage)?;
