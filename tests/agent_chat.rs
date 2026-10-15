@@ -306,10 +306,26 @@ async fn stop_interrupts_stream_and_same_session_cannot_overlap() {
             })
             .await
     });
-    tokio::time::timeout(Duration::from_secs(2), receiver.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    // Context status can arrive before admission or the first model delta.
+    // Interrupt only after the partial reply this scenario intends to recover.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match receiver
+                .recv()
+                .await
+                .expect("stream closed before partial reply")
+            {
+                StreamEvent::Context { .. } => continue,
+                StreamEvent::Text { content } => {
+                    assert_eq!(content, "partial");
+                    break;
+                }
+                event => panic!("unexpected event before partial reply: {event:?}"),
+            }
+        }
+    })
+    .await
+    .expect("partial reply did not arrive");
     assert!(matches!(
         f.manager
             .chat(r.clone(), None, &CancellationToken::new(), |_| async {
@@ -721,10 +737,26 @@ async fn aborting_a_future_recovers_partial_as_interrupted_instead_of_completing
             })
             .await
     });
-    tokio::time::timeout(Duration::from_secs(2), output.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    // Context status can arrive before admission or the first model delta.
+    // Interrupt only after the partial reply this scenario intends to recover.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match output
+                .recv()
+                .await
+                .expect("stream closed before partial reply")
+            {
+                StreamEvent::Context { .. } => continue,
+                StreamEvent::Text { content } => {
+                    assert_eq!(content, "partial");
+                    break;
+                }
+                event => panic!("unexpected event before partial reply: {event:?}"),
+            }
+        }
+    })
+    .await
+    .expect("partial reply did not arrive");
     run.abort();
     let _ = run.await;
     tokio::time::timeout(Duration::from_secs(2), async {

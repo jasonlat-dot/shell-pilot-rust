@@ -66,7 +66,7 @@ A0–A6、B1–B5、C1–C6（含 C4R）已完成当前文字阶段，D1 工具�
 
 2026-10-15 已核对客户端 test-rust-ui/9585898、Rust main/8565529；D1/D2 已在提交历史中，D2 提交为 05da511。既定客户端 b7a9735、Rust c4bd68d 均是当前 HEAD 的祖先。schema 已由本次迁移升至 12，客户端 Cargo 相对依赖 ../../ai-ssh-terminal-server-rust 与本机实际目录一致。本次保留中断会话的 D3 原生审批改动，未提交、推送或打包；远端推送状态未核对。
 
-D2 既有验证为 `cargo test --offline --test agent_ssh_tools --test agent_tool_loop --test terminal` 的 39/39；本次 D3 追加 `agent_approvals` 后定向验证为 50/50，严格 Clippy 和修改 Rust 文件格式检查通过。使用临时 SQLite、随机回环模型及本地模拟 SSH 服务器，不调用操作系统 shell 或用户服务器，不使用真实模型 Key。全目标回归在既有 agent_chat 两项首状态帧时序测试处失败，详见末尾 D3 记录；没有运行前端或 Tauri 测试。
+D2 既有验证为 `cargo test --offline --test agent_ssh_tools --test agent_tool_loop --test terminal` 的 39/39；本次 D3 追加 `agent_approvals` 后定向验证为 50/50，严格 Clippy 和修改 Rust 文件格式检查通过。使用临时 SQLite、随机回环模型及本地模拟 SSH 服务器，不调用操作系统 shell 或用户服务器，不使用真实模型 Key。此前全目标回归的 agent_chat 两项首状态帧时序测试已修复并定向验证 2/2 通过，详见末尾修复记录；本次未重跑全量、前端或 Tauri 测试。
 
 C4R 持久项目/作用域与历史恢复逻辑保留。用户随后提供新参考图并明确要求只修改页面：当前调整为左侧会话/SSH 上下分区、中央 Agent、右侧终端，设置分类与“终端”同级合并到左侧主导航，不保留设置页右侧重复栏；这项新要求覆盖之前 UI 撤销时的布局约束。历史仍按同一 sessionId/原 agentId 恢复，再连接/核对身份；新聊天才创建独立上下文，不合并不同服务器历史。
 
@@ -612,3 +612,9 @@ C6 在当前文字能力范围内勾选完成；下一项 **D1 主模型工具�
 验证结果：`cargo test --offline --test agent_approvals --test agent_ssh_tools --test agent_tool_loop --test terminal -- --test-threads=1` 为 50/50；`cargo clippy --offline --all-targets -- -D warnings` 通过；修改 Rust 文件 rustfmt 和 `git diff --check` 通过。全目标回归的既有 `agent_chat` 中两个依赖首个状态帧时序的测试仍失败：`stop_interrupts_stream_and_same_session_cannot_overlap` 在首帧尚未触发模型请求时检查请求数，`aborting_a_future_recovers_partial_as_interrupted_instead_of_completing_or_replaying` 在历史首项尚未写入时读取；单独复测仍重现，与本轮审批/SSH代码无调用路径。首次全量运行的 `response_and_sse_frame_limits_keep_the_delivered_prefix_without_retry` 也曾时序失败，但单独复测通过。其余全目标测试在失败前均通过。
 
 D3 完成边界：审批 API 只有可信原生宿主可调用，桌面审批入口、服务器选择/绑定、工具结果面板和真实本地 SSH 协议回归归 D5；完整输出存储/回查、工具批次整理与错误分类归 D4。没有运行真实模型、用户远端或打包。
+### 2026-10-15：聊天停止/中断测试同步条件修复完成
+
+- [x] 修复 `tests/agent_chat.rs` 的 `stop_interrupts_stream_and_same_session_cannot_overlap` 和 `aborting_a_future_recovers_partial_as_interrupted_instead_of_completing_or_replaying`：上下文 Context 状态可在轮次准入、模型请求和正文前送出，原测试只等任意首帧便停止/abort，导致请求计数竞态或空历史越界。
+- 两项测试现在在原有 2 秒上限内消费 Context，明确收到并断言 Text 正文为 `partial` 后再停止/abort；异常结束或错误帧明确失败。首个正文在 `src/agent/chat.rs` 中先写入部分回复再送出，满足这些场景要求的已准入且已有部分正文前提。保留原有 Interrupted、partial_text、Busy、错误归属、请求计数及不重复请求断言，没有延长等待时间或改变生产逻辑。
+- 验证：`cargo test --offline --test agent_chat -- stop_interrupts_stream_and_same_session_cannot_overlap aborting_a_future_recovers_partial_as_interrupted_instead_of_completing_or_replaying --exact --test-threads=1`：2/2 通过，16 项被过滤。`rustfmt --edition 2021 --check tests/agent_chat.rs`、`git diff --check` 通过。
+- 本次仅修复这两个测试并同步进度；未重跑其余测试、前端、Tauri 或全量回归，未连接真实模型或用户服务器，未提交、推送或打包。前文 D3 的失败描述保留为当时记录，当前这两项已通过；下一项仍为 D4。
