@@ -1,5 +1,6 @@
 //! Persistent context, native model adapters, text turns and the D1 tool-loop kernel.
 //! Desktop chat does not dispatch tools until target binding and approval are integrated.
+pub mod approvals;
 pub mod budget;
 pub mod chat;
 pub mod compact;

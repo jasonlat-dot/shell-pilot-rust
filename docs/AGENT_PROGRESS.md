@@ -1,6 +1,6 @@
 # Rust SSH Agent 实施清单与续接入口
 
-更新日期：2026-10-15。状态：阶段 5 实施中，A/B/C 当前文字阶段、D1 工具循环及 D2 SSH 目标绑定/原生执行器已完成。D2 默认拒绝授权，尚未开放桌面命令执行；下一项 D3：命令策略、明确审批与持久执行准入/恢复。
+更新日期：2026-10-15。状态：阶段 5 实施中，A/B/C 当前文字阶段、D1 工具循环、D2 SSH 目标绑定/原生执行器及 D3 原生审批内核已完成。D3 仍是原生宿主能力，桌面命令入口与执行结果 UI 留给 D5；下一项 D4：工具批次、完整输出回查与产品调用链。
 用户要求：参考 Codex CLI 优化上下文和工具决策；先列清单，每完成一项更新标记，供换窗口后续接。当前不打包。需要修改前端的阶段同步修改 test-rust-ui。
 源码参考与设计依据：[CODEX_AGENT_REFERENCE.md](CODEX_AGENT_REFERENCE.md)。本文件是进度唯一入口，完成标记必须有代码与验证证据，不以“已设计”替代“已实现”。
 
@@ -8,7 +8,7 @@ Rust 重构交接、已完成工作与运行方式见 [WORK_HANDOFF_2026-10-14.m
 
 ## 工作区与约束
 
-- 客户端分支 test-rust-ui，最新已核对提交 9585898；Rust 业务库分支 main，最新提交 1862335（D1 工具循环）。本轮 D2 开始前两个工作区均干净；本轮修改未提交，远端推送状态未核对。
+- 客户端分支 test-rust-ui，最新已核对提交 9585898；Rust 业务库分支 main，基线 8565529（仓库/目录布局说明），包含 05da511（D2）和 1862335（D1）。2026-10-15 D3 接续时 Rust 工作区保留中断会话的未提交审批改动，客户端没有改动；远端推送状态未核对。
 - 项目、参考源码和工具位置由本机环境决定；跨电脑续接时按实际位置核对 Cargo 依赖，不沿用旧电脑的绝对路径。
 - 当前源码未重新打包；已有 0.4.0 安装包不能代表最新功能。
 - 保留各仓库已有未提交变更；不连接用户远端、不执行实际变更命令来做测试。
@@ -47,8 +47,8 @@ Rust 重构交接、已完成工作与运行方式见 [WORK_HANDOFF_2026-10-14.m
 
 ### D. 工具决策与执行
 - [x] D1 主模型工具循环与严格参数校验：Chat Completions 非流式原生内核、宿主工具白名单、闭合 schema 子集、本地参数校验、有界循环与取消/未知结果保护；9 项定向测试及严格 Clippy 通过。尚未接入桌面聊天或持久执行恢复；Responses 工具协议仍未开放。辅助意图标签不作为授权或强制路由。
-- [x] D2 SSH 工具执行绑定 connectionId/terminalSessionId/taskId；实际目标状态复核。新增可注册的 ssh_execute 原生处理器、同认证传输的独立 exec 通道、任务/归属/主机身份/连接配置复核及未知结果保护；默认授权拒绝。新增 8、D1 9、既有终端 22 项及严格 Clippy 通过；前端仍未开放，持久审批/去重留给 D3。
-- [ ] D3 命令策略和明确执行确认；持久授权范围，取消/结果未知/恢复时不盲目重执行。
+- [x] D2 SSH 工具执行绑定 connectionId/terminalSessionId/taskId；实际目标状态复核。新增可注册的 ssh_execute 原生处理器、同认证传输的独立 exec 通道、任务/归属/主机身份/连接配置复核及未知结果保护；默认授权拒绝。新增 8、D1 9、既有终端 22 项及严格 Clippy 通过；前端仍未开放。
+- [x] D3 命令策略和明确执行确认；持久授权范围，取消/结果未知/恢复时不盲目重执行。新增 schema 12 的原生审批请求、任务/命令精确授权、策略 CAS、原子 admitted 准入、完成回执与 unknown 永久阻断；前端审批入口和结果展示归 D5。
 - [ ] D4 工具批次、输出回查与错误分类；执行失败不自动判为意图偏差。
 - [ ] D5 前端执行确认/绑定服务器/工具结果 UI 和真实本地 SSH 协议回归。
 
@@ -62,15 +62,15 @@ Rust 重构交接、已完成工作与运行方式见 [WORK_HANDOFF_2026-10-14.m
 
 ## 当前进度与下一项
 
-A0–A6、B1–B5、C1–C6（含 C4R）已完成当前文字阶段，D1 工具循环与 D2 SSH 原生处理器已完成。C2/C3 整理、C4 可信上下文及 C5/C6 状态/恢复保持。D2 可以在原生宿主注册 ssh_execute 并在可信授权后执行，但桌面仍使用既有文本流；默认授权拒绝，旧摘要、模型参数或原生窗口不能授予命令权限。
+A0–A6、B1–B5、C1–C6（含 C4R）已完成当前文字阶段，D1 工具循环、D2 SSH 原生处理器与 D3 原生审批内核已完成。C2/C3 整理、C4 可信上下文及 C5/C6 状态/恢复保持。D3 可以在原生宿主持久保存审批、精确任务命令授权和执行回执；桌面仍使用既有文本流，命令入口与结果 UI 留给 D5。默认授权拒绝，旧摘要、模型参数或原生窗口不能授予命令权限。
 
-当前已核对客户端 test-rust-ui/9585898、Rust main/1862335，D1 已由用户提交。本轮 D2 开始前工作区干净，未提交、推送或打包本轮修改。schema 仍为 11；本轮仅修改 Rust 代码、定向测试和重构文档，不修改前端或 IPC。
+2026-10-15 已核对客户端 test-rust-ui/9585898、Rust main/8565529；D1/D2 已在提交历史中，D2 提交为 05da511。既定客户端 b7a9735、Rust c4bd68d 均是当前 HEAD 的祖先。schema 已由本次迁移升至 12，客户端 Cargo 相对依赖 ../../ai-ssh-terminal-server-rust 与本机实际目录一致。本次保留中断会话的 D3 原生审批改动，未提交、推送或打包；远端推送状态未核对。
 
-本轮 D2 运行 `cargo test --offline --test agent_ssh_tools --test agent_tool_loop --test terminal`：新增 8、D1 9、受共享连接池影响的终端 22 项，共 39/39 通过；对应严格 Clippy 和修改 Rust 文件格式检查通过。使用临时 SQLite、随机回环模型及本地模拟 SSH 服务器，不调用操作系统 shell 或用户服务器，不使用真实模型 Key。没有运行全项目、前端或 Tauri 测试。
+D2 既有验证为 `cargo test --offline --test agent_ssh_tools --test agent_tool_loop --test terminal` 的 39/39；本次 D3 追加 `agent_approvals` 后定向验证为 50/50，严格 Clippy 和修改 Rust 文件格式检查通过。使用临时 SQLite、随机回环模型及本地模拟 SSH 服务器，不调用操作系统 shell 或用户服务器，不使用真实模型 Key。全目标回归在既有 agent_chat 两项首状态帧时序测试处失败，详见末尾 D3 记录；没有运行前端或 Tauri 测试。
 
 C4R 持久项目/作用域与历史恢复逻辑保留。用户随后提供新参考图并明确要求只修改页面：当前调整为左侧会话/SSH 上下分区、中央 Agent、右侧终端，设置分类与“终端”同级合并到左侧主导航，不保留设置页右侧重复栏；这项新要求覆盖之前 UI 撤销时的布局约束。历史仍按同一 sessionId/原 agentId 恢复，再连接/核对身份；新聊天才创建独立上下文，不合并不同服务器历史。
 
-下一项 D3：命令策略、可信明确审批、持久执行准入/副作用去重，以及取消/未知结果恢复。D2 的 Authorizer 只是默认拒绝的原生接点，不等于审批系统已完成；复核任务后发送 exec 的检查也不等于持久事务准入。D4/D5 再连接完整输出/回查、工具批次整理、产品调用链与 UI。工具循环仍只支持 Chat Completions 非流式，Responses 工具协议与工具流尚未开放。聊天附件与真实媒体预算、记忆待 E。本轮没有新增前端执行入口，现有文字对话保持。
+下一项 D4：工具批次、完整输出/回查、错误分类与产品调用链。D3 的审批 API 仍由可信原生宿主调用；D5 再连接桌面执行确认、服务器绑定、工具结果 UI 和真实本地 SSH 协议回归。工具循环仍只支持 Chat Completions 非流式，Responses 工具协议与工具流尚未开放。聊天附件与真实媒体预算、记忆待 E。本轮没有新增前端执行入口，现有文字对话保持。
 
 ## 验证与完成记录
 
@@ -590,3 +590,25 @@ C6 在当前文字能力范围内勾选完成；下一项 **D1 主模型工具�
 - `cargo test --offline --test agent_ssh_tools --test agent_tool_loop --test terminal`：8 + 9 + 22，共 **39/39 通过**。共享认证/连接池有修改，因此运行既有终端目标，未扩大到全部业务测试。
 - `cargo clippy --offline --lib --test agent_ssh_tools --test agent_tool_loop --test terminal -- -D warnings`、修改 Rust 文件 rustfmt 检查与 `git diff --check` 通过。测试全部使用临时 SQLite、随机回环模型与本地模拟 SSH；未访问真实模型或用户远端，没有运行前端/Tauri/GUI。
 - 下一项 **D3：命令策略、明确审批、持久执行准入与结果未知恢复**。D4/D5 随后接完整输出、工具批次整理、产品链路和 UI；Responses 工具协议/工具流仍未开放。
+
+
+### 工作进度同步（2026-10-15）
+
+- 实际代码：客户端 test-rust-ui/9585898，Rust main/8565529（包含 D2/05da511、D1/1862335）；同步开始前 git status 均为空。此前“D2 未提交”是上次交接时状态，本次已修正顶部当前状态和交接续接提示，保留历史阶段记录。
+- 核对 src/agent/tool_loop.rs、ssh_tools.rs、terminal/agent_exec.rs、context_status.rs 与 schema 11 初始化；D1/D2 模块存在，SSH Authorizer 的生产默认仍拒绝；客户端/Tauri 未注册 ssh_execute 或接入主模型工具循环。桌面仍为文本 Agent，手动 SSH 终端可用。
+- 当前 UI 是后续新要求确定的左侧会话/SSH、中央 Agent、右侧终端及统一主导航；不以早期撤销布局说明作为当前界面约束。项目历史恢复与同身份重连逻辑保留，普通聊天不随终端页签自动改绑。
+- 已完成 A0–A6、B1–B5、当前文字阶段 C1–C6/C4R，以及原生内核 D1/D2；下一项 D3（命令策略、明确审批、持久执行准入/去重和结果未知恢复）。D4/D5 产品执行链路、完整输出与 UI，E 附件/记忆/高级能力仍待办；Responses 工具协议未开放。
+- 本次是源码/提交/文档核对，不重复已有通过的测试。D2 的最近验证仍为 SSH 工具 8、工具循环 9、终端 22，共 39/39 和严格 Clippy；不能将此记录描述为本次全项目重测。未连接真实服务器、未调用真实模型、未构建安装包。
+
+### D3：2026-10-15 原生审批、执行准入与未知结果恢复完成
+
+本次接续中断会话留下的未提交代码，实际已经在 D2 SSH 执行器上推进了 D3。保留这些改动并完成验证，没有接入桌面命令入口，也没有把原生内核描述为用户界面可用。
+
+- `src/agent/approvals.rs` 新增 native-only 审批存储：请求与 `sessionId/userId/taskId/callId` 绑定，保存完整任务/目标/命令快照；`Policy` 通过 revision CAS 设置为 deny/confirm，明确 `ApproveOnce` 或精确 task-command grant，策略变更撤销旧 grant 并取消待处理请求。
+- `migrations/012_agent_execution_approvals.sql` 持久化 pending/approved/denied/cancelled/expired/admitted/completed/notSent/unknown 状态、审批范围、结果回执和时间边界；`Store` 启动时加载 schema 12。已有会话、事件和检查点保持可读。
+- `src/agent/ssh_tools.rs` 通过 `with_approvals` 仅由可信原生宿主开启 D3 流程；审批等待、任务/连接/终端/主机信任复核、独立 exec 通道和 admitted 事务按顺序执行。已完成回执只读重放； admitted 后取消、超时、断线、进程退出缺少可信结果均标记 unknown，新 callId 或重启后也拒绝自动重发。旧 `Authorizer` 兼容路径仍逐调用决策并写入同一回执，默认构造仍拒绝。
+- `tests/agent_approvals.rs` 新增 11 项：拒绝/归属、一次性回执重放、并发去重、精确任务命令授权与撤销、开通道期间撤销、策略 CAS、取消/任务变化/断线、过期、unknown 重启恢复、新任务/新终端隔离和原生撤回。
+
+验证结果：`cargo test --offline --test agent_approvals --test agent_ssh_tools --test agent_tool_loop --test terminal -- --test-threads=1` 为 50/50；`cargo clippy --offline --all-targets -- -D warnings` 通过；修改 Rust 文件 rustfmt 和 `git diff --check` 通过。全目标回归的既有 `agent_chat` 中两个依赖首个状态帧时序的测试仍失败：`stop_interrupts_stream_and_same_session_cannot_overlap` 在首帧尚未触发模型请求时检查请求数，`aborting_a_future_recovers_partial_as_interrupted_instead_of_completing_or_replaying` 在历史首项尚未写入时读取；单独复测仍重现，与本轮审批/SSH代码无调用路径。首次全量运行的 `response_and_sse_frame_limits_keep_the_delivered_prefix_without_retry` 也曾时序失败，但单独复测通过。其余全目标测试在失败前均通过。
+
+D3 完成边界：审批 API 只有可信原生宿主可调用，桌面审批入口、服务器选择/绑定、工具结果面板和真实本地 SSH 协议回归归 D5；完整输出存储/回查、工具批次整理与错误分类归 D4。没有运行真实模型、用户远端或打包。

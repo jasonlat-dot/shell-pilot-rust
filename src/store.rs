@@ -46,6 +46,9 @@ impl Store {
         database.execute_batch(include_str!("../migrations/009_agent_scopes.sql"))?;
         database.execute_batch(include_str!("../migrations/010_agent_projects.sql"))?;
         database.execute_batch(include_str!("../migrations/011_agent_context_status.sql"))?;
+        database.execute_batch(include_str!(
+            "../migrations/012_agent_execution_approvals.sql"
+        ))?;
         Ok(Self {
             database: Mutex::new(database),
             data_directory: None,

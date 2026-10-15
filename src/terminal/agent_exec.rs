@@ -1,6 +1,7 @@
 //! Exec on the originating terminal's authenticated transport, never a profile reconnect.
 use super::*;
 
+#[derive(Clone)]
 pub(crate) struct Lease {
     session: Arc<Session>,
 }

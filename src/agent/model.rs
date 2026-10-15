@@ -237,7 +237,7 @@ pub struct TaskRequest {
 
 /// Authored by the application from a trusted task snapshot, never by model arguments.
 /// This identifies the target; it does not grant permission to execute a command.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolBinding {
     pub task_id: String,
     pub target: Target,

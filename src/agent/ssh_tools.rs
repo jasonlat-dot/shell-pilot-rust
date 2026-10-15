@@ -1,6 +1,7 @@
 //! D2 task-bound SSH handler. Native callers must provide trusted authorization;
-//! the default is deny. Desktop/model exposure and durable approval arrive in D3–D5.
+//! the default is deny. D3 persists approval/admission; desktop exposure remains in D5.
 use super::{
+    approvals::{self, Approvals, Context, Input, Start, State},
     provider::FunctionDefinition,
     tool_loop::{ToolExecutor, ToolOutcome, ToolRegistry, ValidatedCall},
     Repository, Scope, ScopeKind, ServerIdentity, Task, ToolBinding,
@@ -30,7 +31,7 @@ pub fn definition() -> FunctionDefinition {
         },"required":["command","timeoutSeconds"],"additionalProperties":false}),
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshBinding {
     pub session_id: String,
     pub user_id: String,
@@ -38,7 +39,7 @@ pub struct SshBinding {
     pub identity: ServerIdentity,
 }
 // Deliberately not Debug: command text may contain sensitive data.
-#[derive(Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Command {
     pub command: String,
@@ -51,7 +52,7 @@ pub struct AuthorizationRequest<'a> {
 }
 pub trait Authorizer: Send + Sync {
     /// Trusted host hook, never deserialized from model arguments or summaries.
-    /// D3 implements persisted policy/approval and admission here. Returning true
+    /// Legacy native hooks supply a one-call decision, still journaled by D3. Returning true
     /// must apply to this exact task, live identity, call and command.
     fn authorize<'a>(
         &'a self,
@@ -87,9 +88,15 @@ pub enum Error {
     Unavailable,
     #[error("SSH execution outcome is unknown; do not automatically repeat it")]
     OutcomeUnknown,
+    #[error("Execution is already preparing or awaiting approval")]
+    Busy,
+    #[error("Call ID conflicts with persisted execution input")]
+    Conflict,
+    #[error("Execution approval/storage unavailable")]
+    Storage,
 }
 pub type Result<T> = std::result::Result<T, Error>;
-#[derive(Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandResult {
     pub task_id: String,
@@ -100,8 +107,8 @@ pub struct CommandResult {
     pub stderr: String,
     pub truncated: bool,
 }
-#[derive(PartialEq, Eq)]
-struct Profile {
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Profile {
     host: String,
     port: u16,
     username: String,
@@ -134,6 +141,8 @@ pub struct SshExecutor {
     scope: Option<Scope>,
     profile: Profile,
     authorizer: Arc<dyn Authorizer>,
+    approvals: Approvals,
+    durable_approval: bool,
 }
 impl SshExecutor {
     /// Reads a persisted *active targeted task*. General/offline text sessions do not
@@ -200,6 +209,8 @@ impl SshExecutor {
             }
         }
         Ok(Self {
+            approvals: Approvals::new(store.clone()),
+            durable_approval: false,
             store,
             terminals,
             lease,
@@ -220,7 +231,17 @@ impl SshExecutor {
     }
     pub fn with_authorizer(mut self, authorizer: Arc<dyn Authorizer>) -> Self {
         self.authorizer = authorizer;
+        self.durable_approval = false;
         self
+    }
+    /// Native only: enable the pending/decision workflow. No model or IPC parameter can install it.
+    pub fn with_approvals(mut self, approvals: Approvals) -> Result<Self> {
+        if !approvals.shares_store(&self.store) {
+            return Err(Error::TargetMismatch);
+        }
+        self.approvals = approvals;
+        self.durable_approval = true;
+        Ok(self)
     }
     pub fn register(&self, registry: &mut ToolRegistry) -> super::tool_loop::Result<()> {
         registry.register(definition())
@@ -254,8 +275,8 @@ impl SshExecutor {
             .check_agent_lease(&self.lease)
             .map_err(|_| Error::TargetUnavailable)
     }
-    /// Native dispatch surface; not an IPC command. It always calls the authorizer.
-    /// There is no persisted execution receipt yet; D3 must provide admission/dedup.
+    /// Native dispatch surface; not an IPC command. Authorization is host-owned; replays are read-only.
+    /// Every call uses durable at-most-once admission. Replays return receipts, never execute.
     pub async fn execute_command(
         &self,
         call_id: &str,
@@ -275,39 +296,134 @@ impl SshExecutor {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        self.verify().await?;
-        let authorized = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(Error::Cancelled),
-            result = self.authorizer.authorize(AuthorizationRequest { binding: &self.binding, call_id, command }, cancel) => result,
+        let input = Input {
+            context: Context {
+                binding: self.binding.clone(),
+                task: self.task.clone(),
+                scope: self.scope.clone(),
+                profile: self.profile.clone(),
+            },
+            command: command.clone(),
         };
-        if !authorized {
-            return Err(Error::Denied);
+        let mut ticket = match self
+            .approvals
+            .begin(input, call_id.into(), self.durable_approval)
+            .await
+            .map_err(map_approval)?
+        {
+            Start::Replay(result) => return Ok(result),
+            Start::New(ticket) => ticket,
+        };
+        self.verify().await?;
+        if !self
+            .approvals
+            .is_approved(&ticket)
+            .await
+            .map_err(map_approval)?
+        {
+            if self.durable_approval {
+                let waiting = self.approvals.wait(&ticket, cancel);
+                let monitor = async {
+                    loop {
+                        self.verify().await?;
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                };
+                tokio::select! {biased;
+                    _=cancel.cancelled()=>return Err(Error::Cancelled),
+                    error=monitor=>{return error;},
+                    approved=waiting=>approved.map_err(map_approval)?,
+                }
+            } else {
+                let authorized = tokio::select! {
+                    biased;
+                    _=cancel.cancelled()=>return Err(Error::Cancelled),
+                    result=self.authorizer.authorize(AuthorizationRequest{binding:&self.binding,call_id,command},cancel)=>result,
+                };
+                if !authorized {
+                    self.approvals
+                        .decide(
+                            ticket.id.clone(),
+                            ticket.user.clone(),
+                            approvals::Decision::Deny,
+                        )
+                        .await
+                        .map_err(map_approval)?;
+                    return Err(Error::Denied);
+                }
+                self.approvals
+                    .approve_hook(&ticket)
+                    .await
+                    .map_err(map_approval)?;
+            }
         }
-        self.verify().await?; // Recheck after an approval wait, before opening a channel.
+        self.verify().await?;
         let channel = self
             .terminals
             .prepare_agent_exec(&self.lease, cancel)
             .await
             .map_err(map_exec)?;
-        self.verify().await?; // Recheck after asynchronous channel creation, before exec.
+        self.verify().await?;
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let terminals = self.terminals.clone();
+        // The lease is not reconstructed from a tab or connection profile.
+        let lease = self.lease.clone();
+        let stop = cancel.clone();
+        self.approvals
+            .admit(&ticket, move || {
+                !stop.is_cancelled() && terminals.check_agent_lease(&lease).is_ok()
+            })
+            .await
+            .map_err(map_approval)?;
         let result = channel
             .run(
                 &command.command,
                 Duration::from_secs(command.timeout_seconds),
                 cancel,
             )
-            .await
-            .map_err(map_exec)?;
-        Ok(CommandResult {
-            task_id: self.binding.tool.task_id.clone(),
-            connection_id: self.binding.tool.target.connection_id.clone(),
-            terminal_session_id: self.binding.tool.target.terminal_session_id.clone(),
-            exit_code: result.exit_code,
-            stdout: result.stdout,
-            stderr: result.stderr,
-            truncated: result.truncated,
-        })
+            .await;
+        match result {
+            Ok(result) => {
+                let result = CommandResult {
+                    task_id: self.binding.tool.task_id.clone(),
+                    connection_id: self.binding.tool.target.connection_id.clone(),
+                    terminal_session_id: self.binding.tool.target.terminal_session_id.clone(),
+                    exit_code: result.exit_code,
+                    stdout: result.stdout,
+                    stderr: result.stderr,
+                    truncated: result.truncated,
+                };
+                self.approvals
+                    .finish(&mut ticket, State::Completed, Some(result.clone()))
+                    .await
+                    .map_err(|_| Error::OutcomeUnknown)?;
+                Ok(result)
+            }
+            Err(error) => {
+                let state = if matches!(error, ExecError::Unknown) {
+                    State::Unknown
+                } else {
+                    State::NotSent
+                };
+                self.approvals
+                    .finish(&mut ticket, state, None)
+                    .await
+                    .map_err(|_| Error::OutcomeUnknown)?;
+                Err(map_exec(error))
+            }
+        }
+    }
+}
+fn map_approval(error: approvals::Error) -> Error {
+    match error {
+        approvals::Error::Unknown => Error::OutcomeUnknown,
+        approvals::Error::Busy => Error::Busy,
+        approvals::Error::Conflict => Error::Conflict,
+        approvals::Error::Storage => Error::Storage,
+        approvals::Error::Stale => Error::TaskChanged,
+        _ => Error::Denied,
     }
 }
 fn map_exec(error: ExecError) -> Error {
