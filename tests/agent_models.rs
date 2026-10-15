@@ -339,7 +339,7 @@ fn schema_upgrade_preserves_existing_agent_sessions() {
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        15
+        16
     );
     assert_eq!(
         db.query_row("SELECT count(*) FROM agent_sessions", [], |r| r

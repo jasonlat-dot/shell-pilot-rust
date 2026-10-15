@@ -11,6 +11,97 @@ pub struct Project {
     pub identity: Option<ServerIdentity>,
     pub profile: Option<serde_json::Value>,
 }
+
+#[cfg(test)]
+mod history_status_tests {
+    use super::*;
+    use crate::store::Store;
+    use std::sync::Arc;
+
+    #[test]
+    fn history_waits_only_for_live_human_approvals_in_the_exact_session() {
+        let repo = Repository::new(Arc::new(Store::in_memory().unwrap()));
+        let chat = repo.create_general_session("model", "user").unwrap();
+        let other = repo.create_general_session("model", "user").unwrap();
+        for session in [&chat, &other] {
+            repo.append(
+                &session.id,
+                "user",
+                0,
+                "message",
+                Payload::UserMessage {
+                    text: "有历史的对话".into(),
+                },
+            )
+            .unwrap();
+        }
+        repo.db(|db| {
+            db.execute("INSERT INTO agent_execution_requests(id,session_id,user_id,task_id,call_id,request_json,state,created_at,expires_at,updated_at) VALUES('pending',?1,'user','task','call','{}','pending',0,?2,0)",params![chat.id,chrono::Utc::now().timestamp_millis()+300_000])?;
+            db.execute("INSERT INTO agent_execution_policies VALUES(?1,'task','confirm',1)",[&chat.id])?;
+            Ok(())
+        }).unwrap();
+        let status = || {
+            let chats = repo.project_chats("user", None, "").unwrap();
+            assert!(
+                !chats
+                    .items
+                    .iter()
+                    .find(|c| c.session_id == other.id)
+                    .unwrap()
+                    .awaiting_approval
+            );
+            chats
+                .items
+                .iter()
+                .find(|c| c.session_id == chat.id)
+                .unwrap()
+                .awaiting_approval
+        };
+        assert!(status());
+        for state in [
+            "approved",
+            "admitted",
+            "completed",
+            "denied",
+            "cancelled",
+            "expired",
+            "unknown",
+        ] {
+            repo.db(|db| {
+                db.execute("UPDATE agent_execution_requests SET state=?1", [state])?;
+                Ok(())
+            })
+            .unwrap();
+            assert!(!status(), "{state} is no longer awaiting approval");
+        }
+        repo.db(|db| {
+            db.execute_batch("UPDATE agent_execution_requests SET state='pending',expires_at=0")?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(!status());
+        repo.db(|db| {
+            db.execute(
+                "UPDATE agent_execution_requests SET expires_at=?1",
+                [chrono::Utc::now().timestamp_millis() + 300_000],
+            )?;
+            db.execute_batch("UPDATE agent_execution_policies SET mode='auto'")?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(!status(), "automatic review alone does not require a human");
+        repo.db(|db| {db.execute_batch("INSERT INTO agent_execution_policy_reviews VALUES('pending','auto',1,'ask','high','需要确认')")?;Ok(())}).unwrap();
+        assert!(status());
+        repo.db(|db| {
+            db.execute_batch("UPDATE agent_execution_policy_reviews SET decision='allow'")?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(!status());
+        repo.db(|db| {db.execute_batch("UPDATE agent_execution_policy_reviews SET decision='ask'; UPDATE agent_execution_policies SET mode='fullAccess'")?;Ok(())}).unwrap();
+        assert!(!status());
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectChat {
@@ -18,6 +109,8 @@ pub struct ProjectChat {
     pub agent_id: String,
     pub title: String,
     pub created_at: i64,
+    pub running: bool,
+    pub awaiting_approval: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,7 +120,7 @@ pub struct ProjectChats {
 }
 fn project(db: &Connection, id: &str, user: &str) -> Result<Project> {
     let (id,name,connection,identity,profile)=db.query_row(
-  "SELECT id,name,connection_id,identity_json,profile_json FROM agent_projects WHERE id=?1 AND user_id=?2",
+  "SELECT id,name,connection_id,identity_json,profile_json FROM agent_projects WHERE id=?1 AND user_id=?2 AND NOT EXISTS(SELECT 1 FROM agent_removed_projects WHERE project_id=?1)",
   params![id,user],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,Option<String>>(4)?)))
   .optional()?.ok_or(Error::NotFound)?;
     Ok(Project {
@@ -93,7 +186,7 @@ impl Repository {
     pub fn projects(&self, user: &str) -> Result<Vec<Project>> {
         self.db(|db| {
             let mut q = db.prepare(
-                "SELECT id FROM agent_projects WHERE user_id=?1 ORDER BY created_at DESC,id DESC",
+                "SELECT id FROM agent_projects WHERE user_id=?1 AND NOT EXISTS(SELECT 1 FROM agent_removed_projects WHERE project_id=agent_projects.id) ORDER BY created_at DESC,id DESC",
             )?;
             let ids = q
                 .query_map([user], |r| r.get::<_, String>(0))?
@@ -135,13 +228,15 @@ impl Repository {
     pub fn project_chats(&self, user: &str, id: Option<&str>, after: &str) -> Result<ProjectChats> {
         self.db(|db|{
    if let Some(id)=id {project(db,id,user)?;}
-   // Stable rowid cursor, scoped to the same owner/project. Include empty newly created chats.
+   // Stable owner/project cursor. Empty preparations are not conversation history.
    let cursor=if after.is_empty(){None}else{
-    Some(db.query_row("SELECT a.rowid FROM agent_sessions a LEFT JOIN agent_project_chats c ON c.session_id=a.id WHERE a.id=?1 AND a.user_id=?2 AND ((?3 IS NULL AND c.project_id IS NULL) OR c.project_id=?3)",
+    Some(db.query_row("SELECT a.rowid FROM agent_sessions a LEFT JOIN agent_project_chats c ON c.session_id=a.id WHERE a.id=?1 AND a.user_id=?2 AND ((?3 IS NULL AND (c.project_id IS NULL OR EXISTS(SELECT 1 FROM agent_removed_projects WHERE project_id=c.project_id))) OR c.project_id=?3)",
      params![after,user,id],|r|r.get::<_,i64>(0)).optional()?.ok_or(Error::NotFound)?)
    };
-   let mut q=db.prepare("SELECT a.id,a.agent_id,COALESCE((SELECT json_extract(input_json,'$.message') FROM agent_chat_turns t WHERE t.session_id=a.id ORDER BY user_event_id LIMIT 1),json_extract(a.task_json,'$.goal'),'新对话'),a.created_at FROM agent_sessions a LEFT JOIN agent_project_chats c ON c.session_id=a.id WHERE a.user_id=?1 AND ((?2 IS NULL AND c.project_id IS NULL) OR c.project_id=?2) AND (?3 IS NULL OR a.rowid<?3) ORDER BY a.rowid DESC LIMIT 51")?;
-   let mut items=q.query_map(params![user,id,cursor],|r|Ok(ProjectChat{session_id:r.get(0)?,agent_id:r.get(1)?,title:r.get(2)?,created_at:r.get(3)?}))?.collect::<std::result::Result<Vec<_>,_>>()?;
+   let mut q=db.prepare("SELECT a.id,a.agent_id,COALESCE((SELECT json_extract(input_json,'$.message') FROM agent_chat_turns t WHERE t.session_id=a.id ORDER BY user_event_id LIMIT 1),(SELECT json_extract(payload,'$.text') FROM agent_events e WHERE e.session_id=a.id AND kind='user_message' ORDER BY id LIMIT 1),json_extract(a.task_json,'$.goal'),'新对话'),a.created_at,EXISTS(SELECT 1 FROM agent_chat_turns t WHERE t.session_id=a.id AND t.state='running'),
+    EXISTS(SELECT 1 FROM agent_execution_requests r LEFT JOIN agent_execution_policies p ON p.session_id=r.session_id LEFT JOIN agent_execution_policy_reviews v ON v.request_id=r.id WHERE r.session_id=a.id AND r.state='pending' AND r.expires_at>?4 AND (COALESCE(p.mode,'confirm')='confirm' OR (p.mode='auto' AND v.decision='ask')))
+    FROM agent_sessions a LEFT JOIN agent_project_chats c ON c.session_id=a.id WHERE a.user_id=?1 AND ((?2 IS NULL AND (c.project_id IS NULL OR EXISTS(SELECT 1 FROM agent_removed_projects WHERE project_id=c.project_id))) OR c.project_id=?2) AND (EXISTS(SELECT 1 FROM agent_chat_turns t WHERE t.session_id=a.id) OR EXISTS(SELECT 1 FROM agent_events e WHERE e.session_id=a.id AND kind IN ('user_message','assistant_message')) OR (a.task_json IS NOT NULL AND NOT EXISTS(SELECT 1 FROM agent_session_scopes s WHERE s.session_id=a.id))) AND (?3 IS NULL OR a.rowid<?3) ORDER BY a.rowid DESC LIMIT 51")?;
+   let mut items=q.query_map(params![user,id,cursor,chrono::Utc::now().timestamp_millis()],|r|Ok(ProjectChat{session_id:r.get(0)?,agent_id:r.get(1)?,title:r.get(2)?,created_at:r.get(3)?,running:r.get(4)?,awaiting_approval:r.get(5)?}))?.collect::<std::result::Result<Vec<_>,_>>()?;
    let more=items.len()>50;items.truncate(50);
    for item in &mut items {item.title=item.title.chars().take(80).collect();}
    let next_after=if more{items.last().map(|i|i.session_id.clone())}else{None};

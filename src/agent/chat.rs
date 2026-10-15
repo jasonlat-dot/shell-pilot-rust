@@ -216,7 +216,7 @@ struct Active {
 pub struct Manager {
     store: Arc<Store>,
     stop: CancellationToken,
-    active: Mutex<HashMap<ActiveKey, Active>>,
+    active: Arc<Mutex<HashMap<ActiveKey, Active>>>,
     live: super::live::Source,
     terminals: Option<Arc<crate::terminal::TerminalManager>>,
     approvals: super::approvals::Approvals,
@@ -333,7 +333,7 @@ impl Manager {
             approvals: super::approvals::Approvals::new(store.clone()),
             store,
             stop,
-            active: Mutex::new(HashMap::new()),
+            active: Arc::new(Mutex::new(HashMap::new())),
         }
     }
     pub fn with_terminals(

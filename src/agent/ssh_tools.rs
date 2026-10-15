@@ -26,6 +26,68 @@ pub const SSH_EXECUTE: &str = "ssh_execute";
 const SSH_EXECUTE_USES_TOTAL_TIMEOUT: bool = false;
 const SSH_IDLE_TIMEOUT_MIN_SECONDS: u64 = 15;
 const SSH_IDLE_TIMEOUT_MAX_SECONDS: u64 = 120;
+const MISSING_EXPLANATION: &str = "未提供命令用途说明，请核对完整命令。";
+
+fn normalize_explanation(arguments: &mut Value) {
+    let Some(fields) = arguments.as_object_mut() else { return; };
+    let missing = match fields.get("explanation") {
+        None => true,
+        Some(Value::String(text)) => text.trim().is_empty() || text.trim() == MISSING_EXPLANATION,
+        // Keep invalid types intact so the closed schema can reject them.
+        _ => false,
+    };
+    if !missing { return; }
+    let command = fields.get("command").and_then(Value::as_str).unwrap_or("").trim();
+    // Only explain exact simple commands, never a prefix of a pipeline or script.
+    let mut words = command.split([' ', '\t']).filter(|word| !word.is_empty());
+    let purpose = if matches!((words.next(),words.next(),words.next()),(Some("df"),Some("-h"),None)) {
+        "查看各文件系统的磁盘总量、已用空间、可用空间和使用率，以易读的单位显示。"
+    } else {
+        match command {
+            "whoami" => "查看当前终端实际执行命令的用户身份。",
+            "pwd" => "显示当前终端所在的工作目录。",
+            _ => MISSING_EXPLANATION,
+        }
+    };
+    fields.insert("explanation".into(),json!(purpose));
+}
+
+#[cfg(test)]
+mod explanation_tests {
+    use super::*;
+
+    #[test]
+    fn missing_or_placeholder_purpose_is_filled_before_persisting_simple_commands() {
+        for command in ["df -h", " df\t-h ", "whoami", "pwd"] {
+            for explanation in [None, Some(""), Some("  "), Some(MISSING_EXPLANATION)] {
+                let mut args=json!({"command":command,"timeoutSeconds":20});
+                if let Some(explanation)=explanation { args["explanation"]=json!(explanation); }
+                normalize_explanation(&mut args);
+                let parsed: Command = serde_json::from_value(args).unwrap();
+                assert_ne!(parsed.explanation.as_deref(),Some(MISSING_EXPLANATION));
+                assert_eq!(parsed.command,command);
+                assert_eq!(parsed.timeout_seconds,20);
+                assert!(parsed.approval_key().explanation.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn purpose_preserves_model_text_and_does_not_guess_compound_commands_or_repair_invalid_types() {
+        for command in ["df -h && rm -rf /tmp/example", "df -h | cat", "df\n-h", "df -h; whoami", "custom-script"] {
+            let mut args=json!({"command":command,"timeoutSeconds":20});
+            normalize_explanation(&mut args);
+            assert_eq!(args["explanation"],MISSING_EXPLANATION);
+            args["explanation"]=json!("模型提供的完整命令说明");
+            normalize_explanation(&mut args);
+            assert_eq!(args["explanation"],"模型提供的完整命令说明");
+        }
+        for invalid in [Value::Null,json!(17),json!({"text":"bad"})] {
+            let mut args=json!({"command":"df -h","explanation":invalid});
+            let original=args.clone();normalize_explanation(&mut args);assert_eq!(args,original);
+        }
+    }
+}
 pub fn definition() -> FunctionDefinition {
     FunctionDefinition {
         name: SSH_EXECUTE.into(),
@@ -604,11 +666,7 @@ impl ToolExecutor for SshExecutor {
         // The closed schema requires every declared property. Legacy callers
         // may omit descriptive text; supply a truthful display-only fallback,
         // without changing the command or granting execution permission.
-        if let Some(fields) = arguments.as_object_mut() {
-            fields.entry("explanation").or_insert_with(|| {
-                json!("未提供命令用途说明，请核对完整命令。")
-            });
-        }
+        normalize_explanation(arguments);
         let Some(timeout) = arguments.get_mut("timeoutSeconds") else {
             return;
         };

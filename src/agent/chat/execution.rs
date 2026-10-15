@@ -34,12 +34,128 @@ struct Slot<'a> {
     manager: &'a Manager,
     key: ActiveKey,
 }
+
+#[cfg(test)]
+mod delete_tests {
+    use super::*;
+    #[tokio::test]
+    async fn project_removal_cannot_race_a_session_preparing_to_generate() {
+        let store = Arc::new(Store::in_memory().unwrap());
+        store
+            .save(
+                crate::model::ConnectionRequest {
+                    connection_id: Some("server".into()),
+                    connection_name: "server".into(),
+                    host: "host".into(),
+                    port: 22,
+                    username: "user".into(),
+                    user_id: Some("user".into()),
+                    strict_host_key_check: Some(false),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+        let repo = Repository::new(store.clone());
+        let project = repo.create_project("user", "project", "server").unwrap();
+        let chat = repo
+            .create_project_chat(
+                &project.id,
+                "user",
+                "model",
+                &crate::agent::Target {
+                    connection_id: "server".into(),
+                    terminal_session_id: "terminal".into(),
+                },
+                crate::agent::ServerIdentity {
+                    host: "host".into(),
+                    port: 22,
+                    username: "user".into(),
+                    host_key: "key".into(),
+                },
+            )
+            .unwrap();
+        let manager = Manager::new(store, CancellationToken::new());
+        let slot = manager.slot("user", &chat.id).unwrap();
+        assert!(matches!(
+            manager
+                .delete_project("user".into(), project.id.clone())
+                .await,
+            Err(Error::Busy)
+        ));
+        assert_eq!(repo.projects("user").unwrap().len(), 1);
+        drop(slot);
+        manager
+            .delete_project("user".into(), project.id)
+            .await
+            .unwrap();
+        assert!(repo.projects("user").unwrap().is_empty());
+        assert!(repo.session(&chat.id, "user").is_ok());
+    }
+    #[tokio::test]
+    async fn deleting_chat_uses_the_same_exclusive_slot_as_generation() {
+        let store = Arc::new(Store::in_memory().unwrap());
+        let repo = Repository::new(store.clone());
+        let session = repo.create_general_session("model", "user").unwrap();
+        let manager = Manager::new(store, CancellationToken::new());
+        let slot = manager.slot("user", &session.id).unwrap();
+        assert!(matches!(
+            manager
+                .delete_chat("model".into(), "user".into(), session.id.clone())
+                .await,
+            Err(Error::Busy)
+        ));
+        assert!(repo.session(&session.id, "user").is_ok());
+        drop(slot);
+        manager
+            .delete_chat("model".into(), "user".into(), session.id.clone())
+            .await
+            .unwrap();
+        assert!(repo.session(&session.id, "user").is_err());
+    }
+}
 impl Drop for Slot<'_> {
     fn drop(&mut self) {
         self.manager.active.lock().unwrap().remove(&self.key);
     }
 }
 impl Manager {
+    pub async fn delete_project(&self, user: String, project: String) -> Result<()> {
+        if self.stop.is_cancelled() {
+            return Err(Error::Stopped);
+        }
+        let repo = Repository::new(self.store.clone());
+        let active = self.active.clone();
+        worker(move || {
+            // Keep admission closed across lookup and the atomic delete, including
+            // projects with more sessions than the concurrent-generation limit.
+            let active = active.lock().map_err(|_| Error::Storage)?;
+            let ids = repo.project_chat_ids(&user, &project)?;
+            if ids
+                .iter()
+                .any(|id| active.contains_key(&(user.clone(), id.clone())))
+            {
+                return Err(Error::Busy);
+            }
+            repo.delete_project(&user, &project).map_err(Error::from)
+        })
+        .await
+    }
+
+    pub async fn delete_chat(&self, agent: String, user: String, session: String) -> Result<()> {
+        if self.stop.is_cancelled() {
+            return Err(Error::Stopped);
+        }
+        // Same slot as bind/execution/chat: no generation can enter while deletion runs.
+        let _slot = self.slot(&user, &session)?;
+        let repo = Repository::new(self.store.clone());
+        worker(move || {
+            repo.delete_chat(&agent, &user, &session)
+                .map_err(Error::from)
+        })
+        .await
+    }
+
     fn slot(&self, user: &str, session: &str) -> Result<Slot<'_>> {
         let key = (user.into(), session.into());
         let mut active = self.active.lock().unwrap();
