@@ -106,6 +106,12 @@ pub struct CommandResult {
     pub stdout: String,
     pub stderr: String,
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<super::OutputReference>,
+    #[serde(default)]
+    pub output_truncated: bool,
+    #[serde(default)]
+    pub output_error: bool,
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Profile {
@@ -247,7 +253,7 @@ impl SshExecutor {
         registry.register(definition())
     }
 
-    async fn verify(&self) -> Result<()> {
+    pub(crate) async fn verify(&self) -> Result<()> {
         self.terminals
             .check_agent_lease(&self.lease)
             .map_err(|_| Error::TargetUnavailable)?;
@@ -282,6 +288,20 @@ impl SshExecutor {
         call_id: &str,
         command: &Command,
         cancel: &CancellationToken,
+    ) -> Result<CommandResult> {
+        self.execute_inner(call_id, command, cancel, None, None)
+            .await
+    }
+    pub(crate) fn store(&self) -> Arc<Store> {
+        self.store.clone()
+    }
+    pub(crate) async fn execute_inner(
+        &self,
+        call_id: &str,
+        command: &Command,
+        cancel: &CancellationToken,
+        capture: Option<Arc<super::tool_output::Capture>>,
+        revision: Option<u64>,
     ) -> Result<CommandResult> {
         if call_id.trim().is_empty()
             || call_id.len() > 128
@@ -367,26 +387,56 @@ impl SshExecutor {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
+        if let Some(capture) = &capture {
+            capture.start().await.map_err(|_| Error::Storage)?;
+        }
         let terminals = self.terminals.clone();
         // The lease is not reconstructed from a tab or connection profile.
         let lease = self.lease.clone();
         let stop = cancel.clone();
-        self.approvals
-            .admit(&ticket, move || {
-                !stop.is_cancelled() && terminals.check_agent_lease(&lease).is_ok()
-            })
-            .await
-            .map_err(map_approval)?;
+        let live = move || !stop.is_cancelled() && terminals.check_agent_lease(&lease).is_ok();
+        match revision {
+            Some(revision) => self.approvals.admit_revision(&ticket, revision, live).await,
+            None => self.approvals.admit(&ticket, live).await,
+        }
+        .map_err(map_approval)?;
         let result = channel
             .run(
                 &command.command,
                 Duration::from_secs(command.timeout_seconds),
                 cancel,
+                capture.clone(),
             )
             .await;
+        let mut previews = None;
+        let (outputs, output_truncated, output_error) = if let Some(capture) = capture {
+            let sink = capture.clone();
+            let outputs = tokio::task::spawn_blocking(move || sink.finish())
+                .await
+                .map_err(|_| Error::OutcomeUnknown)?
+                .map_err(|_| Error::OutcomeUnknown)?;
+            previews = Some((
+                outputs
+                    .iter()
+                    .find(|o| o.reference.channel == super::OutputChannel::Stdout)
+                    .map(|o| model_preview(&o.preview)),
+                outputs
+                    .iter()
+                    .find(|o| o.reference.channel == super::OutputChannel::Stderr)
+                    .map(|o| model_preview(&o.preview)),
+            ));
+            let (truncated, failed) = capture.status();
+            (
+                outputs.into_iter().map(|o| o.reference).collect(),
+                truncated,
+                failed,
+            )
+        } else {
+            (vec![], false, false)
+        };
         match result {
             Ok(result) => {
-                let result = CommandResult {
+                let mut result = CommandResult {
                     task_id: self.binding.tool.task_id.clone(),
                     connection_id: self.binding.tool.target.connection_id.clone(),
                     terminal_session_id: self.binding.tool.target.terminal_session_id.clone(),
@@ -394,7 +444,21 @@ impl SshExecutor {
                     stdout: result.stdout,
                     stderr: result.stderr,
                     truncated: result.truncated,
+                    outputs,
+                    output_truncated,
+                    output_error,
                 };
+                if let Some((stdout, stderr)) = previews {
+                    if let Some((text, truncated)) = stdout {
+                        result.stdout = text;
+                        result.truncated |= truncated;
+                    }
+                    if let Some((text, truncated)) = stderr {
+                        result.stderr = text;
+                        result.truncated |= truncated;
+                    }
+                    result.truncated |= output_truncated;
+                }
                 self.approvals
                     .finish(&mut ticket, State::Completed, Some(result.clone()))
                     .await
@@ -415,6 +479,29 @@ impl SshExecutor {
             }
         }
     }
+}
+/// A5 already keeps raw head/tail previews; further bound each stream for escaped JSON.
+fn model_preview(text: &str) -> (String, bool) {
+    const BYTES: usize = 384;
+    if text.len() <= BYTES {
+        return (text.into(), false);
+    }
+    let mut head = BYTES / 2;
+    while !text.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = text.len() - BYTES / 2;
+    while !text.is_char_boundary(tail) {
+        tail += 1;
+    }
+    (
+        format!(
+            "{}\n[... omitted; use read_tool_output ...]\n{}",
+            &text[..head],
+            &text[tail..]
+        ),
+        true,
+    )
 }
 fn map_approval(error: approvals::Error) -> Error {
     match error {

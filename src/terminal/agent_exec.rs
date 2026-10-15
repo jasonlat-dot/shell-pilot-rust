@@ -125,6 +125,7 @@ impl PreparedExec {
         command: &str,
         timeout: Duration,
         cancel: &CancellationToken,
+        sink: Option<Arc<crate::agent::tool_output::Capture>>,
     ) -> Result<ExecResult, ExecError> {
         if cancel.is_cancelled() || self.session.stop.is_cancelled() || self.shutdown.is_cancelled()
         {
@@ -150,9 +151,15 @@ impl PreparedExec {
                         return Err(ExecError::Rejected)
                     }
                     Some(ChannelMsg::Data { data }) => {
+                        if let Some(sink) = &sink {
+                            sink.write(false, data.to_vec()).await;
+                        }
                         capture(&mut stdout, &stderr, &data, &mut truncated)
                     }
                     Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
+                        if let Some(sink) = &sink {
+                            sink.write(true, data.to_vec()).await;
+                        }
                         capture(&mut stderr, &stdout, &data, &mut truncated)
                     }
                     Some(ChannelMsg::ExitStatus { exit_status }) if exit_code.is_none() => {
@@ -183,7 +190,7 @@ impl PreparedExec {
     }
 }
 fn capture(output: &mut Vec<u8>, other: &[u8], data: &[u8], truncated: &mut bool) {
-    // D4 will connect full-output persistence. D2 keeps a bounded combined preview,
+    // The D4 sink stores raw bytes separately. Keep a bounded combined model preview,
     // continues draining, and never claims truncated data is the complete output.
     let take = data
         .len()

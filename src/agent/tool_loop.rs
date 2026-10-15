@@ -28,6 +28,8 @@ pub enum Error {
     Cancelled,
     #[error("Tool outcome is unknown; do not automatically execute it again")]
     OutcomeUnknown,
+    #[error("Persistent tool context changed or cannot be stored")]
+    Context,
     #[error(transparent)]
     Model(#[from] ModelError),
 }
@@ -84,9 +86,13 @@ impl ValidatedCall {
     }
 }
 pub enum ToolOutcome {
-    /// Must contain only model-visible, bounded data; full output storage belongs to D4.
+    /// Model-visible bounded data; full outputs are referenced separately.
     Success(Value),
     Failed,
+    Failure {
+        code: &'static str,
+        data: Value,
+    },
     Denied,
     OutcomeUnknown,
 }
@@ -98,6 +104,22 @@ pub trait ToolExecutor: Send + Sync {
         call: &'a ValidatedCall,
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, ToolOutcome>;
+}
+/// Trusted native persistence and context hooks; model payloads cannot install them.
+pub trait LoopContext: Send + Sync {
+    fn before_model<'a>(
+        &'a self,
+        request: &'a ChatRequest,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<ChatRequest>>;
+    fn begin_batch<'a>(
+        &'a self,
+        calls: &'a [ToolCall],
+        text: Option<&'a str>,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<()>>;
+    fn started(&self, call_id: &str) -> Result<()>;
+    fn result<'a>(&'a self, call_id: &'a str, content: &'a str) -> BoxFuture<'a, Result<()>>;
 }
 #[derive(Clone)]
 pub struct Limits {
@@ -126,6 +148,7 @@ pub enum State {
 
 pub struct ToolLoop<'a> {
     registry: &'a ToolRegistry,
+    context: Option<&'a dyn LoopContext>,
     request: ChatRequest,
     limits: Limits,
     state: State,
@@ -148,6 +171,7 @@ impl<'a> ToolLoop<'a> {
         }
         Ok(Self {
             registry,
+            context: None,
             request: ChatRequest {
                 messages,
                 tools: registry.definitions(),
@@ -157,6 +181,10 @@ impl<'a> ToolLoop<'a> {
             model_rounds: 0,
             tool_calls: 0,
         })
+    }
+    pub fn with_context(mut self, context: &'a dyn LoopContext) -> Self {
+        self.context = Some(context);
+        self
     }
     pub fn state(&self) -> State {
         self.state
@@ -209,6 +237,9 @@ impl<'a> ToolLoop<'a> {
             if self.model_rounds >= self.limits.model_rounds {
                 return Err(Error::Limit);
             }
+            if let Some(context) = self.context {
+                self.request = context.before_model(&self.request, cancel).await?;
+            }
             self.boundary(client)?;
             self.model_rounds += 1;
             let reply = client.complete(&self.request, cancel).await?.message;
@@ -222,6 +253,7 @@ impl<'a> ToolLoop<'a> {
 
             // Validate every call before any dispatch. Paired placeholders also let the
             // provider validate cross-round duplicate IDs and full protocol ordering.
+            let assistant_text = reply.content.clone();
             let mut batch = self.request.clone();
             batch.messages.push(ChatMessage::Assistant {
                 content: reply.content,
@@ -254,7 +286,14 @@ impl<'a> ToolLoop<'a> {
             }
             // Protocol errors leave the previous complete transcript untouched.
             // Hard/soft budget errors retain this whole unexecuted batch for the host.
-            let preflight = Self::check_boundary(client, &batch);
+            let preflight = if self.context.is_some() {
+                // A pending batch may cross the soft trigger. Compact only after real results.
+                prepare_request(client.config(), &batch)
+                    .map(|_| ())
+                    .map_err(Error::from)
+            } else {
+                Self::check_boundary(client, &batch)
+            };
             match preflight {
                 Err(Error::NeedsCompaction) => {
                     self.request = batch;
@@ -270,9 +309,25 @@ impl<'a> ToolLoop<'a> {
             {
                 return Err(Error::Limit);
             }
+            if let Some(context) = self.context {
+                context
+                    .begin_batch(&reply.tool_calls, assistant_text.as_deref(), cancel)
+                    .await?;
+            }
             self.tool_calls += reply.tool_calls.len();
             for (index, call) in validated.iter().enumerate() {
-                let Some(call) = call else { continue };
+                let Some(call) = call else {
+                    if let Some(context) = self.context {
+                        if let ChatMessage::Tool {
+                            tool_call_id,
+                            content,
+                        } = &self.request.messages[result_start + index]
+                        {
+                            context.result(tool_call_id, content).await?;
+                        }
+                    }
+                    continue;
+                };
                 if cancel.is_cancelled() {
                     return Err(Error::Cancelled);
                 }
@@ -280,6 +335,9 @@ impl<'a> ToolLoop<'a> {
                 // Set unknown *before* awaiting: even dropping this future cannot make
                 // an in-flight call look unexecuted. A started loop cannot be replayed.
                 self.request.messages[slot] = result_message(call.id(), failure("result_unknown"));
+                if let Some(context) = self.context {
+                    context.started(call.id())?;
+                }
                 let child = cancel.child_token();
                 let _cancel_on_drop = child.clone().drop_guard();
                 let outcome = tokio::select! {
@@ -292,6 +350,9 @@ impl<'a> ToolLoop<'a> {
                 let (value, unknown) = match outcome {
                     ToolOutcome::Success(data) => (json!({"ok":true,"data":data}), false),
                     ToolOutcome::Failed => (failure("tool_failed"), false),
+                    ToolOutcome::Failure { code, data } => {
+                        (json!({"ok":false,"error":code,"data":data}), false)
+                    }
                     ToolOutcome::Denied => (failure("denied"), false),
                     ToolOutcome::OutcomeUnknown => (failure("result_unknown"), true),
                 };
@@ -301,8 +362,11 @@ impl<'a> ToolLoop<'a> {
                 }
                 self.request.messages[slot] = ChatMessage::Tool {
                     tool_call_id: call.id().into(),
-                    content,
+                    content: content.clone(),
                 };
+                if let Some(context) = self.context {
+                    context.result(call.id(), &content).await?;
+                }
                 if unknown {
                     return Err(Error::OutcomeUnknown);
                 }
@@ -312,7 +376,12 @@ impl<'a> ToolLoop<'a> {
         }
     }
     fn boundary(&self, client: &ModelClient) -> Result<()> {
-        Self::check_boundary(client, &self.request)
+        if self.context.is_some() {
+            prepare_request(client.config(), &self.request)?;
+            Ok(())
+        } else {
+            Self::check_boundary(client, &self.request)
+        }
     }
     fn check_boundary(client: &ModelClient, request: &ChatRequest) -> Result<()> {
         let measured = super::provider::measure_request(client.config(), request)?;

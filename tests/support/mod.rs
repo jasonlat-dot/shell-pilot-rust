@@ -159,7 +159,7 @@ impl server::Handler for TestHandler {
             session.channel_failure(channel)?;
         } else {
             session.channel_success(channel)?;
-            session.data(channel, b"ready\r\n".to_vec())?;
+            session.data(channel, b"ready\n".to_vec())?;
         }
         Ok(())
     }
@@ -195,7 +195,9 @@ impl server::Handler for TestHandler {
         if command == "__exec_quiet__" {
             return Ok(());
         }
-        let stdout = if command == "__exec_large__" {
+        let stdout = if command == "__exec_chunked__" {
+            (0..131073).map(|i| (i % 251) as u8).collect()
+        } else if command == "__exec_large__" {
             vec![b'x'; 4096]
         } else {
             "执行完成\n".as_bytes().to_vec()
@@ -230,7 +232,7 @@ impl server::Handler for TestHandler {
                 session.data(channel, vec![b'x'; 4096])?;
             }
             b"__unicode__" => {
-                let bytes = "你好世界\r\n".as_bytes();
+                let bytes = "你好世界\n".as_bytes();
                 session.data(channel, bytes[..2].to_vec())?;
                 session.data(channel, bytes[2..].to_vec())?;
             }

@@ -397,10 +397,33 @@ impl Approvals {
         ticket: &Ticket,
         live: impl FnOnce() -> bool + Send + 'static,
     ) -> Result<()> {
+        self.admit_checked(ticket, None, live).await
+    }
+    /// D4's raw event frontier must still describe the approved plan at dispatch admission.
+    pub(crate) async fn admit_revision(
+        &self,
+        ticket: &Ticket,
+        revision: u64,
+        live: impl FnOnce() -> bool + Send + 'static,
+    ) -> Result<()> {
+        self.admit_checked(ticket, Some(revision), live).await
+    }
+    async fn admit_checked(
+        &self,
+        ticket: &Ticket,
+        revision: Option<u64>,
+        live: impl FnOnce() -> bool + Send + 'static,
+    ) -> Result<()> {
         let id = ticket.id.clone();
         let user = ticket.user.clone();
         self.db(move|db|{
    let tx=db.transaction()?;let old=row(&tx,&id,&user)?;
+   if let Some(revision)=revision {
+    let binding=&old.input.context.binding;
+    if read_session(&tx,&binding.session_id,&binding.user_id).map_err(|_|Error::Stale)?.revision!=revision {
+     return Err(Error::Stale);
+    }
+   }
    if old.state!=State::Approved{return Err(Error::Denied);}
    if old.expires<=now(){return Err(Error::Expired);}
    current(&tx,&old.input.context)?;

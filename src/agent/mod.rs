@@ -1,4 +1,4 @@
-//! Persistent context, native model adapters, text turns and the D1 tool-loop kernel.
+//! Persistent context, native model adapters, text turns and journaled SSH tool turns.
 //! Desktop chat does not dispatch tools until target binding and approval are integrated.
 pub mod approvals;
 pub mod budget;
@@ -13,7 +13,10 @@ pub mod provider;
 mod repository;
 mod scopes;
 pub mod ssh_tools;
+mod tool_journal;
 pub mod tool_loop;
+pub(crate) mod tool_output;
+pub mod tool_session;
 pub use projects::{Project, ProjectChat, ProjectChats};
 mod turns;
 pub use model::*;
