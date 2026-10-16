@@ -48,6 +48,14 @@ pub(super) fn read(db: &Connection, id: &str) -> Result<Option<Scope>> {
 }
 impl Repository {
     pub fn create_general_session(&self, agent: &str, user: &str) -> Result<Session> {
+        self.create_general_session_with_policy(agent, user, None)
+    }
+    pub fn create_general_session_with_policy(
+        &self,
+        agent: &str,
+        user: &str,
+        policy: Option<approvals::Policy>,
+    ) -> Result<Session> {
         model::identifier(agent)?;
         model::identifier(user)?;
         let id = uuid::Uuid::new_v4().to_string();
@@ -61,6 +69,12 @@ impl Repository {
                 "INSERT INTO agent_session_scopes(session_id,root_id,kind) VALUES(?1,?1,'general')",
                 [&id],
             )?;
+            if let Some(policy) = policy {
+                tx.execute(
+                    "INSERT INTO agent_execution_policies(session_id,task_id,mode,revision) VALUES(?1,?1,?2,1)",
+                    params![id, policy.text()],
+                )?;
+            }
             let result = repository::read_session(&tx, &id, user)?;
             tx.commit()?;
             Ok(result)

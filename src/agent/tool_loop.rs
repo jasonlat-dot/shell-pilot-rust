@@ -4,6 +4,7 @@
 //! D4 connects full output and compaction to the product execution path.
 mod schema;
 
+use super::approvals::{Approvals, Policy};
 use super::provider::{
     prepare_request, AssistantReply, ChatMessage, ChatRequest, FunctionDefinition, ModelClient,
     ModelError, ProviderKind, ToolCall,
@@ -98,7 +99,7 @@ pub enum ToolOutcome {
 }
 pub trait ToolExecutor: Send + Sync {
     /// Shared admission hook for EVERY tool category, not just shell commands.
-    /// The native host must use the current task's approval policy and a trusted
+    /// The native host must use the current conversation's approval policy and a trusted
     /// tool adapter. Registering a function alone never grants execution rights.
     /// Adapters with durable approvals must still recheck permission at dispatch.
     fn authorize<'a>(
@@ -107,6 +108,22 @@ pub trait ToolExecutor: Send + Sync {
         _cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, bool> {
         Box::pin(async { false })
+    }
+
+    /// Called by the shared conversation boundary before EVERY registered tool.
+    /// Confirm/Auto require an adapter that implements durable human/reviewer
+    /// approval for the exact call. Merely registering an MCP/native function
+    /// or implementing legacy authorize() cannot bypass those modes.
+    /// FullAccess still requires the adapter's target/access authorization.
+    fn authorize_with_policy<'a>(
+        &'a self,
+        call: &'a ValidatedCall,
+        policy: Policy,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            policy == Policy::FullAccess && self.authorize(call, cancel).await
+        })
     }
 
     /// Native-only normalization of parsed arguments, before schema validation.
@@ -180,9 +197,27 @@ pub enum State {
     Halted,
 }
 
+/// Native-owned identity, never taken from model tool arguments. The same
+/// boundary can be installed for general, SSH and future MCP tool registries.
+pub struct ApprovalBoundary {
+    approvals: Approvals,
+    session: String,
+    user: String,
+}
+impl ApprovalBoundary {
+    pub fn new(approvals: Approvals, session: String, user: String) -> Self {
+        Self { approvals, session, user }
+    }
+    async fn mode(&self) -> Policy {
+        self.approvals.conversation_policy(self.session.clone(), self.user.clone())
+            .await.map(|(mode, _)| mode).unwrap_or(Policy::Deny)
+    }
+}
+
 pub struct ToolLoop<'a> {
     registry: &'a ToolRegistry,
     context: Option<&'a dyn LoopContext>,
+    approval_boundary: Option<ApprovalBoundary>,
     request: ChatRequest,
     limits: Limits,
     state: State,
@@ -206,6 +241,7 @@ impl<'a> ToolLoop<'a> {
         Ok(Self {
             registry,
             context: None,
+            approval_boundary: None,
             request: ChatRequest {
                 messages,
                 tools: registry.definitions(),
@@ -218,6 +254,10 @@ impl<'a> ToolLoop<'a> {
     }
     pub fn with_context(mut self, context: &'a dyn LoopContext) -> Self {
         self.context = Some(context);
+        self
+    }
+    pub fn with_approval_boundary(mut self, boundary: ApprovalBoundary) -> Self {
+        self.approval_boundary = Some(boundary);
         self
     }
     pub fn state(&self) -> State {
@@ -382,7 +422,18 @@ impl<'a> ToolLoop<'a> {
                 let authorized = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Err(Error::Cancelled),
-                    allowed = executor.authorize(call, cancel) => allowed,
+                    allowed = async {
+                        match &self.approval_boundary {
+                            Some(boundary) => {
+                                let mode = boundary.mode().await;
+                                mode != Policy::Deny && executor.authorize_with_policy(call, mode, cancel).await
+                            }
+                            // Standalone loops retain their explicit host authorizer;
+                            // persisted product turns always require a boundary.
+                            None if self.context.is_none() => executor.authorize(call, cancel).await,
+                            None => false,
+                        }
+                    } => allowed,
                 };
                 if !authorized {
                     let content = failure("denied").to_string();

@@ -439,6 +439,14 @@ impl Manager {
         agent: String,
         user: String,
     ) -> Result<super::Session> {
+        self.create_general_session_with_policy(agent, user, None).await
+    }
+    pub async fn create_general_session_with_policy(
+        &self,
+        agent: String,
+        user: String,
+        policy: Option<super::approvals::Policy>,
+    ) -> Result<super::Session> {
         if self.stop.is_cancelled() {
             return Err(Error::Stopped);
         }
@@ -451,7 +459,7 @@ impl Manager {
                 return Err(ModelError::KeyMissing.into());
             }
             Repository::new(store)
-                .create_general_session(&agent, &user)
+                .create_general_session_with_policy(&agent, &user, policy)
                 .map_err(Error::from)
         })
         .await

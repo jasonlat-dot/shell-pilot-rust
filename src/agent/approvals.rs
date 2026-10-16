@@ -55,7 +55,7 @@ pub enum Policy {
     FullAccess,
 }
 impl Policy {
-    fn text(self) -> &'static str {
+    pub(super) fn text(self) -> &'static str {
         match self {
             Self::Deny => "deny",
             Self::Confirm => "confirm",
@@ -234,17 +234,14 @@ fn current(db: &Database, c: &Context) -> Result<()> {
     Ok(())
 }
 fn policy(db: &Database, c: &Context) -> Result<Policy> {
-    let mode = db
-        .query_row(
-            "SELECT mode FROM agent_execution_policies WHERE session_id=?1 AND task_id=?2",
-            params![c.binding.session_id, c.task.id],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()?;
-    Ok(mode
-        .as_deref()
-        .map(Policy::from_text)
-        .unwrap_or(Policy::Confirm))
+    Ok(conversation_policy(db, &c.binding.session_id)?.0)
+}
+fn conversation_policy(db: &Database, session: &str) -> Result<(Policy, u64)> {
+    let row = db.query_row(
+        "SELECT mode,revision FROM agent_execution_policies WHERE session_id=?1",
+        [session], |row| Ok((row.get::<_,String>(0)?, row.get::<_,u64>(1)?)),
+    ).optional()?;
+    Ok(row.map_or((Policy::Confirm, 0), |(mode, revision)| (Policy::from_text(&mode), revision)))
 }
 #[derive(Clone)]
 pub struct Approvals {
@@ -284,39 +281,28 @@ impl Approvals {
         .await
         .map_err(|_| Error::Storage)?
     }
+    /// One conversation policy for every tool category. Reading this preference
+    /// does not grant access to a tool, task, server or MCP endpoint.
+    pub async fn conversation_policy(&self, session: String, user: String) -> Result<(Policy,u64)> {
+        self.db(move |db| {
+            read_session(db, &session, &user).map_err(|_| Error::NotFound)?;
+            conversation_policy(db, &session)
+        }).await
+    }
     pub async fn policy(
         &self,
         session: String,
         user: String,
         task: String,
     ) -> Result<(Policy, u64)> {
-        self.read_policy(session, user, task, true).await
-    }
-    /// Configuration remains readable after a failed/stopped turn. This does
-    /// not authorize execution; policy() and admission still require an active task.
-    pub(crate) async fn policy_view(
-        &self,
-        session: String,
-        user: String,
-        task: String,
-    ) -> Result<(Policy, u64)> {
-        self.read_policy(session, user, task, false).await
-    }
-    async fn read_policy(
-        &self,
-        session: String,
-        user: String,
-        task: String,
-        require_active: bool,
-    ) -> Result<(Policy, u64)> {
         self.db(move|db|{
             let s=read_session(db,&session,&user).map_err(|_|Error::NotFound)?;
-            if !s.task.as_ref().is_some_and(|t|t.id==task&&(!require_active||t.status==TaskStatus::Active)){return Err(Error::Stale);}
-            let row=db.query_row("SELECT task_id,mode,revision FROM agent_execution_policies WHERE session_id=?1",[session],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u64>(2)?))).optional()?;
-            Ok(match row{Some((id,mode,rev))=>(if id==task{Policy::from_text(&mode)}else{Policy::Confirm},rev),None=>(Policy::Confirm,0)})
+            if !s.task.as_ref().is_some_and(|t|t.id==task&&t.status==TaskStatus::Active){return Err(Error::Stale);}
+            conversation_policy(db, &session)
         }).await
     }
-    /// Task-wide tool policy, shared by native tool authorization adapters.
+    /// Compatibility entry for task-bound adapters. The policy itself belongs
+    /// to the conversation; per-call approvals and grants remain task-bound.
     /// Human-facing native host only; it never changes a tool's pinned target.
     pub async fn set_policy(
         &self,
@@ -326,10 +312,23 @@ impl Approvals {
         expected: u64,
         mode: Policy,
     ) -> Result<u64> {
+        self.update_policy(session, user, Some(task), expected, mode).await
+    }
+    /// Human-facing configuration is independent of registered tools or SSH binding.
+    pub async fn set_conversation_policy(
+        &self, session: String, user: String, expected: u64, mode: Policy,
+    ) -> Result<u64> {
+        self.update_policy(session, user, None, expected, mode).await
+    }
+    async fn update_policy(
+        &self, session: String, user: String, expected_task: Option<String>, expected: u64, mode: Policy,
+    ) -> Result<u64> {
         let result=self.db(move|db|{
    let tx=db.transaction()?;
    let s=read_session(&tx,&session,&user).map_err(|_|Error::NotFound)?;
-   let active=s.task.as_ref().filter(|t|t.id==task).ok_or(Error::Stale)?.status==TaskStatus::Active;
+   let task=s.task.as_ref().map_or_else(||s.id.clone(),|task|task.id.clone());
+   if expected_task.as_ref().is_some_and(|expected|expected!=&task){return Err(Error::Stale);}
+   let active=s.task.as_ref().is_some_and(|task|task.status==TaskStatus::Active);
    let rev:u64=tx.query_row("SELECT revision FROM agent_execution_policies WHERE session_id=?1",[&session],|r|r.get(0)).optional()?.unwrap_or(0);
    if rev!=expected{return Err(Error::Conflict);}let next=rev.checked_add(1).ok_or(Error::Invalid)?;
    tx.execute("INSERT INTO agent_execution_policies(session_id,task_id,mode,revision) VALUES(?1,?2,?3,?4) ON CONFLICT(session_id) DO UPDATE SET task_id=excluded.task_id,mode=excluded.mode,revision=excluded.revision",
@@ -341,7 +340,7 @@ impl Approvals {
    tx.execute("UPDATE agent_execution_grants SET revoked=1 WHERE session_id=?1",[&session])?;
    tx.execute("DELETE FROM agent_execution_policy_reviews WHERE request_id IN (SELECT id FROM agent_execution_requests WHERE session_id=?1 AND state='pending')",[&session])?;
    if mode==Policy::FullAccess&&active {
-    tx.execute("INSERT INTO agent_execution_policy_reviews(request_id,mode,revision,decision,risk,reason) SELECT id,'fullAccess',?3,'allow','notReviewed','当前任务已由用户选择完全访问权限' FROM agent_execution_requests WHERE session_id=?1 AND task_id=?2 AND state='pending' AND expires_at>?4",params![session,task,next,now()])?;
+    tx.execute("INSERT INTO agent_execution_policy_reviews(request_id,mode,revision,decision,risk,reason) SELECT id,'fullAccess',?3,'allow','notReviewed','当前对话已由用户选择完全访问权限' FROM agent_execution_requests WHERE session_id=?1 AND task_id=?2 AND state='pending' AND expires_at>?4",params![session,task,next,now()])?;
     tx.execute("UPDATE agent_execution_requests SET state='approved',updated_at=?3 WHERE session_id=?1 AND task_id=?2 AND state='pending' AND expires_at>?3",params![session,task,now()])?;
    }
    if mode==Policy::Deny{tx.execute("UPDATE agent_execution_requests SET state='denied',updated_at=?2 WHERE session_id=?1 AND state IN ('pending','approved')",params![session,now()])?;}
@@ -444,8 +443,8 @@ impl Approvals {
    tx.execute("INSERT INTO agent_execution_requests(id,session_id,user_id,task_id,call_id,request_json,state,created_at,expires_at,updated_at,grant_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?8,?10)",
     params![id,input.context.binding.session_id,input.context.binding.user_id,input.context.task.id,call,serde_json::to_string(&input)?,state,now(),now()+lifetime,grant])?;
    if full_access {
-    let revision:u64=tx.query_row("SELECT revision FROM agent_execution_policies WHERE session_id=?1 AND task_id=?2",params![input.context.binding.session_id,input.context.task.id],|r|r.get(0))?;
-    tx.execute("INSERT INTO agent_execution_policy_reviews(request_id,mode,revision,decision,risk,reason) VALUES(?1,'fullAccess',?2,'allow','notReviewed','当前任务已由用户选择完全访问权限')",params![id,revision])?;
+    let revision:u64=tx.query_row("SELECT revision FROM agent_execution_policies WHERE session_id=?1",[&input.context.binding.session_id],|r|r.get(0))?;
+    tx.execute("INSERT INTO agent_execution_policy_reviews(request_id,mode,revision,decision,risk,reason) VALUES(?1,'fullAccess',?2,'allow','notReviewed','当前对话已由用户选择完全访问权限')",params![id,revision])?;
    }
    tx.commit()?;
    if denied{return Err(Error::Denied);}
@@ -535,8 +534,8 @@ impl Approvals {
    let source:Option<String>=tx.query_row("SELECT grant_id FROM agent_execution_requests WHERE id=?1",[&id],|r|r.get(0))?;
    let automatic:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM agent_execution_policy_reviews WHERE request_id=?1 AND decision='allow')",[&id],|r|r.get(0))?;
    if automatic {
-    let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM agent_execution_policy_reviews r JOIN agent_execution_policies p ON p.session_id=?2 AND p.task_id=?3 AND p.mode=r.mode AND p.revision=r.revision WHERE r.request_id=?1 AND r.decision='allow')",
-     params![id,binding.session_id,old.input.context.task.id],|r|r.get(0))?;
+    let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM agent_execution_policy_reviews r JOIN agent_execution_policies p ON p.session_id=?2 AND p.mode=r.mode AND p.revision=r.revision WHERE r.request_id=?1 AND r.decision='allow')",
+     params![id,binding.session_id],|r|r.get(0))?;
     if !valid{return Err(Error::Denied);}
    }
    if let Some(source)=source{

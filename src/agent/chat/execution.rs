@@ -222,19 +222,10 @@ impl Manager {
             if running{return Err(Error::Busy);}
             let target=Some(Target{connection_id:connection,terminal_session_id:terminal});
             if s.task.as_ref().is_some_and(|t|t.target==target && t.status==super::super::TaskStatus::Active){return Ok(s);}
-            let previous=s.task.clone();
             repo.start_task(&session,&user,s.revision,&uuid::Uuid::new_v4().to_string(),TaskRequest{goal:s.task.as_ref().map_or_else(||"在已绑定服务器协助用户；所有命令须明确审批".into(),|t|t.goal.clone()),constraints:s.task.map_or_else(Vec::new,|t|t.constraints),target})?;
             let resumed=repo.session(&session,&user)?;
-            if let (Some(previous),Some(current))=(previous,resumed.task.as_ref()) {
-                // Rebinding this same conversation after failure/reconnect is
-                // not an explicit new task. Carry only its policy preference,
-                // never approvals/grants, and only on the verified same server.
-                if previous.target.as_ref().map(|t|&t.connection_id)==current.target.as_ref().map(|t|&t.connection_id)
-                    &&previous.goal==current.goal&&previous.constraints==current.constraints {
-                    repo.db(|db|Ok(db.execute("UPDATE agent_execution_policies SET task_id=?3,revision=revision+1 WHERE session_id=?1 AND task_id=?2",
-                        rusqlite::params![session,previous.id,current.id])?))?;
-                }
-            }
+            // Approval mode belongs to this conversation. New tasks still have
+            // distinct grants/receipts and must pass live target verification.
             Ok(resumed)
         }).await
     }
@@ -292,17 +283,16 @@ impl Manager {
         session: String,
         mode: Option<(u64, approvals::Policy)>,
     ) -> Result<Value> {
-        let s = self.owned(agent, user.clone(), session.clone()).await?;
-        let task = s.task.ok_or(Error::Invalid)?.id;
+        self.owned(agent, user.clone(), session.clone()).await?;
         if let Some((revision, mode)) = mode {
             self.approvals
-                .set_policy(session.clone(), user.clone(), task.clone(), revision, mode)
+                .set_conversation_policy(session.clone(), user.clone(), revision, mode)
                 .await
                 .map_err(approval_error)?;
         }
         let (mode, revision) = self
             .approvals
-            .policy_view(session, user, task)
+            .conversation_policy(session, user)
             .await
             .map_err(approval_error)?;
         Ok(json!({"mode":mode,"revision":revision}))
@@ -340,8 +330,10 @@ impl Manager {
         F: FnMut(StreamEvent) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
-        // The legacy transport flag is not a user-facing capability switch.
-        // Unbound/offline chats and unsupported protocols retain text chat.
+        // The transport flag enables tools independently of SSH. SSH is one
+        // category and is registered only for a bound live server scope.
+        // No generic/MCP adapters are installed yet; an empty catalog falls
+        // back to text without granting SSH to general/offline conversations.
         let session = self
             .owned(
                 request.agent_id.clone(),
@@ -349,24 +341,21 @@ impl Manager {
                 request.session_id.clone(),
             )
             .await?;
-        let tools_supported = if execution_enabled
-            && !request.terminal_session_id.is_empty()
-            && session
-                .scope
-                .as_ref()
-                .is_some_and(|scope| scope.kind == ScopeKind::Server)
-        {
+        let tools_supported = if execution_enabled {
             let models = ModelRepository::new(self.store.clone());
             let agent = request.agent_id.clone();
             let user = request.user_id.clone();
             worker(move || {
-                Ok(models.get(&agent, &user)?.config.provider == ProviderKind::OpenAiCompatible)
+                let config=models.get(&agent, &user)?.config;
+                Ok(config.provider == ProviderKind::OpenAiCompatible && config.capabilities.tool_calls)
             })
             .await?
         } else {
             false
         };
-        if tools_supported {
+        let ssh_registered = !request.terminal_session_id.is_empty()
+            && session.scope.as_ref().is_some_and(|scope| scope.kind == ScopeKind::Server);
+        if tools_supported && ssh_registered {
             self.chat_tools(request, cancel, send).await
         } else {
             self.chat(request, target, cancel, send).await

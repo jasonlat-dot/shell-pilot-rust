@@ -152,7 +152,12 @@ impl ToolSession {
             }],
             limits,
         )?
-        .with_context(self);
+        .with_context(self)
+        .with_approval_boundary(tool_loop::ApprovalBoundary::new(
+            approvals::Approvals::new(self.repository.store.clone()),
+            self.executor.binding().session_id.clone(),
+            self.executor.binding().user_id.clone(),
+        ));
         model::identifier(request_id).map_err(context_error)?;
         model::text_value(message, 16000).map_err(context_error)?;
         if cancel.is_cancelled() {
@@ -525,6 +530,19 @@ impl Drop for Cleanup {
     }
 }
 impl ToolExecutor for ToolSession {
+    fn authorize_with_policy<'a>(
+        &'a self,
+        call: &'a ValidatedCall,
+        policy: approvals::Policy,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            // Bounded reads need no new approval; SSH owns its durable review,
+            // exact-call decision and final admission under this SAME mode.
+            // Future tool adapters must implement the equivalent workflow.
+            policy != approvals::Policy::Deny && self.authorize(call, cancel).await
+        })
+    }
     fn authorize<'a>(
         &'a self,
         call: &'a ValidatedCall,
@@ -535,7 +553,7 @@ impl ToolExecutor for ToolSession {
                 return false;
             }
             let binding = self.executor.binding();
-            // The mode belongs to the task and applies before every dispatch,
+            // The mode belongs to the conversation and applies before every dispatch,
             // including tools that don't execute SSH commands.
             let mode = super::approvals::Approvals::new(self.repository.store.clone())
                 .policy(
