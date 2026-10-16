@@ -9,7 +9,7 @@ use super::provider::{
     prepare_request, AssistantReply, ChatMessage, ChatRequest, FunctionDefinition, ModelClient,
     ModelError, ProviderKind, ToolCall,
 };
-use futures_util::future::BoxFuture;
+use futures_util::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use schema::Schema;
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, time::Duration};
@@ -25,6 +25,10 @@ pub enum Error {
     NeedsCompaction,
     #[error("Tool-loop round or call limit reached")]
     Limit,
+    #[error("Model request round limit reached")]
+    ModelRoundLimit,
+    #[error("Tool call limit reached")]
+    ToolCallLimit,
     #[error("Tool loop cancelled before dispatch")]
     Cancelled,
     #[error("Tool outcome is unknown; do not automatically execute it again")]
@@ -35,6 +39,47 @@ pub enum Error {
     Model(#[from] ModelError),
 }
 pub type Result<T> = std::result::Result<T, Error>;
+pub(crate) fn external_schema_supported(schema: &Value) -> bool {
+    Schema::compile_mcp(schema).is_some()
+}
+pub(crate) fn validate_external_arguments(schema: &Value, raw: &str) -> Option<Value> {
+    Schema::compile_mcp(schema)?.parse(raw, |_| {})
+}
+
+#[cfg(test)]
+mod external_schema_tests {
+    use super::*;
+    #[test]
+    fn mcp_optional_properties_keep_exact_validation_and_reject_duplicate_arguments() {
+        let schema = json!({"type":"object","properties":{"name":{"type":"string"},"limit":{"type":"integer","minimum":1}},"required":["name"],"additionalProperties":false});
+        assert!(external_schema_supported(&schema));
+        assert!(validate_external_arguments(&schema, r#"{"name":"sample"}"#).is_some());
+        assert!(validate_external_arguments(&schema, r#"{"name":"sample","limit":1}"#).is_some());
+        for invalid in [
+            r#"{"name":"a","name":"b"}"#,
+            r#"{"name":"a","limit":0}"#,
+            r#"{"name":"a","other":true}"#,
+            r#"{}"#,
+        ] {
+            assert!(validate_external_arguments(&schema, invalid).is_none());
+        }
+        assert!(!external_schema_supported(
+            &json!({"type":"object","properties":{"x":{"$ref":"external"}}})
+        ));
+        assert!(
+            Schema::compile(&schema).is_none(),
+            "native closed schema contract remains strict"
+        );
+        for invalid in [
+            json!({"type":"object","properties":false}),
+            json!({"type":"object","required":"name"}),
+            json!({"type":"object","properties":{},"required":["absent"]}),
+        ] {
+            assert!(!external_schema_supported(&invalid));
+            assert!(validate_external_arguments(&invalid, "{}").is_none());
+        }
+    }
+}
 
 /// Immutable during a turn; only tools explicitly registered by the native host exist.
 #[derive(Default)]
@@ -82,9 +127,25 @@ impl ValidatedCall {
     pub fn name(&self) -> &str {
         &self.call.function.name
     }
+    pub(crate) fn scoped(&self, prefix: &str) -> Self {
+        let mut call = self.call.clone();
+        call.id = scoped_call_id(prefix, &self.call.id);
+        Self {
+            call,
+            arguments: self.arguments.clone(),
+        }
+    }
     pub fn arguments(&self) -> &Value {
         &self.arguments
     }
+}
+pub(crate) fn scoped_call_id(parent: &str, id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(parent.as_bytes());
+    hash.update([0]);
+    hash.update(id.as_bytes());
+    format!("child_{}", super::output_model::hex(&hash.finalize()))
 }
 pub enum ToolOutcome {
     /// Model-visible bounded data; full outputs are referenced separately.
@@ -98,6 +159,15 @@ pub enum ToolOutcome {
     OutcomeUnknown,
 }
 pub trait ToolExecutor: Send + Sync {
+    /// Only host-validated output reads may be exempted; unknown calls still count.
+    fn counts_toward_tool_limit(&self, _call: &ValidatedCall) -> bool {
+        true
+    }
+    /// Host-owned scheduling capability. Unknown and side-effecting tools are exclusive.
+    fn supports_parallel(&self, _call: &ValidatedCall) -> bool {
+        false
+    }
+
     /// Shared admission hook for EVERY tool category, not just shell commands.
     /// The native host must use the current conversation's approval policy and a trusted
     /// tool adapter. Registering a function alone never grants execution rights.
@@ -121,9 +191,7 @@ pub trait ToolExecutor: Send + Sync {
         policy: Policy,
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, bool> {
-        Box::pin(async move {
-            policy == Policy::FullAccess && self.authorize(call, cancel).await
-        })
+        Box::pin(async move { policy == Policy::FullAccess && self.authorize(call, cancel).await })
     }
 
     /// Native-only normalization of parsed arguments, before schema validation.
@@ -147,9 +215,15 @@ pub trait ToolExecutor: Send + Sync {
 }
 /// Trusted native persistence and context hooks; model payloads cannot install them.
 pub trait LoopContext: Send + Sync {
-    fn streams_replies(&self) -> bool { false }
-    fn text_delta<'a>(&'a self,_text:String,_cancel:&'a CancellationToken)->BoxFuture<'a,super::provider::Result<()>> {
-        Box::pin(async {Ok(())})
+    fn streams_replies(&self) -> bool {
+        false
+    }
+    fn text_delta<'a>(
+        &'a self,
+        _text: String,
+        _cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, super::provider::Result<()>> {
+        Box::pin(async { Ok(()) })
     }
     fn continue_after_reply<'a>(
         &'a self,
@@ -182,8 +256,8 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            model_rounds: 8,
-            tool_calls: 32,
+            model_rounds: 32,
+            tool_calls: 128,
             result_bytes: 8192,
             tool_timeout: Duration::from_secs(30),
         }
@@ -206,11 +280,18 @@ pub struct ApprovalBoundary {
 }
 impl ApprovalBoundary {
     pub fn new(approvals: Approvals, session: String, user: String) -> Self {
-        Self { approvals, session, user }
+        Self {
+            approvals,
+            session,
+            user,
+        }
     }
     async fn mode(&self) -> Policy {
-        self.approvals.conversation_policy(self.session.clone(), self.user.clone())
-            .await.map(|(mode, _)| mode).unwrap_or(Policy::Deny)
+        self.approvals
+            .conversation_policy(self.session.clone(), self.user.clone())
+            .await
+            .map(|(mode, _)| mode)
+            .unwrap_or(Policy::Deny)
     }
 }
 
@@ -230,8 +311,8 @@ impl<'a> ToolLoop<'a> {
         messages: Vec<ChatMessage>,
         limits: Limits,
     ) -> Result<Self> {
-        if !(1..=64).contains(&limits.model_rounds)
-            || !(1..=256).contains(&limits.tool_calls)
+        if !(1..=256).contains(&limits.model_rounds)
+            || !(1..=1024).contains(&limits.tool_calls)
             || !(256..=32768).contains(&limits.result_bytes)
             || limits.tool_timeout.is_zero()
             || limits.tool_timeout > Duration::from_secs(300)
@@ -309,16 +390,24 @@ impl<'a> ToolLoop<'a> {
                 return Err(Error::Cancelled);
             }
             if self.model_rounds >= self.limits.model_rounds {
-                return Err(Error::Limit);
+                return Err(Error::ModelRoundLimit);
             }
             if let Some(context) = self.context {
                 self.request = context.before_model(&self.request, cancel).await?;
             }
             self.boundary(client)?;
             self.model_rounds += 1;
-            let reply = if let Some(context)=self.context.filter(|context|context.streams_replies()) {
-                client.stream_tools(&self.request,cancel,|text|context.text_delta(text,cancel)).await?.message
-            } else {client.complete(&self.request, cancel).await?.message};
+            let reply =
+                if let Some(context) = self.context.filter(|context| context.streams_replies()) {
+                    client
+                        .stream_tools(&self.request, cancel, |text| {
+                            context.text_delta(text, cancel)
+                        })
+                        .await?
+                        .message
+                } else {
+                    client.complete(&self.request, cancel).await?.message
+                };
             if reply.tool_calls.is_empty() {
                 if let Some(context) = self.context {
                     if context.continue_after_reply(&reply, cancel).await? {
@@ -389,113 +478,160 @@ impl<'a> ToolLoop<'a> {
                     self.request = batch;
                 }
             }
-            if self.model_rounds >= self.limits.model_rounds
-                || self.tool_calls + reply.tool_calls.len() > self.limits.tool_calls
-            {
-                return Err(Error::Limit);
+            let charged = validated
+                .iter()
+                .filter(|call| {
+                    call.as_ref()
+                        .is_none_or(|call| executor.counts_toward_tool_limit(call))
+                })
+                .count();
+            if self.model_rounds >= self.limits.model_rounds {
+                return Err(Error::ModelRoundLimit);
+            }
+            if self.tool_calls + charged > self.limits.tool_calls {
+                return Err(Error::ToolCallLimit);
             }
             if let Some(context) = self.context {
                 context
                     .begin_batch(&reply.tool_calls, assistant_text.as_deref(), cancel)
                     .await?;
             }
-            self.tool_calls += reply.tool_calls.len();
-            for (index, call) in validated.iter().enumerate() {
-                let Some(call) = call else {
-                    if let Some(context) = self.context {
-                        if let ChatMessage::Tool {
-                            tool_call_id,
-                            content,
-                        } = &self.request.messages[result_start + index]
-                        {
-                            context.result(tool_call_id, content).await?;
-                        }
+            self.tool_calls += charged;
+            // Parallelize only a contiguous group of host-approved independent calls.
+            // Exclusive calls form fences; later calls cannot jump ahead of them.
+            let mut start = 0;
+            while start < validated.len() {
+                let parallel = validated[start]
+                    .as_ref()
+                    .is_some_and(|c| executor.supports_parallel(c));
+                let mut end = start + 1;
+                if parallel {
+                    while end < validated.len()
+                        && validated[end]
+                            .as_ref()
+                            .is_some_and(|c| executor.supports_parallel(c))
+                    {
+                        end += 1;
                     }
-                    continue;
-                };
-                if cancel.is_cancelled() {
-                    return Err(Error::Cancelled);
                 }
-                let slot = result_start + index;
-                // Authorization precedes dispatch and the "possibly executed"
-                // marker. Unknown/new tool adapters fail closed by default.
-                let authorized = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => return Err(Error::Cancelled),
-                    allowed = async {
-                        match &self.approval_boundary {
-                            Some(boundary) => {
-                                let mode = boundary.mode().await;
-                                mode != Policy::Deny && executor.authorize_with_policy(call, mode, cancel).await
+                let group = cancel.child_token();
+                let _group_guard = group.clone().drop_guard();
+                let mut active = FuturesUnordered::new();
+                let mut next = start;
+                let mut failure = None;
+                let mut completed = vec![];
+                loop {
+                    while failure.is_none() && next < end && active.len() < 4 {
+                        let index = next;
+                        next += 1;
+                        let operation = self.run_call(
+                            executor,
+                            validated[index].as_ref(),
+                            &reply.tool_calls[index],
+                            &group,
+                        );
+                        active.push(async move { (index, operation.await) });
+                    }
+                    let Some((index, result)) = active.next().await else {
+                        break;
+                    };
+                    match result {
+                        Ok((content, unknown)) => {
+                            completed.push((index, content));
+                            if unknown {
+                                failure.get_or_insert(Error::OutcomeUnknown);
+                                group.cancel();
                             }
-                            // Standalone loops retain their explicit host authorizer;
-                            // persisted product turns always require a boundary.
-                            None if self.context.is_none() => executor.authorize(call, cancel).await,
-                            None => false,
                         }
-                    } => allowed,
-                };
-                if !authorized {
-                    let content = failure("denied").to_string();
-                    self.request.messages[slot] = result_message(call.id(), failure("denied"));
-                    if let Some(context) = self.context {
-                        context.result(call.id(), &content).await?;
-                    }
-                    continue;
-                }
-                if cancel.is_cancelled() {
-                    return Err(Error::Cancelled);
-                }
-                // Set unknown *before* awaiting: even dropping this future cannot make
-                // an in-flight call look unexecuted. A started loop cannot be replayed.
-                self.request.messages[slot] = result_message(call.id(), failure("result_unknown"));
-                if let Some(context) = self.context {
-                    context.started(call.id())?;
-                }
-                let child = cancel.child_token();
-                let _cancel_on_drop = child.clone().drop_guard();
-                let outcome = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => ToolOutcome::OutcomeUnknown,
-                    outcome = async {
-                        let execution = executor.execute(call, &child);
-                        if executor.uses_total_timeout(call.name()) {
-                            tokio::time::timeout(self.limits.tool_timeout, execution)
-                                .await
-                                .unwrap_or(ToolOutcome::OutcomeUnknown)
-                        } else {
-                            execution.await
+                        Err(error) => {
+                            failure.get_or_insert(error);
+                            group.cancel();
                         }
-                    } => outcome,
-                };
-                child.cancel();
-                let (value, unknown) = match outcome {
-                    ToolOutcome::Success(data) => (json!({"ok":true,"data":data}), false),
-                    ToolOutcome::Failed => (failure("tool_failed"), false),
-                    ToolOutcome::Failure { code, data } => {
-                        (json!({"ok":false,"error":code,"data":data}), false)
                     }
-                    ToolOutcome::Denied => (failure("denied"), false),
-                    ToolOutcome::OutcomeUnknown => (failure("result_unknown"), true),
-                };
-                let mut content = value.to_string();
-                if content.len() > self.limits.result_bytes {
-                    content = failure("output_too_large").to_string();
                 }
-                self.request.messages[slot] = ChatMessage::Tool {
-                    tool_call_id: call.id().into(),
-                    content: content.clone(),
-                };
-                if let Some(context) = self.context {
-                    context.result(call.id(), &content).await?;
+                drop(active);
+                for (index, content) in completed {
+                    self.request.messages[result_start + index] = ChatMessage::Tool {
+                        tool_call_id: reply.tool_calls[index].id.clone(),
+                        content,
+                    };
                 }
-                if unknown {
-                    return Err(Error::OutcomeUnknown);
+                if let Some(error) = failure {
+                    return Err(error);
                 }
+                start = end;
             }
             // Re-check the complete real results, definitions and framing, not just
             // the user request. Never prune tool pairs or resend an oversized request.
         }
+    }
+    fn run_call<'b>(
+        &'b self,
+        executor: &'b impl ToolExecutor,
+        call: Option<&'b ValidatedCall>,
+        raw: &'b ToolCall,
+        cancel: &'b CancellationToken,
+    ) -> BoxFuture<'b, Result<(String, bool)>> {
+        Box::pin(async move {
+            let Some(call) = call else {
+                let content = failure("invalid_arguments").to_string();
+                if let Some(context) = self.context {
+                    context.result(&raw.id, &content).await?;
+                }
+                return Ok((content, false));
+            };
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let authorized = tokio::select! {biased;
+                _=cancel.cancelled()=>return Err(Error::Cancelled),
+                result=async {match &self.approval_boundary {
+                    Some(boundary)=>{let mode=boundary.mode().await;mode!=Policy::Deny&&executor.authorize_with_policy(call,mode,cancel).await},
+                    None if self.context.is_none()=>executor.authorize(call,cancel).await,
+                    None=>false,
+                }}=>result,
+            };
+            if !authorized {
+                let content = failure("denied").to_string();
+                if let Some(context) = self.context {
+                    context.result(call.id(), &content).await?;
+                }
+                return Ok((content, false));
+            }
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            if let Some(context) = self.context {
+                context.started(call.id())?;
+            }
+            let child = cancel.child_token();
+            let _guard = child.clone().drop_guard();
+            let outcome = tokio::select! {biased;
+                _=cancel.cancelled()=>ToolOutcome::OutcomeUnknown,
+                result=async {
+                    let execution=executor.execute(call,&child);
+                    if executor.uses_total_timeout(call.name()){tokio::time::timeout(self.limits.tool_timeout,execution).await.unwrap_or(ToolOutcome::OutcomeUnknown)}else{execution.await}
+                }=>result,
+            };
+            child.cancel();
+            let (value, unknown) = match outcome {
+                ToolOutcome::Success(data) => (json!({"ok":true,"data":data}), false),
+                ToolOutcome::Failed => (failure("tool_failed"), false),
+                ToolOutcome::Failure { code, data } => {
+                    (json!({"ok":false,"error":code,"data":data}), false)
+                }
+                ToolOutcome::Denied => (failure("denied"), false),
+                ToolOutcome::OutcomeUnknown => (failure("result_unknown"), true),
+            };
+            let mut content = value.to_string();
+            if content.len() > self.limits.result_bytes {
+                content = failure("output_too_large").to_string();
+            }
+            if let Some(context) = self.context {
+                context.result(call.id(), &content).await?;
+            }
+            Ok((content, unknown))
+        })
     }
     fn boundary(&self, client: &ModelClient) -> Result<()> {
         if self.context.is_some() {

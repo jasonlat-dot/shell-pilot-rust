@@ -29,6 +29,8 @@ fn delete_chat_data(db: &Connection, user: &str, id: &str) -> Result<()> {
         "DELETE FROM agent_execution_policies WHERE session_id=?1",
         "DELETE FROM agent_turn_inputs WHERE session_id=?1",
         "DELETE FROM agent_input_gates WHERE session_id=?1",
+        "DELETE FROM agent_extension_approvals WHERE session_id=?1",
+        "DELETE FROM agent_workflow_events WHERE session_id=?1",
         "DELETE FROM agent_tool_turns WHERE session_id=?1",
         "DELETE FROM agent_chat_turns WHERE session_id=?1",
         "DELETE FROM agent_context_status WHERE session_id=?1",

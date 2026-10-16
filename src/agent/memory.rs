@@ -601,7 +601,7 @@ mod tests {
             assert_eq!(
                 repo.db(|db| Ok(db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?))
                     .unwrap(),
-                19
+                20
             );
             assert!(repo
                 .memories("model", "alice", &sid)

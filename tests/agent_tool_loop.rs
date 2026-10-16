@@ -191,6 +191,125 @@ fn results(loop_: &ToolLoop<'_>) -> Vec<Value> {
         .collect()
 }
 
+struct ConcurrentHost {
+    active: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+    ids: Mutex<Vec<String>>,
+    unknown: bool,
+}
+impl ToolExecutor for ConcurrentHost {
+    fn supports_parallel(&self, call: &ValidatedCall) -> bool {
+        call.id() != "fence"
+    }
+    fn authorize<'a>(
+        &'a self,
+        _: &'a ValidatedCall,
+        _: &'a CancellationToken,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async { true })
+    }
+    fn execute<'a>(
+        &'a self,
+        call: &'a ValidatedCall,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, ToolOutcome> {
+        Box::pin(async move {
+            use std::sync::atomic::Ordering;
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            self.ids.lock().unwrap().push(call.id().into());
+            if call.id() == "fence" {
+                assert_eq!(active, 1, "exclusive tools must run alone");
+            }
+            struct Guard<'a>(&'a std::sync::atomic::AtomicUsize);
+            impl Drop for Guard<'_> {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            let _guard = Guard(&self.active);
+            if self.unknown {
+                if call.id() == "a" {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    return ToolOutcome::OutcomeUnknown;
+                }
+                cancel.cancelled().await;
+                return ToolOutcome::OutcomeUnknown;
+            }
+            tokio::time::sleep(Duration::from_millis(if call.id() == "a" { 30 } else { 5 })).await;
+            ToolOutcome::Success(json!({"id":call.id()}))
+        })
+    }
+}
+#[tokio::test]
+async fn independent_calls_overlap_with_a_bound_and_exclusive_fences_preserve_protocol_order() {
+    let ids = ["a", "b", "c", "d", "fence", "e", "f", "g", "h", "i"];
+    let model = Model::new(
+        vec![
+            calls(ids.iter().map(|id| call(id, args().to_string())).collect()),
+            final_reply(),
+        ],
+        |_| {},
+    )
+    .await;
+    let registry = registry();
+    let mut loop_ = ToolLoop::new(&registry, input(), Limits::default()).unwrap();
+    let host = ConcurrentHost {
+        active: 0.into(),
+        peak: 0.into(),
+        ids: Mutex::new(vec![]),
+        unknown: false,
+    };
+    loop_
+        .run(&model.client, &host, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(host.peak.load(std::sync::atomic::Ordering::SeqCst), 4);
+    let actual = host.ids.lock().unwrap();
+    assert_eq!(actual[4], "fence");
+    let returned = results(&loop_);
+    assert_eq!(
+        returned
+            .iter()
+            .map(|r| r["data"]["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ids
+    );
+}
+#[tokio::test]
+async fn unknown_parallel_call_cancels_active_siblings_without_starting_queued_work() {
+    let model = Model::new(
+        vec![calls(
+            ["a", "b", "c", "d", "e", "f"]
+                .iter()
+                .map(|id| call(id, args().to_string()))
+                .collect(),
+        )],
+        |_| {},
+    )
+    .await;
+    let registry = registry();
+    let mut loop_ = ToolLoop::new(&registry, input(), Limits::default()).unwrap();
+    let host = ConcurrentHost {
+        active: 0.into(),
+        peak: 0.into(),
+        ids: Mutex::new(vec![]),
+        unknown: true,
+    };
+    assert!(matches!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            loop_.run(&model.client, &host, &CancellationToken::new())
+        )
+        .await
+        .unwrap(),
+        Err(tool_loop::Error::OutcomeUnknown)
+    ));
+    assert_eq!(host.ids.lock().unwrap().len(), 4);
+    assert_eq!(host.active.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(model.requests().len(), 1);
+}
+
 #[tokio::test]
 async fn main_model_selects_multi_round_tools_and_receives_paired_results() {
     let model = Model::new(
@@ -357,13 +476,16 @@ async fn round_and_call_limits_do_not_start_a_batch_they_cannot_finish() {
         .await;
         let r = registry();
         let host = Host::new(Behavior::Success(json!(true)));
+        let rounds = limits.model_rounds == 1;
         let mut loop_ = ToolLoop::new(&r, input(), limits).unwrap();
-        assert!(matches!(
-            loop_
-                .run(&model.client, &host, &CancellationToken::new())
-                .await,
-            Err(tool_loop::Error::Limit)
-        ));
+        let result = loop_
+            .run(&model.client, &host, &CancellationToken::new())
+            .await;
+        assert!(if rounds {
+            matches!(result, Err(tool_loop::Error::ModelRoundLimit))
+        } else {
+            matches!(result, Err(tool_loop::Error::ToolCallLimit))
+        });
         assert!(host.ids.lock().unwrap().is_empty());
         assert!(results(&loop_).iter().all(|r| r["error"] == "not_executed"));
         assert_eq!(model.requests().len(), 1);

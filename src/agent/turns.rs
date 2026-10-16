@@ -44,6 +44,7 @@ pub struct Turn {
     pub created_at: i64,
     pub updated_at: i64,
     pub tool_events: Vec<super::Event>,
+    pub started_tool_call_ids: Vec<String>,
     pub inputs: Vec<super::steering::Input>,
     pub attachments: Vec<super::attachments::Reference>,
 }
@@ -105,6 +106,7 @@ fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
             created_at: r.get("created_at")?,
             updated_at: r.get("updated_at")?,
             tool_events: vec![],
+            started_tool_call_ids: vec![],
             inputs: vec![],
             attachments: vec![],
         },
@@ -312,6 +314,7 @@ fn recover(db: &Connection, session: &str) -> Result<()> {
                 ))?;
             }
             storage(db.execute("UPDATE agent_execution_requests SET state=CASE WHEN state='admitted' THEN 'unknown' ELSE 'cancelled' END,updated_at=?3 WHERE session_id=?1 AND call_id IN (SELECT call_id FROM agent_events WHERE session_id=?1 AND id>?2 AND kind='tool_call') AND state IN ('pending','approved','admitted')",params![session,old.turn.cursor,now()]))?;
+            storage(db.execute("UPDATE agent_extension_approvals SET state=CASE WHEN state='admitted' THEN 'unknown' ELSE 'cancelled' END WHERE session_id=?1 AND call_id IN (SELECT call_id FROM agent_events WHERE session_id=?1 AND id>?2 AND kind='tool_call') AND state IN ('pending','approved','admitted')",params![session,old.turn.cursor]))?;
         }
         finish_row(
             db,
@@ -366,6 +369,7 @@ impl Turns {
     ) -> Result<(Turn, bool)> {
         self.begin_kind(request, target, owner, expected, false)
     }
+    #[cfg(test)]
     pub fn begin_tools(
         &self,
         request: &Request,
@@ -374,6 +378,15 @@ impl Turns {
         expected: u64,
     ) -> Result<(Turn, bool)> {
         self.begin_kind(request, Some(target), owner, expected, true)
+    }
+    pub(crate) fn begin_runtime_tools(
+        &self,
+        request: &Request,
+        target: Option<Target>,
+        owner: &str,
+        expected: u64,
+    ) -> Result<(Turn, bool)> {
+        self.begin_kind(request, target, owner, expected, true)
     }
     fn begin_kind(
         &self,
@@ -523,6 +536,8 @@ impl Turns {
                 let mut q=storage(tx.prepare("SELECT id,session_id,task_id,request_id,payload,created_at FROM agent_events WHERE session_id=?1 AND id>?2 AND (?3 IS NULL OR id<?3) ORDER BY id LIMIT 600"))?;
                 let rows=storage(q.query_map(params![session.id,turn.cursor,end],super::repository::read_event_row))?;
                 turn.tool_events=rows.map(|r|super::repository::decode_event(r.map_err(|_|Error::Storage)?).map_err(Error::from)).collect::<Result<Vec<_>>>()?.into_iter().filter(|e|matches!(e.payload,Payload::ToolCall{..}|Payload::ToolResult{..})).collect();
+                let mut started=storage(tx.prepare("SELECT DISTINCT w.parent_call_id FROM agent_workflow_events w JOIN agent_events c ON c.session_id=w.session_id AND c.call_id=w.parent_call_id AND c.kind='tool_call' WHERE w.session_id=?1 AND w.kind='tool_started' AND c.id>?2 AND (?3 IS NULL OR c.id<?3)"))?;
+                turn.started_tool_call_ids=storage(started.query_map(params![session.id,turn.cursor,end],|r|r.get(0)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(|_|Error::Storage)?;
             }
             storage(tx.commit())?;Ok(History {session,turns,has_more,next_after})
         })

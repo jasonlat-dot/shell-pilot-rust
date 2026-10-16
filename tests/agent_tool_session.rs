@@ -1065,6 +1065,315 @@ async fn user_supplement_during_approval_invalidates_the_dispatch_plan_inside_ad
 }
 
 // D5 uses the actual desktop Manager: persistent turn receipt + bound SSH + human decisions.
+#[tokio::test]
+async fn e3_child_ssh_uses_the_parent_server_binding_and_exact_human_approval() {
+    use shellpilot_server::agent::{chat::StreamEvent, extensions};
+    let b = Bound::new(
+        vec![
+            Step::Calls(vec![tool(
+                "delegate",
+                "delegate_agent",
+                json!({"task":"读取日志","context":"沿用父任务服务器，只读取"}),
+            )]),
+            Step::Calls(vec![exec("child-ssh", "__exec_unicode__")]),
+            Step::Final,
+            Step::Final,
+        ],
+        90,
+        true,
+        false,
+    )
+    .await;
+    let mut config = extensions::settings(&b.store, "default").unwrap();
+    config.config.sub_agents = true;
+    extensions::save(&b.store, "default", config).unwrap();
+    let (manager, request) = desktop(&b).await;
+    let events = Arc::new(Mutex::new(vec![]));
+    let frames = events.clone();
+    let m = manager.clone();
+    let r = request.clone();
+    let run = tokio::spawn(async move {
+        m.chat_desktop(r, None, true, &CancellationToken::new(), move |e| {
+            frames.lock().unwrap().push(e);
+            async { Ok(()) }
+        })
+        .await
+    });
+    let approval = pending_approval(&manager, &request).await;
+    assert!(approval.call_id.starts_with("child_"));
+    assert_eq!(approval.binding.tool.target, b.target);
+    assert_eq!(b.execs(), 0);
+    manager
+        .execution_decision(
+            "model".into(),
+            "default".into(),
+            request.session_id.clone(),
+            approval.id,
+            "approveOnce".into(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(8), run)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(b.execs(), 1);
+    assert!(events.lock().unwrap().iter().any(|e|matches!(e,StreamEvent::ToolCall{tool_call_id,agent_call_id:Some(parent),..} if tool_call_id.starts_with("child_")&&parent=="delegate")));
+    assert!(events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| matches!(e,StreamEvent::AgentResult{status,..} if status=="success")));
+    assert!(b
+        .repo
+        .snapshot(&request.session_id, "default")
+        .unwrap()
+        .pending_tool_call_ids
+        .is_empty());
+    b.terminals.shutdown().await;
+}
+
+#[tokio::test]
+async fn parallel_children_serialize_ssh_without_invalidating_sibling_approval_or_showing_queued_commands(
+) {
+    use shellpilot_server::agent::{chat::StreamEvent, extensions};
+    let b = Bound::new(
+        vec![
+            Step::Calls(vec![
+                tool(
+                    "left",
+                    "delegate_agent",
+                    json!({"task":"检查一","context":"只读取"}),
+                ),
+                tool(
+                    "right",
+                    "delegate_agent",
+                    json!({"task":"检查二","context":"只读取"}),
+                ),
+            ]),
+            Step::Calls(vec![exec("same-local-id", "__exec_unicode__")]),
+            Step::Calls(vec![exec("same-local-id", "__exec_unicode__")]),
+            Step::Final,
+            Step::Final,
+            Step::Final,
+        ],
+        90,
+        true,
+        false,
+    )
+    .await;
+    let mut config = extensions::settings(&b.store, "default").unwrap();
+    config.config.sub_agents = true;
+    extensions::save(&b.store, "default", config).unwrap();
+    let (manager, request) = desktop(&b).await;
+    let m = manager.clone();
+    let r = request.clone();
+    let events = Arc::new(Mutex::new(vec![]));
+    let frames = events.clone();
+    let run = tokio::spawn(async move {
+        m.chat_desktop(r, None, true, &CancellationToken::new(), move |e| {
+            frames.lock().unwrap().push(e);
+            async { Ok(()) }
+        })
+        .await
+    });
+    let first = pending_approval(&manager, &request).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(b.execs(), 0);
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e,StreamEvent::ToolCall{tool_name,..} if tool_name=="ssh_execute"))
+            .count(),
+        1
+    );
+    manager
+        .execution_decision(
+            "model".into(),
+            "default".into(),
+            request.session_id.clone(),
+            first.id,
+            "approveOnce".into(),
+        )
+        .await
+        .unwrap();
+    let second = pending_approval(&manager, &request).await;
+    assert_ne!(first.call_id, second.call_id);
+    assert_eq!(b.execs(), 1);
+    assert_eq!(first.binding.tool.target, second.binding.tool.target);
+    manager
+        .execution_decision(
+            "model".into(),
+            "default".into(),
+            request.session_id.clone(),
+            second.id,
+            "approveOnce".into(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(8), run)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(b.execs(), 2);
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e,StreamEvent::AgentResult{status,..} if status=="success"))
+            .count(),
+        2
+    );
+    assert!(b
+        .repo
+        .snapshot(&request.session_id, "default")
+        .unwrap()
+        .pending_tool_call_ids
+        .is_empty());
+    b.terminals.shutdown().await;
+}
+
+#[tokio::test]
+async fn child_reads_oversized_pages_from_its_own_ssh_output_without_reexecuting_commands() {
+    use shellpilot_server::agent::{chat::StreamEvent, extensions};
+    let b = Bound::new(
+        vec![
+            Step::Calls(vec![tool(
+                "delegate",
+                "delegate_agent",
+                json!({"task":"读取两条命令及分页输出","context":"只分析实际读到的内容"}),
+            )]),
+            Step::Calls(vec![exec("large", "__exec_large__")]),
+            Step::Calls(vec![exec("second", "__exec_unicode__")]),
+            Step::Read {
+                id: "page-1".into(),
+                source: "large".into(),
+                offset: 0,
+                limit: 1000,
+            },
+            Step::Read {
+                id: "page-2".into(),
+                source: "large".into(),
+                offset: 512,
+                limit: 4096,
+            },
+            Step::Read {
+                id: "page-3".into(),
+                source: "large".into(),
+                offset: 1024,
+                limit: 1500,
+            },
+            Step::Read {
+                id: "page-4".into(),
+                source: "large".into(),
+                offset: 1536,
+                limit: 4096,
+            },
+            Step::Read {
+                id: "page-5".into(),
+                source: "large".into(),
+                offset: 2048,
+                limit: 4096,
+            },
+            Step::Read {
+                id: "page-6".into(),
+                source: "large".into(),
+                offset: 2560,
+                limit: 4096,
+            },
+            Step::Final,
+            Step::Final,
+        ],
+        90,
+        true,
+        false,
+    )
+    .await;
+    let mut config = extensions::settings(&b.store, "default").unwrap();
+    config.config.sub_agents = true;
+    config.config.execution_limits.child_tool_calls = 2;
+    config.config.execution_limits.child_model_rounds = 9;
+    extensions::save(&b.store, "default", config).unwrap();
+    let (manager, request) = desktop(&b).await;
+    let m = manager.clone();
+    let r = request.clone();
+    let events = Arc::new(Mutex::new(vec![]));
+    let frames = events.clone();
+    let run = tokio::spawn(async move {
+        m.chat_desktop(r, None, true, &CancellationToken::new(), move |e| {
+            frames.lock().unwrap().push(e);
+            async { Ok(()) }
+        })
+        .await
+    });
+    for _ in 0..2 {
+        let approval = pending_approval(&manager, &request).await;
+        manager
+            .execution_decision(
+                "model".into(),
+                "default".into(),
+                request.session_id.clone(),
+                approval.id,
+                "approveOnce".into(),
+            )
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(8), run)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        b.execs(),
+        2,
+        "output pagination must not execute another SSH command"
+    );
+    let persisted = b
+        .repo
+        .events(&request.session_id, "default", 0, 200)
+        .unwrap();
+    let reads = persisted
+        .iter()
+        .filter_map(|e| match &e.payload {
+            Payload::ToolCall {
+                call_id,
+                tool_name,
+                arguments,
+            } if tool_name == READ_OUTPUT => Some((call_id, arguments)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reads.len(), 6);
+    for (index, (id, args)) in reads.iter().enumerate() {
+        assert_eq!(args["parentToolCallId"], "delegate");
+        assert!(id.starts_with("child_"));
+        let value = result(&persisted, id);
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["data"]["text"], "x".repeat(512));
+        assert_eq!(value["data"]["bytesHex"], "78".repeat(512));
+        assert_eq!(value["data"]["offset"], index * 512);
+        assert_eq!(value["data"]["nextOffset"], (index + 1) * 512);
+        assert_eq!(value["data"]["eof"], false);
+    }
+    assert!(events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| matches!(e,StreamEvent::AgentResult{status,..} if status=="success")));
+    assert_eq!(
+        b.normal().len(),
+        11,
+        "child must report after two charged calls and six free output reads"
+    );
+    b.terminals.shutdown().await;
+}
+
 async fn desktop(
     b: &Bound,
 ) -> (
@@ -1611,6 +1920,23 @@ async fn desktop_d5_batch_compaction_reports_real_checkpoint_and_grants_can_be_r
         false,
     )
     .await;
+    // E3's host catalog also occupies pinned input. Keep enough room for a
+    // minimal checkpoint below the low watermark while the four-result batch
+    // still exceeds the compaction trigger.
+    let models = ModelRepository::new(b.store.clone());
+    let mut model = models.get("model", "default").unwrap();
+    model.config.context_window = 11264;
+    models
+        .save(
+            "model",
+            "default",
+            model.revision,
+            ModelConfigUpdate {
+                config: model.config,
+                api_key: KeyChange::Keep,
+            },
+        )
+        .unwrap();
     let (manager, request) = desktop(&b).await;
     let m = manager.clone();
     let r = request.clone();
@@ -1823,4 +2149,59 @@ async fn tool_turn_receives_confirmed_memory_as_separate_budgeted_context() {
     assert!(!serde_json::to_string(&b.events())
         .unwrap()
         .contains("MEMORY_TOOL_MARKER"));
+}
+
+#[tokio::test]
+async fn output_pagination_is_free_of_tool_quota_but_not_model_round_quota() {
+    for rounds in [6, 3] {
+        let b = Bound::new(
+            vec![
+                Step::Calls(vec![exec("source", "__exec_large__")]),
+                Step::Read {
+                    id: "page-a".into(),
+                    source: "source".into(),
+                    offset: 0,
+                    limit: 1000,
+                },
+                Step::Read {
+                    id: "page-b".into(),
+                    source: "source".into(),
+                    offset: 512,
+                    limit: 4096,
+                },
+                Step::Final,
+            ],
+            90,
+            true,
+            false,
+        )
+        .await;
+        let result = b
+            .session()
+            .await
+            .run(
+                "pagination",
+                "读取已有输出",
+                Limits {
+                    model_rounds: rounds,
+                    tool_calls: 1,
+                    ..Default::default()
+                },
+                &CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(b.execs(), 1);
+        if rounds == 6 {
+            result.unwrap();
+            assert_eq!(
+                self::result(&b.events(), "page-b")["data"]["nextOffset"],
+                1024
+            );
+            assert_eq!(b.normal().len(), 4);
+        } else {
+            assert!(matches!(result, Err(tool_loop::Error::ModelRoundLimit)));
+            assert_eq!(b.normal().len(), 3);
+        }
+        b.terminals.shutdown().await;
+    }
 }

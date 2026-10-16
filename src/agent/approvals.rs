@@ -948,7 +948,7 @@ mod tests {
         ));
     }
     #[tokio::test]
-    async fn denied_policy_is_persisted_and_scoped_to_the_current_task() {
+    async fn denied_policy_is_persisted_across_tasks_in_the_same_conversation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent.sqlite");
         let (store, input) = setup(&path);
@@ -987,15 +987,7 @@ mod tests {
         .unwrap();
         changed.context.task = repo.session(&s.id, "default").unwrap().task.unwrap();
         changed.context.binding.tool.task_id = changed.context.task.id.clone();
-        let t = ticket(&reopened, changed, "different-task").await;
-        assert_eq!(
-            reopened
-                .receipt(t.id.clone(), t.user.clone())
-                .await
-                .unwrap()
-                .state,
-            State::Pending
-        );
+        assert!(matches!(reopened.begin(changed, "different-task".into(), true).await,Err(Error::Denied)));
     }
     #[tokio::test]
     async fn separate_database_handles_cannot_claim_the_same_request_twice() {
@@ -1054,7 +1046,7 @@ mod tests {
                 .db(|db| Ok(db.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))?))
                 .await
                 .unwrap(),
-            19
+            20
         );
     }
 }

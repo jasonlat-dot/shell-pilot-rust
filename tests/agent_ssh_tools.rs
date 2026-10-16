@@ -278,8 +278,8 @@ async fn default_authorization_and_invalid_binding_never_dispatch_ssh() {
             explanation: None,
         },
         Command {
-            command: "x".into(),
-            timeout_seconds: 0,
+            command: "   ".into(),
+            timeout_seconds: 15,
             explanation: None,
         },
     ] {

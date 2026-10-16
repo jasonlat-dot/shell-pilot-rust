@@ -16,6 +16,8 @@ fn tool_error(e: tool_loop::Error) -> Error {
         tool_loop::Error::Cancelled => ModelError::Cancelled.into(),
         tool_loop::Error::NeedsCompaction => Error::CompactionLimit,
         tool_loop::Error::Limit => Error::ToolLimit,
+        tool_loop::Error::ModelRoundLimit => Error::ModelRoundLimit,
+        tool_loop::Error::ToolCallLimit => Error::ToolCallLimit,
         tool_loop::Error::OutcomeUnknown => Error::ToolUnknown,
         tool_loop::Error::AlreadyStarted => Error::Conflict,
         tool_loop::Error::Context => Error::ContextChanged,
@@ -172,7 +174,7 @@ impl Manager {
         );
         Ok(Slot { manager: self, key })
     }
-    async fn owned(
+    pub(crate) async fn owned(
         &self,
         agent: String,
         user: String,
@@ -332,8 +334,8 @@ impl Manager {
     {
         // The transport flag enables tools independently of SSH. SSH is one
         // category and is registered only for a bound live server scope.
-        // No generic/MCP adapters are installed yet; an empty catalog falls
-        // back to text without granting SSH to general/offline conversations.
+        // General/native extensions share this loop; only a bound server scope
+        // can add SSH to its catalog.
         let session = self
             .owned(
                 request.agent_id.clone(),
@@ -346,17 +348,21 @@ impl Manager {
             let agent = request.agent_id.clone();
             let user = request.user_id.clone();
             worker(move || {
-                let config=models.get(&agent, &user)?.config;
-                Ok(config.provider == ProviderKind::OpenAiCompatible && config.capabilities.tool_calls)
+                let config = models.get(&agent, &user)?.config;
+                Ok(config.provider == ProviderKind::OpenAiCompatible
+                    && config.capabilities.tool_calls)
             })
             .await?
         } else {
             false
         };
         let ssh_registered = !request.terminal_session_id.is_empty()
-            && session.scope.as_ref().is_some_and(|scope| scope.kind == ScopeKind::Server);
-        if tools_supported && ssh_registered {
-            self.chat_tools(request, cancel, send).await
+            && session
+                .scope
+                .as_ref()
+                .is_some_and(|scope| scope.kind == ScopeKind::Server);
+        if tools_supported {
+            self.chat_tools(request, ssh_registered, cancel, send).await
         } else {
             self.chat(request, target, cancel, send).await
         }
@@ -364,6 +370,7 @@ impl Manager {
     async fn chat_tools<F, Fut>(
         &self,
         request: Request,
+        ssh_registered: bool,
         cancel: &CancellationToken,
         mut send: F,
     ) -> Result<()>
@@ -417,7 +424,7 @@ impl Manager {
             finished: true,
             observation: None,
         };
-        let terminals = self.terminals.clone().ok_or(Error::TargetUnavailable)?;
+        let terminals = self.terminals.clone();
         let repo = Repository::new(self.store.clone());
         let r = request.clone();
         let snapshot = worker(move || {
@@ -425,36 +432,45 @@ impl Manager {
             if s.session.agent_id != r.agent_id {
                 return Err(Error::NotFound);
             }
-            if s.session
-                .scope
-                .as_ref()
-                .is_none_or(|s| s.kind != ScopeKind::Server)
+            if ssh_registered
+                && s.session
+                    .scope
+                    .as_ref()
+                    .is_none_or(|s| s.kind != ScopeKind::Server)
             {
                 return Err(Error::TargetMismatch);
             }
-            let binding = ToolBinding::from_snapshot(&s).map_err(|_| Error::TargetMismatch)?;
-            if binding.target.terminal_session_id != r.terminal_session_id {
-                return Err(Error::TargetMismatch);
+            if ssh_registered {
+                let binding = ToolBinding::from_snapshot(&s).map_err(|_| Error::TargetMismatch)?;
+                if binding.target.terminal_session_id != r.terminal_session_id {
+                    return Err(Error::TargetMismatch);
+                }
             }
             Ok(s)
         })
         .await?;
-        let binding = ToolBinding::from_snapshot(&snapshot).map_err(|_| Error::TargetMismatch)?;
-        let executor = SshExecutor::bind(
-            self.store.clone(),
-            terminals,
-            &request.session_id,
-            &request.user_id,
-            &binding.task_id,
-        )
-        .await
-        .map_err(|e| match e {
-            crate::agent::ssh_tools::Error::TargetUnavailable => Error::TargetUnavailable,
-            _ => Error::TargetMismatch,
-        })?
-        .with_terminal_shell()
-        .with_approvals(self.approvals.clone())
-        .map_err(|_| Error::Storage)?;
+        let executor = if ssh_registered {
+            let binding =
+                ToolBinding::from_snapshot(&snapshot).map_err(|_| Error::TargetMismatch)?;
+            let executor = SshExecutor::bind(
+                self.store.clone(),
+                terminals.ok_or(Error::TargetUnavailable)?,
+                &request.session_id,
+                &request.user_id,
+                &binding.task_id,
+            )
+            .await
+            .map_err(|e| match e {
+                crate::agent::ssh_tools::Error::TargetUnavailable => Error::TargetUnavailable,
+                _ => Error::TargetMismatch,
+            })?
+            .with_terminal_shell()
+            .with_approvals(self.approvals.clone())
+            .map_err(|_| Error::Storage)?;
+            Some(executor)
+        } else {
+            None
+        };
         let models = ModelRepository::new(self.store.clone());
         let r = request.clone();
         let runtime = worker(move || Ok(models.runtime(&r.agent_id, &r.user_id)?)).await?;
@@ -476,18 +492,31 @@ impl Manager {
         } else {
             &request.message
         };
-        ToolSession::preflight(&snapshot, executor.binding(), prompt, &runtime, media)
-            .map_err(tool_error)?;
+        let extension_settings = super::super::extensions::settings(&self.store, &request.user_id)
+            .map_err(|_| Error::Invalid)?;
+        ToolSession::preflight(
+            &snapshot,
+            executor.as_ref().map(|e| e.binding()),
+            prompt,
+            &runtime,
+            media,
+            extension_settings.config.sub_agents,
+        )
+        .map_err(tool_error)?;
         if token.is_cancelled() || cancel.is_cancelled() {
             return Err(ModelError::Cancelled.into());
         }
         let turns = Turns::new(self.store.clone());
         let r = request.clone();
         let who = owner.clone();
-        let target = binding.target;
+        let target = snapshot
+            .session
+            .task
+            .as_ref()
+            .and_then(|t| t.target.clone());
         let initial_revision = snapshot.session.revision;
         let admission =
-            worker(move || turns.begin_tools(&r, target, &who, initial_revision)).await?;
+            worker(move || turns.begin_runtime_tools(&r, target, &who, initial_revision)).await?;
         if !admission.1 {
             return Err(recorded(&admission.0));
         }
@@ -501,7 +530,19 @@ impl Manager {
         let (reporter, mut updates) = Reporter::channel(observation.clone());
         let (tx, mut events) = tokio::sync::mpsc::channel(64);
         let partial = running.partial.clone();
-        let session = ToolSession::new(executor).managed(
+        let current =
+            Repository::new(self.store.clone()).snapshot(&request.session_id, &request.user_id)?;
+        let extensions =
+            super::super::extensions::Runtime::load(self.store.clone(), &current, &token)
+                .await
+                .map_err(|_| Error::Invalid)?;
+        let limits = extensions.execution_limits().main_loop();
+        let session = match executor {
+            Some(e) => ToolSession::new(e),
+            None => ToolSession::general(self.store.clone(), &current).map_err(tool_error)?,
+        }
+        .with_extensions(extensions)
+        .managed(
             request.clone(),
             owner.clone(),
             tx,
@@ -509,15 +550,7 @@ impl Manager {
             partial.clone(),
         );
         // Model deltas and tool events share the same ordered Channel.
-        let operation = session.run(
-            &request.request_id,
-            prompt,
-            tool_loop::Limits {
-                tool_timeout: std::time::Duration::from_secs(300),
-                ..Default::default()
-            },
-            &token,
-        );
+        let operation = session.run(&request.request_id, prompt, limits, &token);
         tokio::pin!(operation);
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         let result = loop {

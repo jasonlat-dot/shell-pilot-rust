@@ -23,8 +23,12 @@ pub enum Error {
     ApprovalChanged,
     #[error("工具执行结果未知；请先核查服务器状态，不会自动重试")]
     ToolUnknown,
-    #[error("工具调用已达到本轮上限，请核对结果后继续")]
+    #[error("本次处理达到执行资源上限，请核对结果后继续")]
     ToolLimit,
+    #[error("本次处理达到模型请求轮数上限，可在工具与 Skills 设置中调整")]
+    ModelRoundLimit,
+    #[error("本次处理达到工具调用次数上限，输出回查不占此额度，可在工具与 Skills 设置中调整")]
+    ToolCallLimit,
     #[error("当前工具执行链需要支持 Chat Completions 函数工具的模型")]
     ToolsUnsupported,
     #[error("Agent 会话或配置不存在")]
@@ -101,6 +105,8 @@ impl Error {
             Self::ApprovalChanged => "AGENT_APPROVAL_CHANGED",
             Self::ToolUnknown => "AGENT_TOOL_UNKNOWN",
             Self::ToolLimit => "AGENT_TOOL_LIMIT",
+            Self::ModelRoundLimit => "AGENT_MODEL_ROUND_LIMIT",
+            Self::ToolCallLimit => "AGENT_TOOL_CALL_LIMIT",
             Self::ToolsUnsupported => "AGENT_TOOLS_UNSUPPORTED",
             Self::NotFound => "AGENT_NOT_FOUND",
             Self::Busy => "AGENT_BUSY",
@@ -123,7 +129,11 @@ impl Error {
     }
     pub fn status(&self) -> u16 {
         match self {
-            Self::ApprovalChanged | Self::ToolUnknown | Self::ToolLimit => 409,
+            Self::ApprovalChanged
+            | Self::ToolUnknown
+            | Self::ToolLimit
+            | Self::ModelRoundLimit
+            | Self::ToolCallLimit => 409,
             Self::ToolsUnsupported => 400,
             Self::NotFound => 404,
             Self::Busy | Self::TargetMismatch | Self::TargetUnavailable => 409,
@@ -188,17 +198,33 @@ fn new_request_id() -> String {
     rename_all_fields = "camelCase"
 )]
 pub enum StreamEvent {
+    AgentStart {
+        agent_call_id: String,
+        agent_name: String,
+        task: String,
+        parent_tool_call_id: String,
+    },
+    AgentResult {
+        agent_call_id: String,
+        agent_name: String,
+        content: String,
+        status: String,
+    },
     Input {
         input: super::steering::Input,
     },
     ToolCall {
         tool_call_id: String,
         tool_name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agent_call_id: Option<String>,
         command: Option<String>,
         status: String,
     },
     ToolResult {
         tool_call_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agent_call_id: Option<String>,
         content: String,
         status: String,
     },
@@ -439,7 +465,8 @@ impl Manager {
         agent: String,
         user: String,
     ) -> Result<super::Session> {
-        self.create_general_session_with_policy(agent, user, None).await
+        self.create_general_session_with_policy(agent, user, None)
+            .await
     }
     pub async fn create_general_session_with_policy(
         &self,

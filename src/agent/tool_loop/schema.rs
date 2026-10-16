@@ -7,8 +7,10 @@ use std::{collections::HashSet, fmt};
 #[derive(Clone)]
 pub(super) struct Schema(Value);
 impl Schema {
-    pub fn compile(value: &Value) -> Option<Self> {
-        fn check(v: &Value, depth: usize, nodes: &mut usize) -> bool {
+    pub fn compile(value: &Value) -> Option<Self> {Self::compile_mode(value,false)}
+    pub fn compile_mcp(value: &Value) -> Option<Self> {Self::compile_mode(value,true)}
+    fn compile_mode(value: &Value, external:bool) -> Option<Self> {
+        fn check(v: &Value, depth: usize, nodes: &mut usize, external:bool) -> bool {
             *nodes += 1;
             if depth > 8 || *nodes > 256 {
                 return false;
@@ -23,7 +25,7 @@ impl Schema {
                 _ => return false,
             };
             if o.keys().any(|k| {
-                !matches!(k.as_str(), "type" | "description" | "enum")
+                !matches!(k.as_str(), "type" | "description" | "enum") && !(external&&matches!(k.as_str(),"title"|"default"|"$schema"))
                     && !fields.contains(&k.as_str())
             }) || o
                 .get("description")
@@ -64,27 +66,34 @@ impl Schema {
             }
             match v["type"].as_str() {
                 Some("object") => {
+                    if o.get("properties").is_some_and(|v|!v.is_object())
+                        || o.get("required").is_some_and(|v|!v.is_array()) {
+                        return false;
+                    }
+                    let empty_properties=Map::new();let empty_required=vec![];
                     let (Some(properties), Some(required)) =
-                        (v["properties"].as_object(), v["required"].as_array())
+                        (v["properties"].as_object().or(external.then_some(&empty_properties)), v["required"].as_array().or(external.then_some(&empty_required)))
                     else {
                         return false;
                     };
                     let names: HashSet<_> = required.iter().filter_map(Value::as_str).collect();
-                    if v["additionalProperties"] != false
+                    if (!external && v["additionalProperties"] != false)
+                        || (external && v.get("additionalProperties").is_some_and(|v|!v.is_boolean()))
                         || names.len() != required.len()
-                        || names.len() != properties.len()
+                        || (!external && names.len() != properties.len())
+                        || names.iter().any(|k|!properties.contains_key(*k))
                         || properties.len() > 64
                         || properties.iter().any(|(k, child)| {
                             k.is_empty()
                                 || k.len() > 128
-                                || !names.contains(k.as_str())
-                                || !check(child, depth + 1, nodes)
+                                || (!external && !names.contains(k.as_str()))
+                                || !check(child, depth + 1, nodes, external)
                         })
                     {
                         return false;
                     }
                 }
-                Some("array") if !check(&v["items"], depth + 1, nodes) => return false,
+                Some("array") if !check(&v["items"], depth + 1, nodes, external) => return false,
                 _ => {}
             }
             if let Some(enumeration) = o.get("enum") {
@@ -100,7 +109,7 @@ impl Schema {
             }
             true
         }
-        (value["type"] == "object" && check(value, 0, &mut 0)).then(|| Self(value.clone()))
+        (value["type"] == "object" && check(value, 0, &mut 0, external)).then(|| Self(value.clone()))
     }
     pub fn parse(&self, arguments: &str, normalize: impl FnOnce(&mut Value)) -> Option<Value> {
         if arguments.len() > 65536 {
@@ -135,13 +144,10 @@ fn accepts(schema: &Value, value: &Value) -> bool {
         return false;
     }
     if let Some(o) = value.as_object() {
-        let fields = schema["properties"]
-            .as_object()
-            .expect("compiled object schema");
-        return o.len() == fields.len()
-            && fields
-                .iter()
-                .all(|(k, s)| o.get(k).is_some_and(|v| accepts(s, v)));
+        let empty=Map::new();
+        let fields=schema["properties"].as_object().unwrap_or(&empty);
+        return schema["required"].as_array().is_none_or(|a|a.iter().all(|k|k.as_str().is_some_and(|k|o.contains_key(k))))
+            && o.iter().all(|(k,v)|match fields.get(k) {Some(s)=>accepts(s,v),None=>schema["additionalProperties"]!=false});
     }
     let length = value
         .as_str()

@@ -1,5 +1,6 @@
 //! D4 native tool turn: original events, full SSH captures and bounded output reads.
 //! D5 desktop integration uses a host-owned durable turn and bounded event channel.
+mod child;
 mod context;
 use super::{
     provider::{
@@ -22,21 +23,67 @@ use std::sync::{
 use tokio_util::sync::CancellationToken;
 
 pub const READ_OUTPUT: &str = "read_tool_output";
+const OUTPUT_PAGE_BYTES: u64 = 512;
+fn normalize_output_arguments(arguments: &mut Value) {
+    if let Some(limit) = arguments.get_mut("limit") {
+        if limit
+            .as_u64()
+            .is_some_and(|value| value > OUTPUT_PAGE_BYTES)
+        {
+            *limit = json!(OUTPUT_PAGE_BYTES);
+        }
+    }
+}
+#[cfg(test)]
+mod output_argument_tests {
+    use super::*;
+    #[test]
+    fn caps_only_oversized_positive_integer_pages_without_rewriting_the_output_or_offset() {
+        for size in [1000u64, 1500, 4096, u64::MAX] {
+            let mut args = json!({"outputId":"unchanged","offset":1024,"limit":size});
+            normalize_output_arguments(&mut args);
+            assert_eq!(
+                args,
+                json!({"outputId":"unchanged","offset":1024,"limit":512})
+            );
+        }
+        for limit in [
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("4096"),
+            Value::Null,
+            json!(512),
+        ] {
+            let mut args = json!({"outputId":"unchanged","offset":0,"limit":limit});
+            let original = args.clone();
+            normalize_output_arguments(&mut args);
+            assert_eq!(args, original);
+        }
+        let mut missing = json!({"outputId":"unchanged","offset":0});
+        let original = missing.clone();
+        normalize_output_arguments(&mut missing);
+        assert_eq!(missing, original);
+    }
+}
 pub fn output_definition() -> provider::FunctionDefinition {
     provider::FunctionDefinition {
         name: READ_OUTPUT.into(),
-        description: "Read original bytes of a linked output from this task, without SSH execution or approval. Offsets and limits count bytes. bytesHex is exact; text is a possibly lossy UTF-8 view. Never repeat a command to fetch its output.".into(),
+        description: "Read original bytes of a linked output from this task, without SSH execution or approval. Reads do not consume tool-call quota; requesting the model again still consumes a model round. Use outputs[].id, never a tool call ID. Offsets and limits count bytes. Each page returns at most 512 bytes; larger positive integer limits are capped to 512. When eof=false, continue with nextOffset and the same outputId. bytesHex is exact; text is a possibly lossy UTF-8 view. Never repeat a command to fetch its output.".into(),
         parameters: json!({"type":"object","properties":{
             "outputId":{"type":"string","minLength":36,"maxLength":36},
-            "offset":{"type":"integer","minimum":0,"maximum":16777216},
-            "limit":{"type":"integer","minimum":1,"maximum":512}
+            "offset":{"type":"integer","minimum":0,"maximum":16777216,"description":"Byte offset, initially 0; use the previous result's nextOffset for the next page."},
+            "limit":{"type":"integer","minimum":1,"maximum":OUTPUT_PAGE_BYTES,"description":"Requested page bytes, 1–512. The host caps larger positive integers to 512; continue with nextOffset until eof=true."}
         },"required":["outputId","offset","limit"],"additionalProperties":false}),
     }
 }
 struct Pending {
     id: String,
+    agent: Option<String>,
     started: bool,
     capture: Option<Arc<Capture>>,
+    tool: ToolCall,
+    announced: bool,
 }
 struct Data {
     intermediate: String,
@@ -46,8 +93,40 @@ struct Data {
     runtime: RuntimeConfig,
     pending: Vec<Pending>,
 }
+#[derive(Clone)]
+struct RuntimeBinding {
+    session_id: String,
+    user_id: String,
+    task_id: String,
+    target: Option<super::Target>,
+}
+impl RuntimeBinding {
+    fn snapshot(s: &Snapshot) -> tool_loop::Result<Self> {
+        let t = s
+            .session
+            .task
+            .as_ref()
+            .filter(|t| t.status == super::TaskStatus::Active)
+            .ok_or(tool_loop::Error::Context)?;
+        Ok(Self {
+            session_id: s.session.id.clone(),
+            user_id: s.session.user_id.clone(),
+            task_id: t.id.clone(),
+            target: t.target.clone(),
+        })
+    }
+    fn matches(&self, s: &Snapshot) -> bool {
+        s.session.task.as_ref().is_some_and(|t| {
+            t.status == super::TaskStatus::Active && t.id == self.task_id && t.target == self.target
+        })
+    }
+}
 pub struct ToolSession {
-    executor: SshExecutor,
+    executor: Option<SshExecutor>,
+    operation_gate: tokio::sync::RwLock<()>,
+    journal_gate: tokio::sync::RwLock<()>,
+    binding: RuntimeBinding,
+    extensions: Option<super::extensions::Runtime>,
     repository: Repository,
     started: AtomicBool,
     data: Arc<Mutex<Option<Data>>>,
@@ -71,7 +150,16 @@ impl ToolSession {
     pub fn new(executor: SshExecutor) -> Self {
         Self {
             repository: Repository::new(executor.store()),
-            executor,
+            binding: RuntimeBinding {
+                session_id: executor.binding().session_id.clone(),
+                user_id: executor.binding().user_id.clone(),
+                task_id: executor.binding().tool.task_id.clone(),
+                target: Some(executor.binding().tool.target.clone()),
+            },
+            executor: Some(executor),
+            operation_gate: tokio::sync::RwLock::new(()),
+            journal_gate: tokio::sync::RwLock::new(()),
+            extensions: None,
             started: AtomicBool::new(false),
             data: Arc::new(Mutex::new(None)),
             managed: None,
@@ -79,6 +167,73 @@ impl ToolSession {
             partial: Arc::new(Mutex::new(String::new())),
             reporter: context_status::Reporter::default(),
         }
+    }
+    fn notification(&self, id: &str, status: &str) -> tool_loop::Result<Option<chat::StreamEvent>> {
+        let mut guard = self.data.lock().map_err(|_| tool_loop::Error::Context)?;
+        let pending = guard
+            .as_mut()
+            .and_then(|d| d.pending.iter_mut().find(|p| p.id == id))
+            .ok_or(tool_loop::Error::Context)?;
+        if pending.announced {
+            return Ok(None);
+        }
+        pending.announced = true;
+        let args: Value =
+            serde_json::from_str(&pending.tool.function.arguments).unwrap_or(Value::Null);
+        Ok(Some(chat::StreamEvent::ToolCall {
+            tool_call_id: id.into(),
+            tool_name: pending.tool.function.name.clone(),
+            agent_call_id: pending.agent.clone(),
+            command: args["command"].as_str().map(str::to_owned),
+            status: status.into(),
+        }))
+    }
+    pub(crate) async fn announce(
+        &self,
+        id: &str,
+        cancel: &CancellationToken,
+    ) -> tool_loop::Result<()> {
+        if let Some(event) = self.notification(id, "running")? {
+            self.repository.db(|db|{
+                db.execute("INSERT INTO agent_workflow_events(session_id,task_id,parent_call_id,kind,content,created_at) VALUES(?1,?2,?3,'tool_started','{}',?4)",rusqlite::params![self.binding.session_id,self.binding.task_id,id,chrono::Utc::now().timestamp_millis()])?;Ok(())
+            }).map_err(context_error)?;
+            if let Some(events) = &self.events {
+                tokio::select! {biased;_=cancel.cancelled()=>return Err(tool_loop::Error::Cancelled),result=events.send(event)=>result.map_err(|_|tool_loop::Error::Context)?};
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn general(
+        store: Arc<crate::store::Store>,
+        snapshot: &Snapshot,
+    ) -> tool_loop::Result<Self> {
+        Ok(Self {
+            executor: None,
+            operation_gate: tokio::sync::RwLock::new(()),
+            journal_gate: tokio::sync::RwLock::new(()),
+            binding: RuntimeBinding::snapshot(snapshot)?,
+            extensions: None,
+            repository: Repository::new(store),
+            started: AtomicBool::new(false),
+            data: Arc::new(Mutex::new(None)),
+            managed: None,
+            events: None,
+            partial: Arc::new(Mutex::new(String::new())),
+            reporter: context_status::Reporter::default(),
+        })
+    }
+    pub(crate) fn with_extensions(mut self, extensions: super::extensions::Runtime) -> Self {
+        self.extensions = Some(extensions);
+        self
+    }
+    async fn target_available(&self) -> bool {
+        match &self.executor {
+            Some(e) => e.verify().await.is_ok(),
+            None => true,
+        }
+    }
+    fn ssh_binding(&self) -> Option<&ssh_tools::SshBinding> {
+        self.executor.as_ref().map(|e| e.binding())
     }
     pub(crate) fn managed(
         mut self,
@@ -103,15 +258,21 @@ impl ToolSession {
     }
     pub(crate) fn preflight(
         snapshot: &Snapshot,
-        binding: &ssh_tools::SshBinding,
+        binding: Option<&ssh_tools::SshBinding>,
         message: &str,
         runtime: &RuntimeConfig,
         media: ChatMessage,
+        children: bool,
     ) -> tool_loop::Result<()> {
         // Validate host definitions before a durable running turn is created.
         // A malformed schema is a configuration error, not a failed SSH action.
         let mut registry = ToolRegistry::default();
-        registry.register(ssh_tools::definition())?;
+        if binding.is_some() {
+            registry.register(ssh_tools::definition())?;
+        }
+        for definition in super::extensions::definitions(children) {
+            registry.register(definition)?;
+        }
         registry.register(output_definition())?;
         context::require_pinned(
             snapshot,
@@ -127,8 +288,8 @@ impl ToolSession {
         if self.started.load(Ordering::SeqCst) {
             return Err(tool_loop::Error::AlreadyStarted);
         }
-        self.repository =
-            Repository::with_output_limits(self.executor.store(), limits).map_err(context_error)?;
+        self.repository = Repository::with_output_limits(self.repository.store.clone(), limits)
+            .map_err(context_error)?;
         Ok(self)
     }
     pub async fn run(
@@ -142,7 +303,12 @@ impl ToolSession {
             return Err(tool_loop::Error::Invalid);
         }
         let mut registry = ToolRegistry::default();
-        self.executor.register(&mut registry)?;
+        if let Some(executor) = &self.executor {
+            executor.register(&mut registry)?;
+        }
+        if let Some(extensions) = &self.extensions {
+            extensions.register(&mut registry)?;
+        }
         registry.register(output_definition())?;
         // Check the loop limits and input shape before mutating persistent state.
         let mut loop_ = ToolLoop::new(
@@ -155,8 +321,8 @@ impl ToolSession {
         .with_context(self)
         .with_approval_boundary(tool_loop::ApprovalBoundary::new(
             approvals::Approvals::new(self.repository.store.clone()),
-            self.executor.binding().session_id.clone(),
-            self.executor.binding().user_id.clone(),
+            self.binding.session_id.clone(),
+            self.binding.user_id.clone(),
         ));
         model::identifier(request_id).map_err(context_error)?;
         model::text_value(message, 16000).map_err(context_error)?;
@@ -167,7 +333,7 @@ impl ToolSession {
             return Err(tool_loop::Error::AlreadyStarted);
         }
         let repository = self.repository.clone();
-        let binding = self.executor.binding().clone();
+        let binding = self.binding.clone();
         let request_id = request_id.to_owned();
         let message = message.to_owned();
         let data = self.data.clone();
@@ -175,7 +341,7 @@ impl ToolSession {
         let managed = self.managed.clone();
         let runtime = worker(move || {
             let snapshot = repository.snapshot(&binding.session_id,&binding.user_id).map_err(context_error)?;
-            if ToolBinding::from_snapshot(&snapshot).map_err(context_error)? != binding.tool {
+            if !binding.matches(&snapshot) {
                 return Err(tool_loop::Error::Context);
             }
             if !snapshot.pending_tool_call_ids.is_empty() {
@@ -197,7 +363,7 @@ impl ToolSession {
                 || !runtime.config.capabilities.tool_calls {
                 return Err(tool_loop::Error::Context);
             }
-            context::require_pinned(&snapshot,&binding,&message,&runtime,&tools,None)?;
+            context::require_pinned(&snapshot,None,&message,&runtime,&tools,None)?;
             let (snapshot,latest_user)=if let Some((r,_))=&managed {
                 let cursor=repository.db(|db|Ok(db.query_row("SELECT user_event_id FROM agent_chat_turns WHERE session_id=?1 AND request_id=?2",rusqlite::params![r.session_id,r.request_id],|r|r.get(0))?)).map_err(context_error)?;
                 (snapshot,cursor)
@@ -346,13 +512,14 @@ impl LoopContext for ToolSession {
             if cancel.is_cancelled() {
                 return Err(tool_loop::Error::Cancelled);
             }
+            let _journal = self.journal_gate.read().await;
             let repository = self.repository.clone();
             let data = self.data.clone();
-            let binding = self.executor.binding().tool.clone();
+            let binding = self.executor.as_ref().map(|e| e.binding().tool.clone());
             let calls = calls.to_vec();
             let text = text.filter(|t| !t.trim().is_empty()).map(str::to_owned);
             let text_present = text.is_some();
-            let notifications = calls.clone();
+
             worker(move||{
                 let mut guard=data.lock().map_err(|_|tool_loop::Error::Context)?;
                 let data=guard.as_mut().ok_or(tool_loop::Error::Context)?;
@@ -364,27 +531,13 @@ impl LoopContext for ToolSession {
                     arguments:json!({"modelArguments":serde_json::from_str::<Value>(&call.function.arguments)
                         .unwrap_or_else(|_|Value::String(call.function.arguments.clone()))}),
                 }).collect();
-                repository.append_tool_batch(&data.snapshot,&binding,payloads,text).map_err(context_error)?;
+                repository.append_runtime_batch(&data.snapshot,binding.as_ref(),payloads,text,None).map_err(context_error)?;
                 data.snapshot=repository.snapshot(&data.snapshot.session.id,&data.snapshot.session.user_id).map_err(context_error)?;
-                data.pending=calls.into_iter().map(|call|Pending{id:call.id,started:false,capture:None}).collect();
+                data.pending=calls.into_iter().map(|call|Pending{id:call.id.clone(),tool:call,announced:false,agent:None,started:false,capture:None}).collect();
                 Ok(())
             }).await?;
             if self.streams_replies() && text_present {
                 self.text_delta("\n\n".into(), cancel).await?;
-            }
-            if let Some(events) = &self.events {
-                for call in notifications {
-                    let args: Value =
-                        serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
-                    events
-                        .try_send(chat::StreamEvent::ToolCall {
-                            tool_call_id: call.id,
-                            tool_name: call.function.name,
-                            command: args["command"].as_str().map(str::to_owned),
-                            status: "running".into(),
-                        })
-                        .map_err(|_| tool_loop::Error::Context)?;
-                }
             }
             Ok(())
         })
@@ -410,7 +563,22 @@ impl LoopContext for ToolSession {
         let call_id = call_id.to_owned();
         let content = content.to_owned();
         let events = self.events.clone();
+        let agent = self.data.lock().ok().and_then(|g| {
+            g.as_ref().and_then(|d| {
+                d.pending
+                    .iter()
+                    .find(|p| p.id == call_id)
+                    .and_then(|p| p.agent.clone())
+            })
+        });
         Box::pin(async move {
+            let _journal = self.journal_gate.read().await;
+            let final_status = match serde_json::from_str::<Value>(&content) {
+                Ok(v) if v["ok"] == true => "success",
+                Ok(v) if v["error"] == "result_unknown" => "unknown",
+                _ => "error",
+            };
+            let notification = self.notification(&call_id, final_status)?;
             let id = call_id.clone();
             let text = content.clone();
             worker(move || {
@@ -421,6 +589,12 @@ impl LoopContext for ToolSession {
             })
             .await?;
             if let Some(events) = events {
+                if let Some(event) = notification {
+                    events
+                        .send(event)
+                        .await
+                        .map_err(|_| tool_loop::Error::Context)?;
+                }
                 let value: Value =
                     serde_json::from_str(&text).map_err(|_| tool_loop::Error::Context)?;
                 let status = if value["ok"] == true {
@@ -433,6 +607,7 @@ impl LoopContext for ToolSession {
                 events
                     .send(chat::StreamEvent::ToolResult {
                         tool_call_id: id,
+                        agent_call_id: agent,
                         content: text,
                         status: status.into(),
                     })
@@ -530,6 +705,18 @@ impl Drop for Cleanup {
     }
 }
 impl ToolExecutor for ToolSession {
+    fn counts_toward_tool_limit(&self, call: &ValidatedCall) -> bool {
+        call.name() != READ_OUTPUT
+    }
+    fn supports_parallel(&self, call: &ValidatedCall) -> bool {
+        matches!(
+            call.name(),
+            READ_OUTPUT | "list_skills" | "read_skill" | "list_mcp_tools" | "delegate_agent"
+        ) || self
+            .extensions
+            .as_ref()
+            .is_some_and(|e| e.parallel_mcp(call))
+    }
     fn authorize_with_policy<'a>(
         &'a self,
         call: &'a ValidatedCall,
@@ -552,14 +739,14 @@ impl ToolExecutor for ToolSession {
             if cancel.is_cancelled() {
                 return false;
             }
-            let binding = self.executor.binding();
+            let binding = &self.binding;
             // The mode belongs to the conversation and applies before every dispatch,
             // including tools that don't execute SSH commands.
             let mode = super::approvals::Approvals::new(self.repository.store.clone())
                 .policy(
                     binding.session_id.clone(),
                     binding.user_id.clone(),
-                    binding.tool.task_id.clone(),
+                    binding.task_id.clone(),
                 )
                 .await;
             if !matches!(mode, Ok((policy, _)) if policy != super::approvals::Policy::Deny) {
@@ -571,7 +758,17 @@ impl ToolExecutor for ToolSession {
                 READ_OUTPUT => true,
                 // SSH performs its own durable review/decision/admission using
                 // the SAME policy; it is not approved by this routing check.
-                SSH_EXECUTE => self.executor.authorize(call, cancel).await,
+                SSH_EXECUTE => match &self.executor {
+                    Some(e) => e.authorize(call, cancel).await,
+                    None => false,
+                },
+                _ if self.extensions.is_some() => {
+                    self.extensions
+                        .as_ref()
+                        .unwrap()
+                        .authorize(call, cancel)
+                        .await
+                }
                 // MCP/other tools must supply a native approval adapter before
                 // being dispatched. Neither a model name nor a skill can bypass it.
                 _ => false,
@@ -580,11 +777,18 @@ impl ToolExecutor for ToolSession {
     }
 
     fn normalize_arguments(&self, tool_name: &str, arguments: &mut Value) {
-        self.executor.normalize_arguments(tool_name, arguments);
+        if tool_name == READ_OUTPUT {
+            normalize_output_arguments(arguments);
+        }
+        if let Some(executor) = &self.executor {
+            executor.normalize_arguments(tool_name, arguments);
+        }
     }
 
     fn uses_total_timeout(&self, tool_name: &str) -> bool {
-        self.executor.uses_total_timeout(tool_name)
+        self.executor
+            .as_ref()
+            .is_none_or(|e| e.uses_total_timeout(tool_name))
     }
 
     fn execute<'a>(
@@ -593,16 +797,53 @@ impl ToolExecutor for ToolSession {
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, ToolOutcome> {
         Box::pin(async move {
+            let _operation = if matches!(call.name(), SSH_EXECUTE | "call_mcp_tool") {
+                Some(
+                    if self
+                        .extensions
+                        .as_ref()
+                        .is_some_and(|e| e.parallel_mcp(call))
+                    {
+                        futures_util::future::Either::Left(
+                            tokio::select! {biased;_=cancel.cancelled()=>return ToolOutcome::Denied,guard=self.operation_gate.read()=>guard},
+                        )
+                    } else {
+                        futures_util::future::Either::Right(
+                            tokio::select! {biased;_=cancel.cancelled()=>return ToolOutcome::Denied,guard=self.operation_gate.write()=>guard},
+                        )
+                    },
+                )
+            } else {
+                None
+            };
+            let _journal = if call.name() == SSH_EXECUTE {
+                Some(
+                    tokio::select! {biased;_=cancel.cancelled()=>return ToolOutcome::Denied,guard=self.journal_gate.write()=>guard},
+                )
+            } else {
+                None
+            };
+            // UI starts only after scheduling/resource admission, never when a batch is queued.
+            // MCP announces after acquiring its per-service transport as well.
+            if call.name() != "call_mcp_tool" && self.announce(call.id(), cancel).await.is_err() {
+                return ToolOutcome::Denied;
+            }
             if call.name() == READ_OUTPUT {
                 return self.read(call.arguments().clone()).await;
             }
             if call.name() != SSH_EXECUTE {
-                return ToolOutcome::Denied;
+                return match &self.extensions {
+                    Some(e) => e.execute(call, cancel, self).await,
+                    None => ToolOutcome::Denied,
+                };
             }
+            let Some(executor) = &self.executor else {
+                return ToolOutcome::Denied;
+            };
             let Ok(command) = serde_json::from_value::<Command>(call.arguments().clone()) else {
                 return ToolOutcome::Denied;
             };
-            let binding = self.executor.binding();
+            let binding = &self.binding;
             let capture = Capture::new(
                 self.repository.clone(),
                 binding.session_id.clone(),
@@ -623,8 +864,7 @@ impl ToolExecutor for ToolSession {
                 p.capture = Some(capture.clone());
                 revision
             };
-            match self
-                .executor
+            match executor
                 .execute_inner(call.id(), &command, cancel, Some(capture), Some(revision))
                 .await
             {
@@ -673,13 +913,13 @@ impl ToolExecutor for ToolSession {
 impl ToolSession {
     async fn read(&self, args: Value) -> ToolOutcome {
         let repository = self.repository.clone();
-        let binding = self.executor.binding().clone();
+        let binding = self.binding.clone();
         let read=tokio::task::spawn_blocking(move||->super::Result<Value>{
             let output_id=args["outputId"].as_str().ok_or(Error::OutputUnavailable)?;
             let offset=args["offset"].as_u64().ok_or(Error::OutputUnavailable)?;
-            let limit=args["limit"].as_u64().filter(|n|(1..=512).contains(n)).ok_or(Error::OutputUnavailable)? as usize;
+            let limit=args["limit"].as_u64().filter(|n|(1..=OUTPUT_PAGE_BYTES).contains(n)).ok_or(Error::OutputUnavailable)? as usize;
             let output=repository.output(&binding.session_id,&binding.user_id,output_id)?;
-            if output.task_id!=binding.tool.task_id || output.event_id.is_none() {return Err(Error::OutputUnavailable);}
+            if output.task_id!=binding.task_id || output.event_id.is_none() {return Err(Error::OutputUnavailable);}
             let range=repository.read_output_range(&binding.session_id,&binding.user_id,output_id,offset,limit)?;
             Ok(json!({"outputId":output_id,"offset":range.offset,"nextOffset":range.next_offset,
                 "eof":range.eof,"size":range.size,"bytesHex":output_model::hex(&range.bytes),

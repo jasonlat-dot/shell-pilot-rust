@@ -184,7 +184,7 @@ impl ModelConfig {
 }
 
 /// Intentionally has no Serialize implementation and no public plaintext accessor.
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, PartialEq, Eq)]
 #[serde(transparent)]
 pub struct SecretKey(pub(crate) String);
 impl SecretKey {
@@ -204,7 +204,7 @@ impl fmt::Debug for SecretKey {
         f.write_str("SecretKey([REDACTED])")
     }
 }
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(tag = "action", rename_all = "camelCase", deny_unknown_fields)]
 pub enum KeyChange {
     #[default]

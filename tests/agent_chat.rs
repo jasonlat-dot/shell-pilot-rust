@@ -1068,7 +1068,7 @@ async fn response_and_sse_frame_limits_keep_the_delivered_prefix_without_retry()
 
 #[tokio::test]
 async fn confirmed_memory_is_rebuilt_per_turn_without_becoming_conversation_history() {
-    use shellpilot_server::agent::memory::{Kind, Scope, Write};
+    use shellpilot_server::agent::memory::{Kind, Scope, Write, View};
     let f = Fixture::new(stream(), Duration::ZERO).await;
     let mut request = f.request().await;
     let write = Write {
@@ -1083,9 +1083,8 @@ async fn confirmed_memory_is_rebuilt_per_turn_without_becoming_conversation_hist
     let note = f
         .manager
         .save_memory(
-            "agent".into(),
             "default".into(),
-            request.session_id.clone(),
+            View {agent_id:"agent".into(),session_id:request.session_id.clone(),project_id:String::new()},
             write,
         )
         .await
@@ -1110,9 +1109,8 @@ async fn confirmed_memory_is_rebuilt_per_turn_without_becoming_conversation_hist
     assert!(!events.contains("记忆测试唯一内容"));
     f.manager
         .delete_memory(
-            "agent".into(),
             "default".into(),
-            request.session_id.clone(),
+            View {agent_id:"agent".into(),session_id:request.session_id.clone(),project_id:String::new()},
             note.id,
             note.revision,
         )
