@@ -39,6 +39,10 @@ pub enum Error {
     TargetUnavailable,
     #[error("{0}")]
     Attachment(String),
+    #[error("{0}")]
+    Memory(String),
+    #[error("记忆已被修改或删除，请刷新列表后重新编辑")]
+    MemoryChanged,
     #[error("附件和工具对话尚未接入")]
     Unsupported,
     #[error("历史过长或已有检查点，需要后续压缩/恢复支持")]
@@ -104,6 +108,8 @@ impl Error {
             Self::TargetMismatch => "AGENT_TARGET_MISMATCH",
             Self::TargetUnavailable => "AGENT_TARGET_UNAVAILABLE",
             Self::Attachment(_) => "AGENT_ATTACHMENT_INVALID",
+            Self::Memory(_) => "AGENT_MEMORY_INVALID",
+            Self::MemoryChanged => "AGENT_MEMORY_CHANGED",
             Self::Unsupported => "FEATURE_NOT_MIGRATED",
             Self::HistoryLimit => "AGENT_HISTORY_LIMIT",
             Self::CompactionFailed => "AGENT_COMPACTION_FAILED",
@@ -121,7 +127,7 @@ impl Error {
             Self::ToolsUnsupported => 400,
             Self::NotFound => 404,
             Self::Busy | Self::TargetMismatch | Self::TargetUnavailable => 409,
-            Self::Invalid | Self::Attachment(_) => 400,
+            Self::Invalid | Self::Attachment(_) | Self::Memory(_) => 400,
             Self::Unsupported => 501,
             Self::Stopped => 503,
             Self::Model(ModelError::Cancelled) => 409,
@@ -132,7 +138,7 @@ impl Error {
             Self::CompactionFailed => 502,
             Self::CompactionLimit => 413,
             Self::Storage => 500,
-            Self::Conflict | Self::ContextChanged => 409,
+            Self::Conflict | Self::ContextChanged | Self::MemoryChanged => 409,
             Self::Recorded(code) => match code.as_str() {
                 "MODEL_TIMEOUT" => 504,
                 "AGENT_INTERRUPTED"

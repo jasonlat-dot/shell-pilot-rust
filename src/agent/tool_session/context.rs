@@ -11,6 +11,7 @@ struct Frame {
     latest_user: u64,
     message: String,
     runtime: RuntimeConfig,
+    memory: Option<String>,
 }
 impl ToolSession {
     pub(super) async fn apply_inputs(
@@ -143,7 +144,20 @@ impl ToolSession {
                 outputs.push(json!({"callId":output.call_id,"reference":output.reference}));
             }
             ensure_current(&repository, data)?;
+            let memory = repository
+                .memory_context(
+                    s,
+                    (data
+                        .runtime
+                        .config
+                        .budget()
+                        .available_input()
+                        .map_err(context_error)?
+                        / 4) as usize,
+                )
+                .map_err(context_error)?;
             Ok(Frame {
+                memory,
                 store: Some(repository.store.clone()),
                 snapshot: data.snapshot.clone(),
                 checkpoint,
@@ -363,6 +377,11 @@ fn project(
         json!({"task":frame.snapshot.session.task,"scope":frame.snapshot.session.scope,
             "binding":binding,"targetAvailable":available,"executionApproval":"nativePerCallOrExactTaskCommand"}),
         json!(frame.outputs))}];
+    if let Some(content) = &frame.memory {
+        messages.push(ChatMessage::System {
+            content: content.clone(),
+        });
+    }
     let (after, checkpoint) = replacement.map(|(id, c)| (id, Some(c))).unwrap_or_else(|| {
         frame
             .checkpoint
@@ -473,6 +492,7 @@ pub(super) fn require_pinned(
     media: Option<&ChatMessage>,
 ) -> tool_loop::Result<()> {
     let frame = Frame {
+        memory: None,
         store: None,
         snapshot: snapshot.clone(),
         checkpoint: None,

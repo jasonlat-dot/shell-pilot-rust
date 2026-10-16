@@ -976,7 +976,7 @@ fn schema_7_reopen_preserves_existing_raw_history_and_adds_only_native_window_ta
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |r| r.get::<_, u64>(0))
             .unwrap(),
-        17
+        19
     );
     assert_eq!(
         db.query_row("SELECT COUNT(*) FROM agent_responses_outputs", [], |r| r
@@ -1197,4 +1197,70 @@ async fn responses_scope_window_remains_in_its_task_and_is_not_copied_to_general
         assert!(f.repo.checkpoint(&session.id, "default").unwrap().is_none());
     }
     terminals.shutdown().await;
+}
+
+#[tokio::test]
+async fn memory_stays_out_of_opaque_compaction_and_is_reloaded_after_forgetting() {
+    use shellpilot_server::agent::memory::{Kind, Scope, Write};
+    let f = Fixture::new().await;
+    f.seed().await;
+    let note = f
+        .repo
+        .save_memory(
+            "model",
+            "default",
+            &f.session,
+            Write {
+                id: uuid::Uuid::new_v4().to_string(),
+                revision: 0,
+                title: "MEMORY_PROVENANCE_MARKER".into(),
+                content: "用户偏好：简洁中文。".into(),
+                kind: Kind::Preference,
+                scope: Scope::Global,
+                enabled: true,
+            },
+        )
+        .unwrap();
+    f.lower(8192);
+    f.chat(f.request("继续分析，不执行命令")).await.unwrap();
+    assert_eq!(f.calls("compact"), 1);
+    {
+        let requests = f.mock.requests.lock().unwrap();
+        let compact = requests
+            .iter()
+            .find(|(p, _, _)| p.ends_with("compact"))
+            .unwrap();
+        assert!(!compact.1.to_string().contains("MEMORY_PROVENANCE_MARKER"));
+        let generation = requests
+            .iter()
+            .rev()
+            .find(|(p, _, _)| p.ends_with("responses"))
+            .unwrap();
+        assert!(generation.1["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("MEMORY_PROVENANCE_MARKER"));
+        assert!(!generation.1["input"]
+            .to_string()
+            .contains("MEMORY_PROVENANCE_MARKER"));
+    }
+    assert!(
+        !serde_json::to_string(&f.repo.checkpoint(&f.session, "default").unwrap())
+            .unwrap()
+            .contains("MEMORY_PROVENANCE_MARKER")
+    );
+    f.repo
+        .delete_memory("model", "default", &f.session, &note.id, note.revision)
+        .unwrap();
+    f.chat(f.request("下一轮分析")).await.unwrap();
+    let requests = f.mock.requests.lock().unwrap();
+    let generation = requests
+        .iter()
+        .rev()
+        .find(|(p, _, _)| p.ends_with("responses"))
+        .unwrap();
+    assert!(!generation
+        .1
+        .to_string()
+        .contains("MEMORY_PROVENANCE_MARKER"));
 }

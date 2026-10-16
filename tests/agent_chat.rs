@@ -306,10 +306,13 @@ async fn stop_interrupts_stream_and_same_session_cannot_overlap() {
             })
             .await
     });
-    tokio::time::timeout(Duration::from_secs(2), receiver.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(receiver.recv().await.unwrap(), StreamEvent::Text { content } if content == "partial") {
+                break;
+            }
+        }
+    }).await.unwrap();
     assert!(matches!(
         f.manager
             .chat(r.clone(), None, &CancellationToken::new(), |_| async {
@@ -408,7 +411,7 @@ async fn wrong_agent_target_and_attachments_are_rejected_before_model_request() 
         f.manager
             .chat(r, None, &CancellationToken::new(), |_| async { Ok(()) })
             .await,
-        Err(Error::Unsupported)
+        Err(Error::Attachment(_))
     ));
     let mut r = f.request().await;
     r.terminal_session_id = "pty-1".into();
@@ -721,10 +724,13 @@ async fn aborting_a_future_recovers_partial_as_interrupted_instead_of_completing
             })
             .await
     });
-    tokio::time::timeout(Duration::from_secs(2), output.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(output.recv().await.unwrap(), StreamEvent::Text { content } if content == "partial") {
+                break;
+            }
+        }
+    }).await.unwrap();
     run.abort();
     let _ = run.await;
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -1058,4 +1064,69 @@ async fn response_and_sse_frame_limits_keep_the_delivered_prefix_without_retry()
         assert!(turn.result_text.is_none(), "{name}");
         assert_eq!(f.mock.bodies.lock().unwrap().len(), 1, "{name}");
     }
+}
+
+#[tokio::test]
+async fn confirmed_memory_is_rebuilt_per_turn_without_becoming_conversation_history() {
+    use shellpilot_server::agent::memory::{Kind, Scope, Write};
+    let f = Fixture::new(stream(), Duration::ZERO).await;
+    let mut request = f.request().await;
+    let write = Write {
+        id: uuid::Uuid::new_v4().to_string(),
+        revision: 0,
+        title: "偏好来源测试".into(),
+        content: "记忆测试唯一内容：优先简洁中文。".into(),
+        kind: Kind::Preference,
+        scope: Scope::Global,
+        enabled: true,
+    };
+    let note = f
+        .manager
+        .save_memory(
+            "agent".into(),
+            "default".into(),
+            request.session_id.clone(),
+            write,
+        )
+        .await
+        .unwrap();
+    f.manager
+        .chat(
+            request.clone(),
+            None,
+            &CancellationToken::new(),
+            |_| async { Ok(()) },
+        )
+        .await
+        .unwrap();
+    let body = f.mock.bodies.lock().unwrap()[0].clone();
+    assert!(body["messages"].to_string().contains("记忆测试唯一内容"));
+    assert_eq!(body["messages"][1]["role"], "system");
+    assert_eq!(
+        body["messages"].as_array().unwrap().last().unwrap()["content"],
+        request.message
+    );
+    let events = serde_json::to_string(&f.events(&request.session_id)).unwrap();
+    assert!(!events.contains("记忆测试唯一内容"));
+    f.manager
+        .delete_memory(
+            "agent".into(),
+            "default".into(),
+            request.session_id.clone(),
+            note.id,
+            note.revision,
+        )
+        .await
+        .unwrap();
+    request.request_id = uuid::Uuid::new_v4().to_string();
+    request.message = "下一轮".into();
+    f.manager
+        .chat(request, None, &CancellationToken::new(), |_| async {
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(!f.mock.bodies.lock().unwrap().last().unwrap()["messages"]
+        .to_string()
+        .contains("记忆测试唯一内容"));
 }

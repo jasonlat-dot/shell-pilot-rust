@@ -121,3 +121,14 @@
 
 A1–A4 已实现上下文内核，当前 A5 将原始输出按 64 KiB 分块存入 SQLite，而不是另建文件目录，以便输出、事件、检查点一致备份和恢复；模型仅使用有界预览与输出 ID。详见 AGENT_OUTPUTS.md 与 AGENT_PROGRESS.md。
 这不代表语义摘要、模型工具循环或实际命令去重已经接通；相关完成标记仍以实施清单为准。
+
+### E2 记忆读取参考（2026-10-16）
+
+继续读取本地参考提交 `f82e36592278a0a782fb0d0fc97e5fa10e832ac2`：
+
+- `codex-rs/core/src/context/memory.rs` 使用独立的 MemoryContextFragment，并限制片段字节数。
+- `codex-rs/ext/memories/src/prompts.rs` 单独构建记忆读取提示，并限制摘要大小。
+- `codex-rs/ext/memories/templates/memories/read_path_v2.md` 将记忆视为历史背景，当前行为需要核实；明确记住、忘记或更正时记录变动。
+- `codex-rs/memories/README.md` 描述提取/合并管线，属于 CLI 更广的能力，不将其后台提取能力等同于 ShellPilot 已实现功能。
+
+ShellPilot E2 采用用户确认后保存的偏好/经验，不自动从任务摘要和工具观察生成记忆。服务器范围绑定连接及完整 ServerIdentity；每次准备模型请求时从独立表读取有界、完整条目，作为单独数据片段加入宿主提示，遵循当前用户更正且不产生执行权限。文字/工具预算均计入此片段；Responses 历史整理请求排除该片段，生成时重新加载，不把它写入原始事件或任务检查点。实现位置和验证状态仅记录在 AGENT_PROGRESS.md。

@@ -517,7 +517,7 @@ async fn schema_sixteen_upgrade_preserves_upload_owner_and_text_history() {
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        17
+        19
     );
     assert_eq!(
         db.query_row("SELECT owner_id FROM file_assets WHERE id=?1", [id], |r| {

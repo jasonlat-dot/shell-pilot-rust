@@ -118,7 +118,7 @@ pub struct ProjectChats {
     pub items: Vec<ProjectChat>,
     pub next_after: Option<String>,
 }
-fn project(db: &Connection, id: &str, user: &str) -> Result<Project> {
+pub(super) fn project(db: &Connection, id: &str, user: &str) -> Result<Project> {
     let (id,name,connection,identity,profile)=db.query_row(
   "SELECT id,name,connection_id,identity_json,profile_json FROM agent_projects WHERE id=?1 AND user_id=?2 AND NOT EXISTS(SELECT 1 FROM agent_removed_projects WHERE project_id=?1)",
   params![id,user],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,Option<String>>(4)?)))
@@ -233,7 +233,7 @@ impl Repository {
     Some(db.query_row("SELECT a.rowid FROM agent_sessions a LEFT JOIN agent_project_chats c ON c.session_id=a.id WHERE a.id=?1 AND a.user_id=?2 AND ((?3 IS NULL AND (c.project_id IS NULL OR EXISTS(SELECT 1 FROM agent_removed_projects WHERE project_id=c.project_id))) OR c.project_id=?3)",
      params![after,user,id],|r|r.get::<_,i64>(0)).optional()?.ok_or(Error::NotFound)?)
    };
-   let mut q=db.prepare("SELECT a.id,a.agent_id,COALESCE((SELECT json_extract(input_json,'$.message') FROM agent_chat_turns t WHERE t.session_id=a.id ORDER BY user_event_id LIMIT 1),(SELECT json_extract(payload,'$.text') FROM agent_events e WHERE e.session_id=a.id AND kind='user_message' ORDER BY id LIMIT 1),json_extract(a.task_json,'$.goal'),'新对话'),a.created_at,EXISTS(SELECT 1 FROM agent_chat_turns t WHERE t.session_id=a.id AND t.state='running'),
+   let mut q=db.prepare("SELECT a.id,a.agent_id,COALESCE((SELECT title FROM agent_chat_titles WHERE session_id=a.id),(SELECT json_extract(input_json,'$.message') FROM agent_chat_turns t WHERE t.session_id=a.id ORDER BY user_event_id LIMIT 1),(SELECT json_extract(payload,'$.text') FROM agent_events e WHERE e.session_id=a.id AND kind='user_message' ORDER BY id LIMIT 1),json_extract(a.task_json,'$.goal'),'新对话'),a.created_at,EXISTS(SELECT 1 FROM agent_chat_turns t WHERE t.session_id=a.id AND t.state='running'),
     EXISTS(SELECT 1 FROM agent_execution_requests r LEFT JOIN agent_execution_policies p ON p.session_id=r.session_id LEFT JOIN agent_execution_policy_reviews v ON v.request_id=r.id WHERE r.session_id=a.id AND r.state='pending' AND r.expires_at>?4 AND (COALESCE(p.mode,'confirm')='confirm' OR (p.mode='auto' AND v.decision='ask')))
     FROM agent_sessions a LEFT JOIN agent_project_chats c ON c.session_id=a.id WHERE a.user_id=?1 AND ((?2 IS NULL AND (c.project_id IS NULL OR EXISTS(SELECT 1 FROM agent_removed_projects WHERE project_id=c.project_id))) OR c.project_id=?2) AND (EXISTS(SELECT 1 FROM agent_chat_turns t WHERE t.session_id=a.id) OR EXISTS(SELECT 1 FROM agent_events e WHERE e.session_id=a.id AND kind IN ('user_message','assistant_message')) OR (a.task_json IS NOT NULL AND NOT EXISTS(SELECT 1 FROM agent_session_scopes s WHERE s.session_id=a.id))) AND (?3 IS NULL OR a.rowid<?3) ORDER BY a.rowid DESC LIMIT 51")?;
    let mut items=q.query_map(params![user,id,cursor,chrono::Utc::now().timestamp_millis()],|r|Ok(ProjectChat{session_id:r.get(0)?,agent_id:r.get(1)?,title:r.get(2)?,created_at:r.get(3)?,running:r.get(4)?,awaiting_approval:r.get(5)?}))?.collect::<std::result::Result<Vec<_>,_>>()?;

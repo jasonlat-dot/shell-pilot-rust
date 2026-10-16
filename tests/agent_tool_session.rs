@@ -1782,3 +1782,45 @@ async fn desktop_d5_persisted_stop_blocks_admission_before_token_delivery() {
     assert_eq!(b.execs(), 0);
     b.terminals.shutdown().await;
 }
+
+#[tokio::test]
+async fn tool_turn_receives_confirmed_memory_as_separate_budgeted_context() {
+    use shellpilot_server::agent::memory::{Kind, Scope, Write};
+    let b = Bound::new(vec![Step::Final], 90, true, false).await;
+    b.repo
+        .save_memory(
+            "model",
+            "default",
+            &b.sid,
+            Write {
+                id: uuid::Uuid::new_v4().to_string(),
+                revision: 0,
+                title: "工具回合偏好".into(),
+                content: "MEMORY_TOOL_MARKER：优先解释原始证据。".into(),
+                kind: Kind::Preference,
+                scope: Scope::Global,
+                enabled: true,
+            },
+        )
+        .unwrap();
+    b.session()
+        .await
+        .run(
+            "run",
+            "分析已有结果",
+            Limits::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(b.execs(), 0);
+    let requests = b.normal();
+    assert!(requests[0]["messages"][1]["content"]
+        .as_str()
+        .unwrap()
+        .contains("MEMORY_TOOL_MARKER"));
+    assert_eq!(requests[0]["messages"][1]["role"], "system");
+    assert!(!serde_json::to_string(&b.events())
+        .unwrap()
+        .contains("MEMORY_TOOL_MARKER"));
+}

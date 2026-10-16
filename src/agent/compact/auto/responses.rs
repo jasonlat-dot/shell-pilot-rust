@@ -70,6 +70,19 @@ impl Controller {
         // A standalone compact request covers the historical window, never the incoming request.
         // Fresh trusted instructions are outside the returned input window and never dropped.
         let mut source = protocol::body(&context.runtime.config, &initial)?;
+        // Durable memory is reloaded separately, never fed to an opaque historical summary.
+        source["instructions"] = initial
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                ChatMessage::System { content } if Some(content) != context.memory.as_ref() => {
+                    Some(content.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into();
         let inputs = source["input"].as_array_mut().ok_or(Error::Storage)?;
         let latest = inputs.pop().ok_or(Error::Storage)?;
         if latest

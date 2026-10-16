@@ -41,6 +41,7 @@ fn delete_chat_data(db: &Connection, user: &str, id: &str) -> Result<()> {
         "DELETE FROM agent_attachments WHERE session_id=?1",
         "DELETE FROM agent_events WHERE session_id=?1",
         "DELETE FROM agent_project_chats WHERE session_id=?1",
+        "DELETE FROM agent_chat_titles WHERE session_id=?1",
         "DELETE FROM agent_session_scopes WHERE session_id=?1",
     ] { db.execute(sql,[id])?; }
     db.execute(
