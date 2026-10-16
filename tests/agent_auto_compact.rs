@@ -617,7 +617,7 @@ async fn c6_dropped_summary_is_interrupted_and_reopen_keeps_the_last_committed_c
 }
 
 #[tokio::test]
-async fn c6_unsupported_attachments_and_oversized_text_cannot_mutate_compacted_history() {
+async fn c6_invalid_attachment_references_and_oversized_text_cannot_mutate_compacted_history() {
     let f = Fixture::new().await;
     f.seed().await;
     f.config(8192, 60);
@@ -636,7 +636,7 @@ async fn c6_unsupported_attachments_and_oversized_text_cannot_mutate_compacted_h
             .collect();
         assert_eq!(
             f.chat(request).await.unwrap_err().code(),
-            "FEATURE_NOT_MIGRATED"
+            "AGENT_ATTACHMENT_INVALID"
         );
     }
     assert_eq!(

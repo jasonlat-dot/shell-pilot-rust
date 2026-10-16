@@ -800,7 +800,8 @@ mod tests {
         let requests=Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
         async fn review(HttpState(requests):HttpState<Arc<std::sync::Mutex<Vec<Value>>>>,Json(request):Json<Value>)->Json<Value>{
             let evidence:Value=serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
-            let low=evidence["command"]["command"]=="whoami";
+            assert_eq!(evidence["toolName"],"ssh_execute");
+            let low=evidence["arguments"]["command"]=="whoami";
             requests.lock().unwrap().push(request);
             Json(json!({"id":"review","model":"reviewer-test","choices":[{"index":0,"message":{"role":"assistant","content":json!({"decision":if low{"allow"}else{"ask"},"risk":if low{"low"}else{"high"},"reason":if low{"只读查询"}else{"删除数据需要确认"}}).to_string()},"finish_reason":"stop"}]}))
         }
@@ -833,7 +834,7 @@ mod tests {
         for request in recorded.iter() {
             assert!(request.get("tools").is_none() || request["tools"].as_array().is_some_and(|tools|tools.is_empty()));
             assert_eq!(request["messages"].as_array().unwrap().len(),2);
-            assert!(request["messages"][0]["content"].as_str().unwrap().contains("independent SSH command approval reviewer"));
+            assert!(request["messages"][0]["content"].as_str().unwrap().contains("independent tool-action approval reviewer"));
         }
         drop(recorded);
         server.abort();
@@ -1054,7 +1055,7 @@ mod tests {
                 .db(|db| Ok(db.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))?))
                 .await
                 .unwrap(),
-            16
+            17
         );
     }
 }

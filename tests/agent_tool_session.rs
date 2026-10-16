@@ -23,6 +23,10 @@ use std::{
 };
 use support::*;
 use tokio_util::sync::CancellationToken;
+// The expanded host/shell instructions put a minimal checkpoint above the old
+// 35% low watermark (2078 tokens). 45% allows the mandatory checkpoint to fit
+// below 2672 tokens while the four-result batch (~3759 tokens) still triggers.
+const BATCH_COMPACTION_PERCENT: u8 = 45;
 struct Permit;
 impl Authorizer for Permit {
     fn authorize<'a>(
@@ -603,7 +607,7 @@ async fn compaction_uses_whole_batch_and_keeps_real_output_references_and_latest
             },
             Step::Final,
         ],
-        35,
+        BATCH_COMPACTION_PERCENT,
         true,
         false,
     )
@@ -652,7 +656,7 @@ async fn cancelled_or_stale_summary_never_commits_or_replays_tool_batch() {
                 exec("d", "__exec_large__"),
                 exec("b", "__exec_large__"),
             ])],
-            35,
+            BATCH_COMPACTION_PERCENT,
             true,
             true,
         )
@@ -711,7 +715,7 @@ async fn invalid_summary_falls_back_to_unchanged_hard_fitting_batch_without_losi
             ]),
             Step::Final,
         ],
-        35,
+        BATCH_COMPACTION_PERCENT,
         false,
         false,
     )
@@ -928,7 +932,7 @@ async fn failed_summary_after_disconnect_refreshes_target_status_without_reexecu
             ]),
             Step::Final,
         ],
-        35,
+        BATCH_COMPACTION_PERCENT,
         false,
         true,
     )
@@ -1602,7 +1606,7 @@ async fn desktop_d5_batch_compaction_reports_real_checkpoint_and_grants_can_be_r
             ]),
             Step::Final,
         ],
-        35,
+        BATCH_COMPACTION_PERCENT,
         true,
         false,
     )

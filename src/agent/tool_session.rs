@@ -106,6 +106,7 @@ impl ToolSession {
         binding: &ssh_tools::SshBinding,
         message: &str,
         runtime: &RuntimeConfig,
+        media: ChatMessage,
     ) -> tool_loop::Result<()> {
         // Validate host definitions before a durable running turn is created.
         // A malformed schema is a configuration error, not a failed SSH action.
@@ -118,6 +119,7 @@ impl ToolSession {
             message,
             runtime,
             &registry.definitions(),
+            Some(&media),
         )
     }
     /// Native storage quotas, never model arguments or execution permission.
@@ -190,7 +192,7 @@ impl ToolSession {
                 || !runtime.config.capabilities.tool_calls {
                 return Err(tool_loop::Error::Context);
             }
-            context::require_pinned(&snapshot,&binding,&message,&runtime,&tools)?;
+            context::require_pinned(&snapshot,&binding,&message,&runtime,&tools,None)?;
             let (snapshot,latest_user)=if let Some((r,_))=&managed {
                 let cursor=repository.db(|db|Ok(db.query_row("SELECT user_event_id FROM agent_chat_turns WHERE session_id=?1 AND request_id=?2",rusqlite::params![r.session_id,r.request_id],|r|r.get(0))?)).map_err(context_error)?;
                 (snapshot,cursor)
@@ -212,7 +214,12 @@ impl ToolSession {
         let client = ModelClient::new(runtime)?;
         let mut reply = loop_.run(&client, self, cancel).await?;
         if self.streams_replies() {
-            reply.content = Some(self.partial.lock().map_err(|_|tool_loop::Error::Context)?.clone());
+            reply.content = Some(
+                self.partial
+                    .lock()
+                    .map_err(|_| tool_loop::Error::Context)?
+                    .clone(),
+            );
             reply.refusal = None;
         } else if let Ok(guard) = self.data.lock() {
             if let Some(data) = guard.as_ref() {
@@ -274,17 +281,30 @@ fn ensure_current(repository: &Repository, data: &Data) -> tool_loop::Result<()>
     Ok(())
 }
 impl LoopContext for ToolSession {
-    fn streams_replies(&self)->bool {self.events.is_some()}
-    fn text_delta<'a>(&'a self,text:String,cancel:&'a CancellationToken)->BoxFuture<'a,provider::Result<()>> {
+    fn streams_replies(&self) -> bool {
+        self.events.is_some()
+    }
+    fn text_delta<'a>(
+        &'a self,
+        text: String,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, provider::Result<()>> {
         Box::pin(async move {
-            if cancel.is_cancelled(){return Err(provider::ModelError::Cancelled);}
+            if cancel.is_cancelled() {
+                return Err(provider::ModelError::Cancelled);
+            }
             {
-                let mut partial=self.partial.lock().map_err(|_|provider::ModelError::Database)?;
-                if partial.len().saturating_add(text.len())>16000{return Err(provider::ModelError::ResponseTooLarge);}
+                let mut partial = self
+                    .partial
+                    .lock()
+                    .map_err(|_| provider::ModelError::Database)?;
+                if partial.len().saturating_add(text.len()) > 16000 {
+                    return Err(provider::ModelError::ResponseTooLarge);
+                }
                 partial.push_str(&text);
             }
-            if let Some(events)=&self.events {
-                tokio::select!{biased;
+            if let Some(events) = &self.events {
+                tokio::select! {biased;
                     _=cancel.cancelled()=>return Err(provider::ModelError::Cancelled),
                     result=events.send(chat::StreamEvent::Text{content:text})=>result.map_err(|_|provider::ModelError::Cancelled)?,
                 }
@@ -301,7 +321,7 @@ impl LoopContext for ToolSession {
             if cancel.is_cancelled() {
                 return Err(tool_loop::Error::Cancelled);
             }
-            self.apply_inputs(Some(reply.clone()), true,cancel).await
+            self.apply_inputs(Some(reply.clone()), true, cancel).await
         })
     }
     fn before_model<'a>(
@@ -344,8 +364,8 @@ impl LoopContext for ToolSession {
                 data.pending=calls.into_iter().map(|call|Pending{id:call.id,started:false,capture:None}).collect();
                 Ok(())
             }).await?;
-            if self.streams_replies()&&text_present {
-                self.text_delta("\n\n".into(),cancel).await?;
+            if self.streams_replies() && text_present {
+                self.text_delta("\n\n".into(), cancel).await?;
             }
             if let Some(events) = &self.events {
                 for call in notifications {

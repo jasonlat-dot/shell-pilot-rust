@@ -1,7 +1,9 @@
 use super::*;
 use crate::agent::compact::{self, Prefix, Summarizer};
+use crate::store::Store;
 
 struct Frame {
+    store: Option<Arc<Store>>,
     snapshot: Snapshot,
     checkpoint: Option<Checkpoint>,
     events: Vec<Event>,
@@ -75,9 +77,14 @@ impl ToolSession {
                         .or(c.message.refusal.as_deref())
                 }) {
                     if self.streams_replies() {
-                        self.text_delta("\n\n".into(),cancel).await?;
+                        self.text_delta("\n\n".into(), cancel).await?;
                     } else {
-                        events.send(chat::StreamEvent::Text {content:format!("{text}\n\n")}).await.map_err(|_|tool_loop::Error::Context)?;
+                        events
+                            .send(chat::StreamEvent::Text {
+                                content: format!("{text}\n\n"),
+                            })
+                            .await
+                            .map_err(|_| tool_loop::Error::Context)?;
                     }
                 }
                 for input in &inputs.0 {
@@ -137,6 +144,7 @@ impl ToolSession {
             }
             ensure_current(&repository, data)?;
             Ok(Frame {
+                store: Some(repository.store.clone()),
                 snapshot: data.snapshot.clone(),
                 checkpoint,
                 events,
@@ -156,7 +164,7 @@ impl ToolSession {
         if cancel.is_cancelled() {
             return Err(tool_loop::Error::Cancelled);
         }
-        self.apply_inputs(None, false,cancel).await?;
+        self.apply_inputs(None, false, cancel).await?;
         let frame = self.frame().await?;
         let available = self.executor.verify().await.is_ok();
         let initial = project(
@@ -371,8 +379,19 @@ fn project(
         });
     }
     if frame.latest_user <= after {
-        messages.push(ChatMessage::User {
-            content: frame.message.clone(),
+        messages.push(if let Some(store) = &frame.store {
+            crate::agent::attachments::event_message(
+                store,
+                &frame.snapshot.session.id,
+                &frame.snapshot.session.user_id,
+                frame.latest_user,
+                &frame.message,
+            )
+            .map_err(|_| tool_loop::Error::Context)?
+        } else {
+            ChatMessage::User {
+                content: frame.message.clone(),
+            }
         });
     }
     let mut calls = vec![];
@@ -406,8 +425,19 @@ fn project(
             });
         }
         match &event.payload {
-            Payload::UserMessage { text } => messages.push(ChatMessage::User {
-                content: text.clone(),
+            Payload::UserMessage { text } => messages.push(if let Some(store) = &frame.store {
+                crate::agent::attachments::event_message(
+                    store,
+                    &frame.snapshot.session.id,
+                    &frame.snapshot.session.user_id,
+                    event.id,
+                    text,
+                )
+                .map_err(|_| tool_loop::Error::Context)?
+            } else {
+                ChatMessage::User {
+                    content: text.clone(),
+                }
             }),
             Payload::AssistantMessage { text } => messages.push(ChatMessage::Assistant {
                 content: Some(text.clone()),
@@ -440,8 +470,10 @@ pub(super) fn require_pinned(
     message: &str,
     runtime: &RuntimeConfig,
     tools: &[provider::FunctionDefinition],
+    media: Option<&ChatMessage>,
 ) -> tool_loop::Result<()> {
     let frame = Frame {
+        store: None,
         snapshot: snapshot.clone(),
         checkpoint: None,
         events: vec![],
@@ -450,7 +482,13 @@ pub(super) fn require_pinned(
         message: message.into(),
         runtime: runtime.clone(),
     };
-    let request = project(&frame, tools, binding, false, None)?;
+    let mut request = project(&frame, tools, binding, false, None)?;
+    if let Some(media) = media {
+        *request
+            .messages
+            .last_mut()
+            .ok_or(tool_loop::Error::Context)? = media.clone();
+    }
     provider::prepare_request(&runtime.config, &request)?;
     Ok(())
 }

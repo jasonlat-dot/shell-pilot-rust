@@ -382,7 +382,7 @@ fn prepare(
     }
     let runtime = match prefix {
         Some(p) => p.runtime.clone(),
-        None => ModelRepository::new(store).runtime(&snapshot.session.agent_id, user)?,
+        None => ModelRepository::new(store.clone()).runtime(&snapshot.session.agent_id, user)?,
     };
     let limit = prefix.map_or(MAX_SUMMARY_BYTES, |p| p.summary_bytes);
     if !(64..=MAX_SUMMARY_BYTES).contains(&limit) {
@@ -393,7 +393,7 @@ fn prepare(
     } else {
         INSTRUCTIONS.into()
     };
-    let request = ChatRequest {
+    let mut request = ChatRequest {
         messages: vec![
             ChatMessage::System {
                 content: instructions,
@@ -404,6 +404,16 @@ fn prepare(
         ],
         tools: vec![],
     };
+    for event in &source.events {
+        if let super::Payload::UserMessage { text } = &event.payload {
+            let message = super::attachments::event_message(&store, session, user, event.id, text)
+                .map_err(|_| Error::InputLimit)?;
+            if let ChatMessage::UserMedia { mut content } = message {
+                content.insert(0,super::attachments::Part::Text{text:format!("以下附件属于原始用户事件 {}，与原始证据一并概括；保留文件来源与无法读取的部分。",event.id)});
+                request.messages.push(ChatMessage::UserMedia { content });
+            }
+        }
+    }
     super::provider::prepare_request(&runtime.config, &request)?;
     Ok((
         snapshot,

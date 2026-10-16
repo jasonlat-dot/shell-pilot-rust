@@ -34,6 +34,10 @@ pub enum ChatMessage {
     User {
         content: String,
     },
+    #[serde(skip)]
+    UserMedia {
+        content: Vec<crate::agent::attachments::Part>,
+    },
     Assistant {
         content: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -106,8 +110,8 @@ pub fn prepare_request(config: &ModelConfig, request: &ChatRequest) -> Result<Pr
         return Err(ModelError::Invalid("message/tool count out of range"));
     }
     let measured = measure_request(config, request)?;
-    if measured.body.len() > 2 * 1024 * 1024 {
-        return Err(ModelError::Invalid("model request exceeds 2 MiB"));
+    if measured.body.len() > request_byte_limit(request) {
+        return Err(ModelError::Invalid("model request exceeds wire byte limit"));
     }
     if measured.estimated_input_tokens
         > config
@@ -183,7 +187,15 @@ pub(crate) fn measure_request(
     if !pending.is_empty() {
         return Err(ModelError::ToolProtocol);
     }
-    let mut body = json!({"model":config.model,"messages":request.messages,"stream":false});
+    let messages: Vec<Value> = request
+        .messages
+        .iter()
+        .map(|m| match m {
+            ChatMessage::UserMedia { content } => Ok(json!({"role":"user","content":content})),
+            _ => serde_json::to_value(m).map_err(|_| ModelError::ToolProtocol),
+        })
+        .collect::<Result<_>>()?;
+    let mut body = json!({"model":config.model,"messages":messages,"stream":false});
     body[match config.output_token_parameter {
         OutputTokenParameter::MaxCompletionTokens => "max_completion_tokens",
         OutputTokenParameter::MaxTokens => "max_tokens",
@@ -205,10 +217,10 @@ pub(crate) fn measure_request(
         );
     }
     let body = serde_json::to_string(&body).map_err(|_| ModelError::ToolProtocol)?;
-    if body.len() > 8 * 1024 * 1024 {
-        return Err(ModelError::Invalid("model planning request exceeds 8 MiB"));
+    if body.len() > 32 * 1024 * 1024 {
+        return Err(ModelError::Invalid("model planning request exceeds 32 MiB"));
     }
-    let cost = estimate_text(&body)
+    let cost = media_adjusted_cost(&body)?
         .checked_add(request.messages.len() as u64 * 12)
         .ok_or(ModelError::BudgetExceeded)?;
     let available = config
@@ -298,4 +310,36 @@ pub(crate) fn decode_response(bytes: &[u8], allowed: &HashSet<String>) -> Result
         finish_reason: choice.finish_reason,
         response_output: None,
     })
+}
+
+pub(crate) fn request_byte_limit(request: &ChatRequest) -> usize {
+    if request
+        .messages
+        .iter()
+        .any(|m| matches!(m, ChatMessage::UserMedia { .. }))
+    {
+        8 * 1024 * 1024
+    } else {
+        2 * 1024 * 1024
+    }
+}
+pub(crate) fn media_adjusted_cost(body: &str) -> Result<u64> {
+    let mut value: Value = serde_json::from_str(body).map_err(|_| ModelError::ToolProtocol)?;
+    fn replace(v: &mut Value) -> u64 {
+        match v {
+            Value::Object(object)
+                if object
+                    .get("type")
+                    .is_some_and(|t| t == "image_url" || t == "input_image") =>
+            {
+                *v = json!({"type":"image","detail":"high"});
+                crate::agent::attachments::IMAGE_TOKENS
+            }
+            Value::Object(object) => object.values_mut().map(replace).sum(),
+            Value::Array(array) => array.iter_mut().map(replace).sum(),
+            _ => 0,
+        }
+    }
+    let media = replace(&mut value);
+    Ok(estimate_text(&value.to_string()).saturating_add(media))
 }

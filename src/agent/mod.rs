@@ -1,6 +1,7 @@
 //! Persistent context, native model adapters, text turns and journaled SSH tool turns.
 //! Desktop tools require explicit target binding and durable human approval.
 pub mod approvals;
+pub mod attachments;
 pub mod budget;
 pub mod chat;
 pub mod compact;

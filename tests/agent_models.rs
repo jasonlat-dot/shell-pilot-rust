@@ -72,6 +72,20 @@ fn reply() -> Value {
 }
 
 #[test]
+fn image_input_is_enabled_for_new_missing_and_legacy_capabilities() {
+    assert!(ModelCapabilities::default().vision);
+    let mut value = serde_json::to_value(config()).unwrap();
+    value["capabilities"]
+        .as_object_mut()
+        .unwrap()
+        .remove("vision");
+    let old: ModelConfig = serde_json::from_value(value.clone()).unwrap();
+    assert!(old.capabilities.vision);
+    value["capabilities"]["vision"] = json!(false);
+    let old: ModelConfig = serde_json::from_value(value).unwrap();
+    assert!(old.normalized().unwrap().capabilities.vision);
+}
+#[test]
 fn api_url_normalization_preserves_prefix_and_rejects_ambiguous_endpoints() {
     let mut c = config();
     c.base_url = "https://model.example/proxy/v1".into();
@@ -339,7 +353,7 @@ fn schema_upgrade_preserves_existing_agent_sessions() {
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
     assert_eq!(
         db.query_row("SELECT count(*) FROM agent_sessions", [], |r| r
@@ -755,33 +769,66 @@ async fn saved_credentials_obey_auth_toggle_and_replacement_after_restart() {
     c.base_url = mock.base.clone();
     c.require_api_key = true;
     let repo = ModelRepository::new(Arc::new(Store::open(&path).unwrap()));
-    repo.save("model", "alice", 0, update(c.clone(), KeyChange::Set {
-        value: SecretKey::new(TEST_KEY).unwrap(),
-    })).unwrap();
-    ModelClient::new(repo.runtime("model", "alice").unwrap()).unwrap()
-        .complete(&request(), &CancellationToken::new()).await.unwrap();
+    repo.save(
+        "model",
+        "alice",
+        0,
+        update(
+            c.clone(),
+            KeyChange::Set {
+                value: SecretKey::new(TEST_KEY).unwrap(),
+            },
+        ),
+    )
+    .unwrap();
+    ModelClient::new(repo.runtime("model", "alice").unwrap())
+        .unwrap()
+        .complete(&request(), &CancellationToken::new())
+        .await
+        .unwrap();
 
     // Blank input keeps the encrypted key, but disabling authentication must
     // remove it from the actual HTTP request, not just hide it in the UI.
     c.require_api_key = false;
-    let saved = repo.save("model", "alice", 1, update(c.clone(), KeyChange::Keep)).unwrap();
+    let saved = repo
+        .save("model", "alice", 1, update(c.clone(), KeyChange::Keep))
+        .unwrap();
     assert!(saved.api_key_configured && saved.ready);
-    ModelClient::new(repo.runtime("model", "alice").unwrap()).unwrap()
-        .complete(&request(), &CancellationToken::new()).await.unwrap();
+    ModelClient::new(repo.runtime("model", "alice").unwrap())
+        .unwrap()
+        .complete(&request(), &CancellationToken::new())
+        .await
+        .unwrap();
 
     // Re-enabling with blank input reuses the old key.
     c.require_api_key = true;
-    repo.save("model", "alice", 2, update(c.clone(), KeyChange::Keep)).unwrap();
-    ModelClient::new(repo.runtime("model", "alice").unwrap()).unwrap()
-        .complete(&request(), &CancellationToken::new()).await.unwrap();
+    repo.save("model", "alice", 2, update(c.clone(), KeyChange::Keep))
+        .unwrap();
+    ModelClient::new(repo.runtime("model", "alice").unwrap())
+        .unwrap()
+        .complete(&request(), &CancellationToken::new())
+        .await
+        .unwrap();
 
     const REPLACEMENT: &str = "unit-test-replacement-key";
     c.require_api_key = false;
-    repo.save("model", "alice", 3, update(c.clone(), KeyChange::Set {
-        value: SecretKey::new(REPLACEMENT).unwrap(),
-    })).unwrap();
-    ModelClient::new(repo.runtime("model", "alice").unwrap()).unwrap()
-        .complete(&request(), &CancellationToken::new()).await.unwrap();
+    repo.save(
+        "model",
+        "alice",
+        3,
+        update(
+            c.clone(),
+            KeyChange::Set {
+                value: SecretKey::new(REPLACEMENT).unwrap(),
+            },
+        ),
+    )
+    .unwrap();
+    ModelClient::new(repo.runtime("model", "alice").unwrap())
+        .unwrap()
+        .complete(&request(), &CancellationToken::new())
+        .await
+        .unwrap();
     drop(repo);
 
     let repo = ModelRepository::new(Arc::new(Store::open(&path).unwrap()));
@@ -791,13 +838,26 @@ async fn saved_credentials_obey_auth_toggle_and_replacement_after_restart() {
     let public = serde_json::to_string(&saved).unwrap();
     assert!(!public.contains(TEST_KEY) && !public.contains(REPLACEMENT));
     c.require_api_key = true;
-    repo.save("model", "alice", 4, update(c, KeyChange::Keep)).unwrap();
-    ModelClient::new(repo.runtime("model", "alice").unwrap()).unwrap()
-        .complete(&request(), &CancellationToken::new()).await.unwrap();
+    repo.save("model", "alice", 4, update(c, KeyChange::Keep))
+        .unwrap();
+    ModelClient::new(repo.runtime("model", "alice").unwrap())
+        .unwrap()
+        .complete(&request(), &CancellationToken::new())
+        .await
+        .unwrap();
 
     let requests = mock.state.requests.lock().unwrap();
     assert_eq!(requests.len(), 5);
-    for (index, key) in [Some(TEST_KEY), None, Some(TEST_KEY), None, Some(REPLACEMENT)].into_iter().enumerate() {
+    for (index, key) in [
+        Some(TEST_KEY),
+        None,
+        Some(TEST_KEY),
+        None,
+        Some(REPLACEMENT),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let (uri, headers, body) = &requests[index];
         match key {
             Some(key) => assert_eq!(headers["authorization"], format!("Bearer {key}")),

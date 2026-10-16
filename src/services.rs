@@ -16,15 +16,15 @@ impl Services {
     pub fn native(store: Arc<Store>, settings: files::Settings, instance: uuid::Uuid) -> Arc<Self> {
         let stop = CancellationToken::new();
         let terminals = Arc::new(terminal::TerminalManager::new(store.clone()));
+        let files = files::Manager::new_native(store.clone(), settings, instance);
         Arc::new(Self {
             terminals: terminals.clone(),
             sftp: sftp::Manager::new(store.clone()),
-            files: files::Manager::new_native(store.clone(), settings, instance),
-            agent: Arc::new(chat::Manager::with_terminals(
-                store.clone(),
-                stop.clone(),
-                terminals,
-            )),
+            files: files.clone(),
+            agent: Arc::new(
+                chat::Manager::with_terminals(store.clone(), stop.clone(), terminals)
+                    .with_files(files),
+            ),
             store,
             stop,
         })
@@ -32,15 +32,15 @@ impl Services {
     pub fn new(store: Arc<Store>, settings: files::Settings, file_base_url: String) -> Arc<Self> {
         let stop = CancellationToken::new();
         let terminals = Arc::new(terminal::TerminalManager::new(store.clone()));
+        let files = files::Manager::new(store.clone(), settings, file_base_url);
         Arc::new(Self {
             terminals: terminals.clone(),
             sftp: sftp::Manager::new(store.clone()),
-            files: files::Manager::new(store.clone(), settings, file_base_url),
-            agent: Arc::new(chat::Manager::with_terminals(
-                store.clone(),
-                stop.clone(),
-                terminals,
-            )),
+            files: files.clone(),
+            agent: Arc::new(
+                chat::Manager::with_terminals(store.clone(), stop.clone(), terminals)
+                    .with_files(files),
+            ),
             store,
             stop,
         })

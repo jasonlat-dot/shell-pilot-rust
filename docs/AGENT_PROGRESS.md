@@ -1,5 +1,100 @@
 # Rust SSH Agent 实施清单与续接入口
 
+### 深色提示统一增加悬停延迟（2026-10-16）
+
+- [x] 客户端 `src/components/AgentPanel.tsx`：添加附件、编辑/恢复、用户/回复复制及完整时间的共用深色提示均在鼠标持续悬停 400 ms 后显示。鼠标提前移开、操作激活、Esc、滚动/调整窗口/失焦、禁用状态或草稿范围切换时取消等待；即使浮层尚未显示也响应取消，卸载清理计时器，触发时复核节点仍连接且未禁用。键盘 focus 保留立即提示，原样式/文案/日期格式不变。同步 docs/chat-attachments.md。
+- 验证：`node --import tsx --test tests/agent-composer-queue.test.mjs tests/message-time.test.ts` **19/19**，其中新增模拟时钟回归覆盖 399 ms 不显示、快速离开取消、400 ms 显示、等待期间 Esc/范围切换取消以及 focus 立即显示；其余沿用队列及日期边界回归。TypeScript、Vite 资源构建和差异检查通过。实际 WebView 视觉仍待 E6，未记作通过；保留已有未提交代码，未提交、推送或打包。
+
+
+### 时间悬停使用统一深色提示（2026-10-16）
+
+- [x] 客户端 `src/components/AgentPanel.tsx`、`src/components/AgentComposer.css`：用户消息和回复的 time 节点移除原生 title，复用已有深色圆角 Portal 浮层显示完整日期与时分秒；提示锚点由按钮推广至 HTMLElement，保留定位与关闭规则。时间支持 Tab 聚焦查看，增加清晰焦点轮廓，原日期格式、午夜刷新及两类消息操作顺序不变。同步 docs/chat-attachments.md。
+- 验证：日期边界与既有输入队列回归 **17/17**，TypeScript、Vite 资源构建及差异检查通过。低影响前端提示调整，未新增重复样式断言、未重跑无关原生套件；实际 WebView 视觉验收仍待 E6，未记作通过。保留已有未提交改动，未提交、推送或打包。
+
+
+### 回复时间后置与历史日期显示（2026-10-16）
+
+- [x] 客户端 `src/components/AgentPanel.tsx`：更正回复操作行为“复制回复 → 时间”，时间在最后；用户消息继续按“时间 → 编辑/恢复 → 复制消息”排列，深色复制提示保留。
+- [x] `src/state/messageTime.ts`、AgentPanel.tsx：用户与回复统一使用本机自然日判断，当天 HH:mm，同年往日 MM-DD HH:mm，跨年 YYYY-MM-DD HH:mm；保留原始时间戳、ISO 语义及完整时间悬停提示。使用单个午夜定时器并在窗口 focus 时刷新，关闭/卸载时清理，不为每条消息创建定时器。同步 docs/chat-attachments.md；两个已有组件夹具补充模拟浏览器定时器。
+- 验证：`node --import tsx --test tests/message-time.test.ts tests/agent-composer-queue.test.mjs` **17/17**（日期边界 4 项、既有队列/项目/附件 13 项），覆盖同一天、相隔不足 24 小时但跨日、跨年、午夜切换及无效时间戳；TypeScript、Vite 资源构建和差异检查通过。未修改历史记录或执行无关原生套件；实际 WebView 视觉仍待 E6，未记作通过。保留已有未提交改动，未提交、推送或打包。
+
+
+### 消息操作顺序与复制悬停提示（2026-10-16）
+
+- [x] 客户端 `src/components/AgentPanel.tsx`：用户消息操作顺序调整为时间、编辑/恢复、复制；回复操作行也将时间放在复制前。用户与回复复制按钮分别显示“复制消息”“复制回复”，使用既有深色圆角 Portal 提示，保留鼠标/聚焦、关闭与边界定位行为。
+- [x] `src/components/CopyMarkdownButton.tsx`、CopyTextButton.tsx：增加可选提示事件透传到实际按钮，使用自定义提示时关闭浏览器原生 title，点击复制时关闭浮层；复制内容生成、成功反馈及剪贴板行为保持。同步 docs/chat-attachments.md。
+- 验证：既有附件/输入队列回归 **20/20**，TypeScript、Vite 资源构建及差异检查通过。本次为前端排序与提示调整，未新增重复实现断言、未重跑无关原生套件；实际 WebView 悬停视觉仍待 E6，未记作通过。保留已有未提交变更，未提交、推送或打包。
+
+
+### 输入框附件与消息恢复按钮的悬停提示（2026-10-16）
+
+- [x] 客户端 `src/components/AgentPanel.tsx`、`src/components/AgentComposer.css`：将“＋”及消息恢复按钮的浏览器 title 提示替换为统一深色圆角、浅色文字、轻阴影浮层，分别显示“添加文件等内容”与“恢复到输入框”。使用 Portal 避免聊天滚动区域裁剪，优先位于按钮上方并限制在视口内；支持鼠标悬停、键盘聚焦和 aria-describedby，点击/失焦/Esc/滚动/窗口失焦或会话切换后关闭，不添加未实现的快捷键提示。附件选择、恢复文字及附件的原有操作继续保留，docs/chat-attachments.md 已同步。
+- 验证：既有输入队列/项目/附件按钮接线回归 `tests/agent-composer-queue.test.mjs` **13/13**，TypeScript、Vite 资源构建及差异检查通过。低影响前端交互调整，未新增重复样式断言或重跑原生套件；实际 WebView 悬停视觉仍待 E6 验收，未记作通过。保留已有未提交代码，未提交、推送或打包。
+
+
+### E1 补充：移除重复的再次附加入口（2026-10-16）
+
+- [x] 客户端 `src/components/ChatAttachments.tsx` / .css、`src/components/AgentPanel.tsx`：移除图片悬停及 PDF/文本卡片上的“再次附加”，清理相关参数、回调和样式。继续使用消息悬停/聚焦时的“恢复到输入框”恢复原文字与附件；图片放大、文档查看和草稿内移除保留。同步 docs/chat-attachments.md 当前说明。
+- 验证：附件与输入队列既有组件回归 **20/20**，TypeScript、Vite 资源构建及差异检查通过；源码搜索确认重复入口及回调无残留。仅前端入口精简，未新增重复实现断言，未重跑无关原生套件；实际 WebView 视觉验收仍待 E6。保留现有未提交改动，未提交、推送或打包。
+
+
+### E1 补充：草稿图片使用紧凑缩略图（2026-10-16）
+
+- [x] 客户端 `src/components/ChatAttachments.tsx` / .css：将待发送图片从铺满输入区的文件行改为 120×120 独立缩略图，附件容器使用横向排列并自动换行；准备中的图片使用相同尺寸占位，保留圆形加载状态。图片文件名/大小仍供无障碍读取，名称可悬停查看，移除按钮移至图片右上角；点击放大、错误重试及普通文件信息继续保留。同步 docs/chat-attachments.md。
+- 验证：`node --import tsx --test tests/agent-attachment-ui.test.mjs tests/agent-composer-queue.test.mjs` **20/20**，TypeScript、Vite 资源构建与差异检查通过。本次是前端样式及卡片分类调整，未新增重复样式断言，未重跑无关 Rust 套件；实际 WebView 视觉验收仍归 E6，未记作通过。保留已有未提交改动，未提交、推送或打包。
+
+
+### E1 补充：所有附件使用卡片内圆形加载指示（2026-10-16）
+
+- [x] 客户端 `src/components/ChatAttachments.tsx` / .css：图片在缩略图区域显示圆形加载指示，PDF/文本等其他支持文件在文件图标区域显示；覆盖队列等待、上传/原生准备及图片预览加载。完成后逐项消失，错误仍在卡片中提示；使用可访问的非确定进度状态，没有可验证的字节进度时不显示百分比。
+- [x] `src-tauri/src/attachment_input.rs`、backend_ipc.rs、`src/api/files.ts`：增加文件级 preparing 事件，携带临时 id/名称/大小，在整批类型/数量/字节预检通过后、原生存储前显示卡片；uploaded 同 id 关联完成。聊天系统选择器与复制文件共用预检/导入流程，文件正文与本机路径仍由原生持有。
+- [x] `src/components/AgentPanel.tsx`：剪贴板读取期间显示临时准备卡片，随后替换成各文件卡片；完成、失败或普通文字粘贴结束时清理。旧草稿的迟到进度不能进入新会话，准备期间仍锁定发送。去掉底部“附件正在准备中，请等待上传完成”整条提示，只保留具体错误；原生选择器错误保留可读原因。客户端 docs/chat-attachments.md 与 ipc-transport.md 已同步。
+- 验证：原生 `cargo test --offline -j 1 --manifest-path src-tauri/Cargo.toml --lib attachment_input -- --test-threads=1` **3/3**，补充逐文件准备/完成事件、id 匹配及整批预检先于事件的断言；前端 `node --import tsx --test tests/agent-attachment-ui.test.mjs tests/agent-composer-queue.test.mjs tests/agent-ipc.test.ts` **48/48**，覆盖图片/PDF/文本指示、单文件完成、旧进度丢弃、无底部等待横条及真实 IPC 接线；最后补齐选择器错误透传断言后 IPC 单独 **28/28**。TypeScript、Vite 资源构建、目标原生文件 rustfmt 和差异检查通过。实际 WebView 视觉验收仍归 E6，未记作通过；未提交、推送或打包，保留已有未提交变更。
+
+
+### 输入框项目选择菜单（2026-10-16）
+
+- [x] 客户端 `src/components/ComposerProjectPicker.tsx` / .css、`src/components/AgentPanel.tsx`：未选择项目的新文字对话在输入框上方显示“选择项目”文件夹按钮；点击打开独立 Portal 浮层，顶部搜索、可滚动已有项目列表和底部“新建项目”。名称/主机搜索、键盘上下键与 Enter、Esc/外部点击关闭、焦点恢复和随视口调整位置已接通，保留主题与三栏布局。
+- [x] `src/App.tsx`、`src/components/ProjectChatHistory.tsx`：底部新建入口打开已有项目创建窗口；创建成功等待原项目连接流程结束，取消/管理服务器返回时释放输入区；选择和新建期间保留文字草稿，已有对话、运行/排队中的会话继续固定归属。沿用现有服务器项目数据和连接流程，未增加不绑定服务器的文字项目类型。`docs/agent-model-settings.md` 已同步使用说明。
+- 验证：`node --import tsx --test tests/composer-project-picker.test.mjs tests/agent-composer-queue.test.mjs tests/project-history-ui.test.mjs` **37/37**，覆盖搜索、无结果不误选、键盘/关闭/运行锁、新建窗口及取消回执、草稿跨连接范围恢复与历史交互。TypeScript、Vite 资源构建、差异检查通过。本次仅改客户端 UI 和接线，不重新运行无关 Rust 套件；实际 WebView 截图/完整交互仍待 E6 验收，未记为通过。保留已有未提交代码，未提交、推送或打包；下一主项仍为 E2。
+
+
+### E1 补充：图片预览、输入框粘贴与发送排版（2026-10-16）
+
+- [x] 图片预览：客户端 `src/components/ChatAttachments.tsx` / .css、`src/api/files.ts`，Rust `src/agent/attachments.rs::image_preview`。原生选择器给图片附带临时缩略图，草稿可直接点击放大；历史按会话/模型/文件 ID 自动读取发送快照，原上传清理后仍可显示，迟到响应不能替换其他会话。原生草稿预览只接受当前实例文件 ID，沿用本地用户文件归属限制；共享现有受限图片解码、1024 缩放、JPEG 输出逻辑，预览并发为 2。失败可重试，不把文件图标当成已显示图片。
+- [x] 输入框粘贴：客户端 `src/components/AgentPanel.tsx`、`src/api/files.ts`，`src-tauri/src/attachment_input.rs`、backend_ipc.rs、lib.rs / Cargo.toml。仅响应 Ctrl+V/Cmd+V 或菜单粘贴，原生读取截图/图片与 Windows CF_HDROP 复制文件，文件路径及原始字节不由 WebView 上传。普通文字按选区插入，用户继续编辑时保留新草稿；导入期间（包括 React 更新前）禁止漏发，完成回调绑定原草稿范围。复制文件整批预检剩余数量/20 MB、类型、空文件/目录，仍不支持 Office 文档或拖入上传。
+- [x] 发送排版：`src/components/AgentPanel.tsx`、ChatAttachments.tsx/.css。图片缩略图独立放在文字气泡上方并右对齐，多图换行，点击放大，悬停/聚焦支持再次附加；PDF/文本继续显示文件卡片。图片与文字不再嵌在同一个大文件卡片中，保持三栏及主题。前端 docs/chat-attachments.md、agent-model-settings.md、ipc-transport.md 和 Rust AGENT_CHAT.md 已同步。
+- 验证：原生 `cargo test --offline -j 1 --manifest-path src-tauri/Cargo.toml --lib attachment_input -- --test-threads=1` **3/3**，覆盖截图编码、原始文件存储及缩略图、清理后拒绝读取、复制文件整批预检、数量/字节限制和无效像素缓冲。首次编译仅遇到测试访问跨仓库私有 Store 字段，已改为公开文件服务接口后通过，未放宽封装。Rust `cargo test --offline -j 1 --test agent_attachments -- --test-threads=1` **12/12**，验证共享图片处理不影响两种模型协议、预算、归属、快照和自动整理。
+- 前端 `node --import tsx --test tests/agent-attachment-ui.test.mjs tests/agent-composer-queue.test.mjs tests/chat-attachments.test.ts tests/agent-ipc.test.ts` **60/60**；补齐同步发送互斥后队列套件单独 **11/11**，TypeScript 与最终 Vite 资源构建、目标文件 rustfmt 和差异检查通过。没有调用真实模型、连接用户远端或读取用户系统剪贴板做测试；实际系统粘贴、WebView 截图/交互及真实模型验收仍归 E6，未记作通过。保留已有未提交变更，未提交、推送或打包；下一主项仍为 E2。
+
+
+### E1 补充：图片理解默认开启（2026-10-16）
+
+- [x] `src/agent/provider/config.rs`：图片理解与工具一样默认开启；缺省 vision 字段按 true 读取，旧配置保存的 false 在读取/保存时归一为 true，无需用户重新保存模型。保留字段用于存量配置兼容，不再作为用户启停开关。
+- [x] `src/agent/attachments.rs`、`src/agent/provider/protocol.rs` / responses.rs：移除图片能力开关拦截，图片直接走已有附件准备和模型协议链路；文件归属、格式、大小及输入预算校验继续保留。供应商实际协议和识图支持仍以真实响应为准。
+- [x] 客户端 `src/api/models.ts`、`src/components/ModelSettings.tsx`：新建及载入旧配置统一开启图片理解，删除高级参数中的图片理解开关；同步 README、模型设置及 Rust 模型/附件说明。
+- 验证：`cargo test --offline -j 1 --test agent_attachments --test agent_models -- --test-threads=1` 附件 **12/12**、模型 **22/22**；包含旧 false 配置在 Chat Completions / Responses 仍发送图片、缺字段默认值和预算不足准入拒绝。`node --import tsx --test tests/model-compaction-ui.test.mjs tests/agent-attachment-ui.test.mjs` **13/13**，覆盖无开关、旧配置保存归一化和预览；TypeScript、Vite 资源构建及差异检查通过。未执行实际 WebView/真实模型验收，未提交、推送或打包。
+
+
+### E1 附件链路（2026-10-16，完成本地联验）
+
+- 基于 Rust main/c14ea5b 与客户端 test-rust-ui/61600b7 开发，保留此前仓库同步记录。实际参考固定 Codex CLI 的 core/src/image_preparation.rs、protocol/src/models.rs、core/src/context_manager/history.rs 与 compact_remote_v2_images.rs；按“原始引用、准备后的媒体、模型预算”分离接入，并核对官方图片输入格式，未执行参考项目代码。
+- [x] E1.1 转换与归属：`src/agent/attachments.rs`、`migrations/017_agent_attachments.sql`、`src/store.rs` / services.rs。沿用同一个文件服务句柄和 Store，核对 file_assets.owner_id、会话/模型/用户及 SHA256；只接受文件 ID，不接受客户端路径、下载地址或转换结果。原始附件最多 4 个/20 MB，PNG/JPG/WEBP 经限制解码后等比缩至 1024 并编码 JPEG；UTF-8 每份至多 256 KiB；PDF 至多 8 MiB/100 页，限制单个加载流和逐页解压，提取文字带页码并计入 256 KiB 上限。两个解析任务，按会话 24 MiB/用户 128 MiB 保存准备快照；配额按 UTF-8 实际字节计。
+- [x] E1.2 模型、预算与持久记录：`src/agent/provider/protocol.rs` / responses.rs、chat.rs、chat/execution.rs、turns.rs、compact.rs、compact/auto.rs、compact/auto/responses.rs、tool_session/context.rs。Chat Completions 使用 text/image_url，Responses 使用 input_text/input_image 并对真实输入调用计数。图片每张预留 8192 估算 tokens，不把 Base64 当正文；仍明确为启发式预留。文字/工具历史与摘要接收附件，整理后最新附件仍保留。轮次准入事务关联事件、幂等比较有序附件 ID；快照在原上传清理后仍可回查。`src/agent/delete.rs` 清理对话内关联与快照，不删除其他上传；移除项目继续保留聊天。附件准备期间响应原生停止/关闭和调用方取消，后台受限解析不产生执行权限。
+- [x] E1.3 前台：客户端 `src/components/AgentPanel.tsx`、ChatAttachments.tsx/.css、ModelSettings.tsx、`src/state/agentHistory.ts`、`src/api/agent.ts` / files.ts、`src-tauri/src/backend_ipc.rs`。聊天“＋”打开系统选择器，数量/类型/大小预检；图片理解默认开启，不再提供高级参数开关，旧关闭配置自动兼容。历史卡片恢复并支持“查看发送内容”，经 agent/attachment 按原会话/模型/用户只读查看缩放图片或文档文字，迟到响应不替换别的会话。保持三栏布局、主题、现有队列与审批入口。
+- [x] E1.4 收尾兼容回归：专项 `cargo test --offline -j 1 --test agent_attachments -- --test-threads=1` **11/11**，包括三类附件、无文字输入、错误内容/能力/预算、归属与不同 Store 拒绝、迁移、删除、重开历史/清理原上传、重复请求与摘要原始证据、Responses 计数/生成、编码长度不冒充文本 token，以及自动整理旧附件后最新图片完整保留、旧文件仍可回查的连续场景。native IPC/Channel + 附件 + 人工审批 + 本地模拟 SSH 的 D5 完整链路定向单项 **1/1**；前端附件预览、队列、模型、历史、IPC 和附件策略 **69/69**，TypeScript/Vite 资源构建、核心改动 rustfmt/diff 检查通过。生产库严格 Clippy 已通过；全目标 `cargo clippy --offline -j 1 --all-targets -- -D warnings -A clippy::items_after_test_module` 通过，仅豁免 HEAD 已有测试模块排序项。
+- 兼容回归：`cargo test --offline -j 1 --lib --test agent_chat --test agent_auto_compact --test agent_responses --test agent_tool_session --test agent_context --test agent_models --test agent_projects -- --test-threads=1` 经夹具修正后，lib **52 通过/1 个原有 POSIX 用例按配置忽略**、auto_compact **25/25**、chat **19/19**、context **19/19**、models **21/21**、projects **6/6**。Responses 初轮 **19/20**，仅修正并复测 `endpoint_model_protocol_and_key_changes_never_reuse_an_opaque_window` **1/1**；工具会话随后单独 **19/19**。这些是分轮结果，不冒充一次全项目全量无失败运行；未跑 SFTP 等无关套件，也未再次重复已通过的全部套件。
+- 验证修正：初轮 Responses 模拟服务漏返回 response.input_tokens 的 object 标识，修正测试服务后 10 项全过；旧审批测试仍按 command 字段及旧 SSH 专用审查提示断言，与 HEAD 的通用 tool-action 实现不一致，已仅修正夹具及 schema 16→17 断言，正式审批不变。Responses 旧密钥测试原先在认证关闭时更换保存密钥，此时有效运行凭据仍为 no-key；夹具现先启用认证并设置虚拟旧密钥，再验证虚拟新密钥拒绝旧窗口，生产凭据规则不变。工具整理 5 项原先沿用 35% 水位，实测完整输入约 3759 tokens，必需提示加检查点超过原低水位 2078；仅将夹具水位改为 45%，保持整批仍触发、压缩后必需输入可装入，最终 19 项通过，生产触发/回退规则不变。Rust 全目标默认严格 Clippy 命中 HEAD 已有 chat/execution.rs 的 items_after_test_module；未移动无关测试模块，另跑仅豁免该项的全目标检查。
+- 扫描 PDF、OCR、Office 文档及拖入上传不在当前支持范围，明确提示而不伪造已读；剪贴板图片/复制文件和缩略图排版已在后续 E1 补充中接通；带附件队列按下一轮发送，同轮引导仍仅纯文本。实际 WebView/真实模型/用户远端验收仍归 E6，不把组件或协议验证当成实际 GUI 通过。只使用临时库、回环模型和本地模拟 SSH，不提交、推送或打包；E1 主清单已勾选，下一项 E2；实际模型质量和视觉验收仍须另做。
+
+### 仓库同步核对（2026-10-16）
+
+- 已执行远端拉取：Rust `main` 从 `6c93fff` 快进至 `c14ea5b`；客户端 `test-rust-ui` 已与远端一致，HEAD 为 `61600b7`。拉取前后两个仓库均无未提交代码；本次仅补充此进度记录，不提交、推送或打包。
+- 核对最新源码：`src/store.rs` 已加载 schema 16；同轮引导见 `src/agent/steering.rs`，三种审批模式及隔离审查见 `src/agent/approvals.rs` / `approvals/reviewer.rs`，无损移除项目与删除对话见 `src/agent/projects.rs` / `delete.rs`。
+- 当前桌面工具使用绑定终端的当前 Shell，继承已完成的身份/目录/环境变更，按调用隔离捕获输出并在终端展示；入口见 `src/terminal/agent_exec.rs` / `shared_shell.rs`。工具默认可用仍须符合绑定、协议及审批策略；此前“须手动启用工具、右侧不展示输出”的说明属于旧阶段。
+- 工具正文已接真实 Chat Completions 增量流，见 `src/agent/provider/tool_stream.rs` / `tool_loop.rs`；前端已包含输入队列/同轮引导、审批模式、延迟建会话、项目移除/对话删除、历史悬停预览与快捷定位轨道。已按实际源码核对，未将文档旧的“未提交”表述解释为当前工作区仍有改动。
+- 阶段状态仍为 A/B/C 与 D1–D5 完成本地联验，下一项 E1（图片/PDF/文本附件转换、模型能力、预算和所有权检查）。E2–E6 保持未完成；真实模型、用户远端及完整 WebView 验收仍待完成。此次同步未重新执行新版本测试或启动应用，各功能验证沿用对应章节的既有证据。
+
 ### 最新工作区：对话快捷定位轨道与审批行收简（2026-10-16）
 
 - 客户端移除对话顶部“工具权限 · … / 审批与记录”整行，审批卡仍按原有待确认流程进入输入区，权限选择仍保留在输入框底部。根据桌面端 `floating-navigation-rail-layout` 的 Marker 样式重做快捷定位：节点只取用户消息/对话轮次，至少 4 个节点才显示；每个节点为固定 10px 行高中的 26px 独立短线，节点从轨道中间自然堆叠，超出最大高度后轨道自身滚动；普通消息使用统一 6px 基础宽度，悬停/聚焦/拖动选中时才按 20/14/9px 邻近宽度递减。悬停/聚焦/点击节点显示对应回复摘要、标题和标记图标；摘要浮层改为 Portal 挂载，脱离轨道滚动裁剪，并保留鼠标移入浮层的交互窗口；点击使用目标元素原生平滑滚动，修正嵌套滚动容器 offset 计算；补齐轨道移入/移出、焦点离开、指针拖动即时定位、拖动点击抑制、窗口尺寸重算和定位后短暂高亮。
@@ -88,7 +183,7 @@
 - Rust ModelRepository::runtime 在 requireApiKey=false 时不解密、不返回运行密钥，确保关闭认证后 HTTP 请求不携带已保存的 Bearer token；加密凭据保留，重新启用时复用。未修改数据库结构。
 - 用户随后要求简单测试保存与认证：前端模型设置 9 项、Rust agent_models 21 项及 TypeScript 检查通过。使用虚拟密钥、临时数据库和本机 HTTP 服务确认留空保留、输入替换、关闭认证不发送 Authorization、重新启用恢复密钥、替换后重启仍使用新密钥；同时验证公开配置不回显密钥和变更地址必须显式处理原密钥。调整旧测试以匹配工具默认启用及禁用认证不解密的现行行为。未做构建或 GUI 验证；未提交。
 
-更新日期：2026-10-16。状态：阶段 5 实施中，A/B/C 当前文字阶段及 D1–D5 工具产品链路已完成本地联验；下一项 E1：聊天附件/媒体能力与预算。最新工作区包含工具默认启用、统一授权入口、审批修复及模型设置布局/认证开关调整；最新已完成模型保存与认证开关的定向验证，不代表整个工作区已回归。真实模型、用户远端和完整 GUI 验收仍归 E6。
+更新日期：2026-10-16。状态：阶段 5 实施中，A/B/C 当前文字阶段、D1–D5 工具产品链路及 E1 基础附件已完成本地联验；schema 17，下一项 E2：长期记忆与短期上下文分离。图片理解默认开启，无需设置开关，PDF 仅提取文字；真实模型、用户远端和完整 GUI 验收仍归 E6。
 最新桌面执行模式：工具使用绑定终端的当前 POSIX Shell（继承已完成的 sudo 切换），工具输出走每次调用专属的描述符/SSH 收集通道；终端展示真实命令、结果和真实提示符，隐藏内部协议。下文早期“独立 exec 不继承终端”记录属于历史阶段，以末尾最新章节为准。
 用户要求：参考 Codex CLI 优化上下文和工具决策；先列清单，每完成一项更新标记，供换窗口后续接。当前不打包。需要修改前端的阶段同步修改 test-rust-ui。
 源码参考与设计依据：[CODEX_AGENT_REFERENCE.md](CODEX_AGENT_REFERENCE.md)。本文件是进度唯一入口，完成标记必须有代码与验证证据，不以“已设计”替代“已实现”。
@@ -122,7 +217,7 @@ Rust 重构交接、已完成工作与运行方式见 [WORK_HANDOFF_2026-10-14.m
 
 ## 工作区与约束
 
-- 最新核对：客户端 test-rust-ui/a5feb94，Rust main/6c93fff；D5 已由用户提交，本地 HEAD 与当前 origin 跟踪引用一致（未 fetch）。本轮接入消息队列/同轮引导、输入区审批和输出 UI；schema 14，前后端改动未提交。旧完成记录中的“本轮未提交”描述对应当时状态。
+- 最新基线：客户端 test-rust-ui/61600b7，Rust main/c14ea5b；本次 E1 前后端和文档保留在未提交工作区，schema 17，无安装包。旧完成记录中的“本轮未提交”描述对应当时状态。
 - 项目、参考源码和工具位置由本机环境决定；跨电脑续接时按实际位置核对 Cargo 依赖，不沿用旧电脑的绝对路径。
 - 当前源码未重新打包；已有 0.4.0 安装包不能代表最新功能。
 - 保留各仓库已有未提交变更；不连接用户远端、不执行实际变更命令来做测试。
@@ -167,7 +262,7 @@ Rust 重构交接、已完成工作与运行方式见 [WORK_HANDOFF_2026-10-14.m
 - [x] D5 前端执行确认/绑定服务器/工具结果 UI 和真实本地 SSH 协议回归。显式启用、审批/拒绝/撤销、固定目标、结果/原始输出和历史恢复已接通；工具 18、native IPC 24、前端 54 项通过。真实 GUI/模型/用户服务器仍待 E6。
 
 ### E. 附件、记忆与高级 Agent
-- [ ] E1 图片/PDF/文本附件到模型的转换、能力/预算/所有权检查。
+- [x] E1 图片/PDF/文本附件到模型的转换、能力/预算/所有权检查。schema 17 的不可变会话快照、原生模型媒体输入、历史/整理/回查与前端系统选择器已接通；专项 11、前端 69、native 完整链路单项及相关兼容回归通过。PDF 仅提取文字，OCR/Office/拖入与剪贴板图片不在当前支持范围；实际 WebView/模型/远端仍待 E6。
 - [ ] E2 长期记忆与短期任务上下文分离，来源/更新时间/适用目标。
 - [ ] E3 子 Agent 与工作流、MCP、Skills，继承目标和授权边界。
 - [ ] E4 旧数据导入设计与迁移验证（连接、聊天、附件、记忆）。
@@ -176,15 +271,11 @@ Rust 重构交接、已完成工作与运行方式见 [WORK_HANDOFF_2026-10-14.m
 
 ## 当前进度与下一项
 
-A0–A6、B1–B5、C1–C6/C4R 当前文字阶段和 D1–D5 已完成本地联验。桌面已有明确启用的 SSH 工具轮次：固定 task/connection/terminal 目标，可信用户逐条审批或短期精确任务命令授权，工具结果及完整输出回查；普通文字仍不派发工具，断线后可讨论历史证据。
+A/B/C 当前文字阶段、D1–D5 和 E1 基础附件已完成本地产品接入与定向联验。本轮基于 Rust main/c14ea5b、客户端 test-rust-ui/61600b7，schema 17 新增附件快照和事件关联，无独立后端部署或监听端口；改动未提交、未推送、未打包。
 
-2026-10-15 核对 Rust main/abfa685、客户端 test-rust-ui/9585898；D5 开始前两仓库均干净。本次前后端 D5 未提交、未推送、未打包；schema 13 只新增幂等 agent_tool_turns 标记表，无新依赖、服务端口或独立后端部署。已有安装包不代表当前功能。
+E1 已接通系统文件选择、图片规范化、PDF 文字/UTF-8 文本提取、归属与预算、模型原生媒体格式、历史/整理和只读预览；专项 11/11、前端 69/69、原生审批/附件/SSH 链路单项及相关兼容套件通过。具体分轮命令、曾失败的旧夹具及修正、严格 Clippy 的原有排序警告豁免，见本文最上方 E1 记录，不将这些结果冒充全项目/真实服务验收。
 
-最终工具集成 18/18（D4 12 + D5 6）、native IPC 24/24、前端定向 54/54、Rust lib 25/25 和自动整理 25/25 通过。聊天 17 项先通过，响应上限单项因负载意外超时后单独复测通过；上下文 18 项先通过，schema 断言修正后恢复单项通过；模型/Responses 两项迁移验证通过。各轮测试有重复，不加总成新的单次全量通过数。Rust 全目标严格 Clippy、TypeScript、Vite 资源构建及修改文件格式/diff 检查通过；桌面原有 lint 的限制和豁免检查见 D5 收尾记录。
-
-现有左侧历史/SSH、中央 Agent、右侧终端和统一主导航布局保留。普通会话不继承当前终端；启用服务器工具时明确绑定，切换页签不改变在途任务目标。前端按持久 requestId 恢复工具证据与中断状态，unknown 不重试。
-
-下一项 **E1：聊天附件/媒体转换、能力/预算和归属校验**。Responses 工具协议、本地 shell、多 Agent/MCP/Skills 未开放。明暗主题、窄窗口、实际 WebView 与真实模型/用户远端仍待 E6，不能把回环协议和组件测试描述为实际 GUI 验收通过。当前不打包。
+下一项 **E2：长期记忆与短期任务上下文分离，来源、更新时间与适用目标**。Responses 工具协议、本地命令工具、多 Agent/MCP/Skills 仍未开放；扫描 PDF/OCR/Office、剪贴板图片和拖入上传也未接通。明暗主题、窄窗口、实际 WebView、真实模型和用户远端仍待 E6。当前不打包。
 
 ## 验证与完成记录
 
@@ -791,12 +882,12 @@ D4 完成的是原生宿主执行/上下文链路，不是桌面已开放服务�
 - 本轮未提交、未推送、未打包。下一项 E1；D5 的本地产品链路完成不代表附件、Responses 工具、本地 shell 或高级 Agent 已开放。
 
 
-### D5 试用反馈修复：批准后立即 unknown（2026-10-15，验证中）
+### D5 试用反馈修复：批准后立即 unknown（2026-10-15，本地定向验证完成）
 
 - 用户截图反馈：点击允许后立即失败，未显示工具输出。仅以只读方式核对本机相关执行回执和输出长度，没有读取凭据、连接或重跑用户服务器命令。
 - 已定位并复现：`src/terminal/agent_exec.rs` 将 SSH 的 WindowAdjusted / XonXoff 正常控制帧落入未知错误分支，提早关闭独立 exec，后续 stdout/stderr 和退出码未读到。`tests/support/mod.rs` 在 __exec_chunked__ 响应前发送真实 XON/XOFF 控制帧；新增 `tests/agent_ssh_tools.rs::informational_ssh_flow_control_before_exec_reply_keeps_result_and_terminal_alive` 在修复前约 0.1 秒稳定失败为 OutcomeUnknown。
 - [x] 修复代码：接收循环容忍窗口调整与流控，继续读取输出和真实 ExitStatus；未放宽审批、目标核对、超时、缺少退出码或断线仍 unknown 的规则。
-- [ ] 验证：提取同一生产接收循环用于 WindowAdjusted 前/中/后及非零退出码测试；本地 SSH / D4-D5 工具与 native IPC 审批回归正在运行。
+- [x] 验证结果补记：该次修复源码的 `cargo test --offline --lib --test agent_ssh_tools --test agent_tool_session -- --test-threads=1` 通过（27 + 9 + 18 项）；桌面 `backend_ipc::tests::d5_native_channel_waits_for_human_approval_executes_bound_ssh_and_restores_outputs` 单项通过。WindowAdjusted 前/中/后、非零退出码、缺少退出码、真实 SSH XON/XOFF、审批后输出/历史均有覆盖。Rust 全目标严格 Clippy、修改文件 rustfmt/diff 检查、前端审批组件 6 项及 TypeScript 检查通过。这是此前运行的收尾结果，不是本次拉取后对新版本的重新回归。
 - 前端审批卡片补充「输出显示在对话中」；右侧 PTY 不回显独立 exec 是现有设计，不能用它推断执行成功。保留原有 D5 改动和用户自行生成的 icon.icns 变更；不提交、不打包。
 
 ### D5 UI 优化：命令审批与执行输出（2026-10-15）

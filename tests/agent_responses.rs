@@ -703,6 +703,24 @@ async fn new_user_message_during_remote_compaction_invalidates_commit_without_ov
 async fn endpoint_model_protocol_and_key_changes_never_reuse_an_opaque_window() {
     for change in 0..4 {
         let f = Fixture::new().await;
+        if change == 3 {
+            let models = ModelRepository::new(f.store.clone());
+            let mut profile = models.get("model", "default").unwrap();
+            profile.config.require_api_key = true;
+            models
+                .save(
+                    "model",
+                    "default",
+                    profile.revision,
+                    ModelConfigUpdate {
+                        config: profile.config,
+                        api_key: KeyChange::Set {
+                            value: SecretKey::new("unit-only-original-key").unwrap(),
+                        },
+                    },
+                )
+                .unwrap();
+        }
         f.seed().await;
         f.lower(8192);
         f.chat(f.request("compact")).await.unwrap();
@@ -958,7 +976,7 @@ fn schema_7_reopen_preserves_existing_raw_history_and_adds_only_native_window_ta
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |r| r.get::<_, u64>(0))
             .unwrap(),
-        16
+        17
     );
     assert_eq!(
         db.query_row("SELECT COUNT(*) FROM agent_responses_outputs", [], |r| r

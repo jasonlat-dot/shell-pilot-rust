@@ -1,6 +1,5 @@
 //! Stateless Responses text transport and complete provider-owned compaction windows.
 use super::{stream::Sse, transport::network, *};
-use crate::agent::budget::estimate_text;
 use reqwest::header;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -12,7 +11,7 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-pub(crate) const MAX_WINDOW_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_WINDOW_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Binding {
     provider: ProviderKind,
@@ -132,6 +131,12 @@ fn validate_items(items: &[Value], compact: bool) -> Result<()> {
                 for part in content {
                     match part["type"].as_str() {
                         Some("input_text" | "output_text") if part["text"].is_string() => {}
+                        Some("input_image")
+                            if item["role"] == "user"
+                                && part["image_url"].as_str().is_some_and(|s| {
+                                    s.starts_with("data:image/jpeg;base64,")
+                                        && s.len() < 1100 * 1024
+                                }) => {}
                         Some("refusal") => return Err(ModelError::Incomplete),
                         _ => return Err(ModelError::ToolProtocol),
                     }
@@ -161,6 +166,20 @@ pub(crate) fn body(config: &ModelConfig, request: &ChatRequest) -> Result<Value>
                 instructions.push(content.clone())
             }
             ChatMessage::User { content } => input.push(json!({"role":"user","content":content})),
+            ChatMessage::UserMedia { content } => {
+                let mut parts = vec![];
+                for part in content {
+                    match part {
+                        crate::agent::attachments::Part::Text { text } => {
+                            parts.push(json!({"type":"input_text","text":text}))
+                        }
+                        crate::agent::attachments::Part::ImageUrl { image_url } => {
+                            parts.push(json!({"type":"input_image","image_url":image_url.url,"detail":"high"}));
+                        }
+                    }
+                }
+                input.push(json!({"role":"user","content":parts}));
+            }
             ChatMessage::Assistant {
                 content: Some(content),
                 tool_calls,
@@ -196,7 +215,8 @@ pub(crate) fn body(config: &ModelConfig, request: &ChatRequest) -> Result<Value>
 }
 pub(crate) fn measure(config: &ModelConfig, request: &ChatRequest) -> Result<PreparedRequest> {
     let body = serde_json::to_string(&body(config, request)?).map_err(|_| ModelError::Response)?;
-    let cost = estimate_text(&body).saturating_add(request.messages.len() as u64 * 12);
+    let cost = super::protocol::media_adjusted_cost(&body)?
+        .saturating_add(request.messages.len() as u64 * 12);
     let available = config
         .budget()
         .available_input()

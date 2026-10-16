@@ -72,7 +72,13 @@ impl Controller {
         let mut source = protocol::body(&context.runtime.config, &initial)?;
         let inputs = source["input"].as_array_mut().ok_or(Error::Storage)?;
         let latest = inputs.pop().ok_or(Error::Storage)?;
-        if latest["role"] != "user" || latest["content"] != request.message {
+        if latest
+            != protocol::body(&context.runtime.config, &pinned)?["input"]
+                .as_array()
+                .and_then(|v| v.last())
+                .cloned()
+                .ok_or(Error::Storage)?
+        {
             return Err(Error::Storage);
         }
         if inputs.is_empty() {
@@ -151,9 +157,8 @@ impl Controller {
         next.messages.push(ChatMessage::Responses {
             window: window.clone(),
         });
-        next.messages.push(ChatMessage::User {
-            content: request.message.clone(),
-        });
+        next.messages
+            .push(reinjected.messages.last().cloned().ok_or(Error::Storage)?);
         let operation = model.prepare_responses(&next, &cancel.local);
         let result = tokio::select! {biased;
             _=cancel.caller.cancelled()=>return Err(ModelError::Cancelled.into()),

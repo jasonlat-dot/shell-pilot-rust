@@ -48,7 +48,7 @@ fn inspect(config: &ModelConfig, request: &ChatRequest) -> Result<BoundaryCheck>
             .map_err(|_| Error::CompactionLimit)?,
         should_compact: measured.should_compact
             || request.messages.len() > 256
-            || measured.body.len() > 2 * 1024 * 1024,
+            || measured.body.len() > provider::request_byte_limit(request),
     })
 }
 pub(crate) struct Prepared {
@@ -58,6 +58,7 @@ pub(crate) struct Prepared {
     pub responses: Option<provider::responses::PreparedResponses>,
 }
 struct Context {
+    store: Arc<Store>,
     snapshot: Snapshot,
     checkpoint: Option<Checkpoint>,
     events: Vec<Event>,
@@ -526,9 +527,8 @@ fn load(
     })?;
     let runtime = match frozen {
         Some(runtime) => runtime,
-        None => {
-            provider::ModelRepository::new(store).runtime(&request.agent_id, &request.user_id)?
-        }
+        None => provider::ModelRepository::new(store.clone())
+            .runtime(&request.agent_id, &request.user_id)?,
     };
     let windows = crate::agent::responses_store::load(
         &repo,
@@ -545,6 +545,7 @@ fn load(
         return Err(Error::ContextChanged);
     }
     Ok(Context {
+        store,
         snapshot,
         checkpoint,
         events,
@@ -593,9 +594,15 @@ fn project(
             continue;
         }
         match &event.payload {
-            Payload::UserMessage { text } => pending.push(ChatMessage::User {
-                content: text.clone(),
-            }),
+            Payload::UserMessage { text } => {
+                pending.push(crate::agent::attachments::event_message(
+                    &context.store,
+                    &request.session_id,
+                    &request.user_id,
+                    event.id,
+                    text,
+                )?)
+            }
             Payload::AssistantMessage { text } => {
                 messages.append(&mut pending);
                 if let Some(window) = context.windows.1.get(&event.id) {
@@ -626,9 +633,13 @@ fn project(
     // rejected, but the unanswered correction must still reach the next model request.
     // Failed/cancelled turn inputs were excluded above; only real pending user events remain.
     messages.append(&mut pending);
-    messages.push(ChatMessage::User {
-        content: request.message.clone(),
-    });
+    messages.push(crate::agent::attachments::message(
+        &context.store,
+        &request.session_id,
+        &request.user_id,
+        &request.message,
+        &request.attachments,
+    )?);
     Ok(ChatRequest {
         messages,
         tools: vec![],

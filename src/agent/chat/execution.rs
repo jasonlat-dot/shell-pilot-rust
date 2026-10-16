@@ -474,7 +474,20 @@ impl Manager {
         {
             return Err(Error::ToolsUnsupported);
         }
-        ToolSession::preflight(&snapshot, executor.binding(), &request.message, &runtime)
+        tokio::select! {biased; _=cancel.cancelled()=>return Err(ModelError::Cancelled.into()), _=token.cancelled()=>return Err(ModelError::Cancelled.into()), result=self.prepare_attachments(&request,&token)=>result?};
+        let media = super::super::attachments::message(
+            &self.store,
+            &request.session_id,
+            &request.user_id,
+            &request.message,
+            &request.attachments,
+        )?;
+        let prompt = if request.message.trim().is_empty() {
+            "请分析所附文件。"
+        } else {
+            &request.message
+        };
+        ToolSession::preflight(&snapshot, executor.binding(), prompt, &runtime, media)
             .map_err(tool_error)?;
         if token.is_cancelled() || cancel.is_cancelled() {
             return Err(ModelError::Cancelled.into());
@@ -498,12 +511,18 @@ impl Manager {
         running.observation = Some(observation.clone());
         let (reporter, mut updates) = Reporter::channel(observation.clone());
         let (tx, mut events) = tokio::sync::mpsc::channel(64);
-        let partial=running.partial.clone();
-        let session = ToolSession::new(executor).managed(request.clone(), owner.clone(), tx, reporter,partial.clone());
+        let partial = running.partial.clone();
+        let session = ToolSession::new(executor).managed(
+            request.clone(),
+            owner.clone(),
+            tx,
+            reporter,
+            partial.clone(),
+        );
         // Model deltas and tool events share the same ordered Channel.
         let operation = session.run(
             &request.request_id,
-            &request.message,
+            prompt,
             tool_loop::Limits {
                 tool_timeout: std::time::Duration::from_secs(300),
                 ..Default::default()
@@ -541,7 +560,7 @@ impl Manager {
             .as_ref()
             .ok()
             .and_then(|r| r.content.clone().or_else(|| r.refusal.clone()))
-            .unwrap_or_else(||partial.lock().map(|text|text.clone()).unwrap_or_default());
+            .unwrap_or_else(|| partial.lock().map(|text| text.clone()).unwrap_or_default());
         let state = if token.is_cancelled() || cancel.is_cancelled() {
             TurnState::Cancelled
         } else if result.is_ok() {

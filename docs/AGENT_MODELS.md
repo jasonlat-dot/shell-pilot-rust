@@ -2,7 +2,7 @@
 
 本阶段完成模型配置、安全保存 API Key、请求预算与 OpenAI 兼容 Chat Completions 协议适配。它是桌面应用内部的 Rust 库，不启动后端监听端口。这里的 API 地址是模型服务地址。
 
-B4 已接通前端“设置 → 模型设置”和基础文本 AI 面板，使用本适配器的加密配置；使用说明见 [模型设置教程](../../ai-ssh-terminal-client/docs/agent-model-settings.md)。B2 基础文本 IPC/Channel 见 [AGENT_CHAT.md](AGENT_CHAT.md)，B3 持久轮次与恢复见 [AGENT_TURNS.md](AGENT_TURNS.md)。C2 已在文字请求前接入普通模型自动整理，C3 已补 Responses 与明确启用的远端整理；工具执行与聊天附件仍未开放。
+B4 已接通前端“设置 → 模型设置”和基础文本 AI 面板，使用本适配器的加密配置；使用说明见 [模型设置教程](../../ai-ssh-terminal-client/docs/agent-model-settings.md)。B2 基础文本 IPC/Channel 见 [AGENT_CHAT.md](AGENT_CHAT.md)，B3 持久轮次与恢复见 [AGENT_TURNS.md](AGENT_TURNS.md)。C2 已在文字请求前接入普通模型自动整理，C3 已补 Responses 与明确启用的远端整理；D5 已接通 SSH 工具；E1 附件输入的当前实现与边界见 AGENT_CHAT.md。
 
 C5 已在 AI 面板展示最近输入占用、估算/供应商计数来源和真实整理状态；状态读取不解密模型凭据、不调用供应商。计数与当前容量快照分开，详见 AGENT_CHAT.md 与客户端模型设置教程。
 
@@ -45,7 +45,7 @@ C5 已在 AI 面板展示最近输入占用、估算/供应商计数来源和真
       "developerRole": false,
       "temperature": true,
       "reasoningEffort": false,
-      "vision": false
+      "vision": true
     },
     "temperature": null,
     "reasoningEffort": null,
@@ -66,7 +66,7 @@ C5 已在 AI 面板展示最近输入占用、估算/供应商计数来源和真
 | `outputReserve`、`safetyReserve` | 输出与安全预留；输出必须大于 0，两者之和必须小于窗口。 |
 | `compactPercent` | 可用输入预算的整理触发比例，1–99；默认 75。C2 据此触发摘要，提交前须降至其 80% 的较低水位（默认 60%）。前端高级参数可编辑。 |
 | `outputTokenParameter` | `maxCompletionTokens` 发 `max_completion_tokens`；兼容供应商需要旧字段时用 `maxTokens`，一次只发送一种字段；Responses 固定使用 max_output_tokens。 |
-| `capabilities` | 函数工具默认启用，读取/保存旧配置时将 toolCalls 归一为 true，前台不再提供开关；实际工具协议仍仅支持 Chat Completions。其他字段声明 developer 角色、temperature、reasoning 参数等支持情况，不代表已通过真实服务探测；vision 标记留给 E1。 |
+| `capabilities` | 函数工具默认启用，读取/保存旧配置时将 toolCalls 归一为 true，前台不再提供开关；实际工具协议仍仅支持 Chat Completions。其他字段声明 developer 角色、temperature、reasoning 参数等支持情况，不代表已通过真实服务探测；vision 与工具一样默认 true，读取/保存旧配置时将关闭值归一为 true，前台不再提供开关；支持 PNG/JPG/WEBP 图片输入，PDF 仍仅提取文字。 |
 | `temperature` | `null` 表示不发送；设置时必须支持该参数，值在 0–2 之间。 |
 | `reasoningEffort` | `null` 表示不发送；可配置 `none/minimal/low/medium/high/xhigh`，需要能力开关。具体模型接受哪些值需按供应商文档选择。 |
 | `timeoutSeconds` | 整次请求总时限，包含发请求和读取响应，1–600 秒；连接时限最多 30 秒。 |
@@ -120,7 +120,7 @@ Windows 本轮结果：模型测试 18 项 + 原 Agent 内核 40 项，共 58/58
 
 将 provider 设为 openAiResponses，相对接口路径通常为 responses。普通创建使用该路径，输入计数和整理使用其下的 input_tokens 与 compact，保留同一基础地址/代理前缀。供应商必须实现 Responses 语义 SSE 与输入计数；只有支持 compact 时才设置 remoteCompaction=true。能力依据配置和实际协议检查，不从模型名称推断。
 
-普通请求设置 store=false、truncation=disabled，使用 max_output_tokens；推理参数使用 reasoning.effort。不使用 previous_response_id，不开启隐式服务端 context_management。模型输出仅接受文字/原生 reasoning 项，不开放工具或附件。通过 response.completed、输出项 ID/index、递增 sequence_number、完整 output_item.done 和已交付文字一致性确认成功；EOF、缺项、拒绝、工具、incomplete/failed、错序及不一致均保留部分证据并失败。
+普通请求设置 store=false、truncation=disabled，使用 max_output_tokens；推理参数使用 reasoning.effort。不使用 previous_response_id，不开启隐式服务端 context_management。模型输出仅接受文字/原生 reasoning 项，Responses 工具仍未开放；E1 输入允许经宿主准备的图片和文档文字。通过 response.completed、输出项 ID/index、递增 sequence_number、完整 output_item.done 和已交付文字一致性确认成功；EOF、缺项、拒绝、工具、incomplete/failed、错序及不一致均保留部分证据并失败。
 
 输入计数使用供应商 responses/input_tokens 的完整 input + instructions，扣除本地配置的输出/安全预留后检查硬容量。远端不透明对象的字节长度不能当作已渲染 token 数，compact usage 也不当作下次请求预算。开启整理时仍使用 compactPercent 与其 80% 的较低水位；当前请求必需内容先检查，历史来源必须仍可进入模型窗口。一次触发最多一个 compact 请求，不自动重试；返回不足以降水位时不提交，不裁掉返回项。
 

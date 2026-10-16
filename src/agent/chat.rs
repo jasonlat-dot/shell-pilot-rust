@@ -37,6 +37,8 @@ pub enum Error {
     TargetMismatch,
     #[error("当前 SSH 连接不可用；仍可讨论已有记录，新建服务器任务或实时操作需先连接")]
     TargetUnavailable,
+    #[error("{0}")]
+    Attachment(String),
     #[error("附件和工具对话尚未接入")]
     Unsupported,
     #[error("历史过长或已有检查点，需要后续压缩/恢复支持")]
@@ -101,6 +103,7 @@ impl Error {
             Self::Invalid => "AGENT_INVALID_REQUEST",
             Self::TargetMismatch => "AGENT_TARGET_MISMATCH",
             Self::TargetUnavailable => "AGENT_TARGET_UNAVAILABLE",
+            Self::Attachment(_) => "AGENT_ATTACHMENT_INVALID",
             Self::Unsupported => "FEATURE_NOT_MIGRATED",
             Self::HistoryLimit => "AGENT_HISTORY_LIMIT",
             Self::CompactionFailed => "AGENT_COMPACTION_FAILED",
@@ -118,7 +121,7 @@ impl Error {
             Self::ToolsUnsupported => 400,
             Self::NotFound => 404,
             Self::Busy | Self::TargetMismatch | Self::TargetUnavailable => 409,
-            Self::Invalid => 400,
+            Self::Invalid | Self::Attachment(_) => 400,
             Self::Unsupported => 501,
             Self::Stopped => 503,
             Self::Model(ModelError::Cancelled) => 409,
@@ -151,7 +154,7 @@ pub struct AgentConfig {
     pub agent_desc: String,
     pub tools_available: bool,
 }
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Attachment {
     pub file_id: String,
@@ -214,8 +217,9 @@ struct Active {
     started: Arc<std::sync::atomic::AtomicBool>,
 }
 pub struct Manager {
-    store: Arc<Store>,
-    stop: CancellationToken,
+    pub(super) store: Arc<Store>,
+    pub(super) stop: CancellationToken,
+    pub(super) files: Option<Arc<crate::files::Manager>>,
     active: Arc<Mutex<HashMap<ActiveKey, Active>>>,
     live: super::live::Source,
     terminals: Option<Arc<crate::terminal::TerminalManager>>,
@@ -306,12 +310,22 @@ fn validate(request: &Request) -> Result<()> {
         return Err(Error::Invalid);
     }
     Payload::UserMessage {
-        text: request.message.clone(),
+        text: if request.message.trim().is_empty() && !request.attachments.is_empty() {
+            "请分析所附文件。".into()
+        } else {
+            request.message.clone()
+        },
     }
     .validate()
     .map_err(|_| Error::Invalid)?;
-    if !request.attachments.is_empty() {
-        return Err(Error::Unsupported);
+    if request.attachments.len() > 4 {
+        return Err(Error::Attachment("每条消息最多附加 4 个文件".into()));
+    }
+    let mut ids = std::collections::HashSet::new();
+    for file in &request.attachments {
+        if uuid::Uuid::parse_str(&file.file_id).is_err() || !ids.insert(&file.file_id) {
+            return Err(Error::Attachment("附件引用无效或重复".into()));
+        }
     }
     Ok(())
 }
@@ -328,6 +342,7 @@ fn recorded(turn: &Turn) -> Error {
 impl Manager {
     pub fn new(store: Arc<Store>, stop: CancellationToken) -> Self {
         Self {
+            files: None,
             live: super::live::Source::new(store.clone(), None),
             terminals: None,
             approvals: super::approvals::Approvals::new(store.clone()),
@@ -803,6 +818,7 @@ impl Manager {
             finished: true,
             observation: None,
         };
+        tokio::select! {biased; _=cancel.cancelled()=>return Err(ModelError::Cancelled.into()), _=token.cancelled()=>return Err(ModelError::Cancelled.into()), result=self.prepare_attachments(&request,&token)=>result?};
         use super::context_status::{Observation, Reporter, Source, Update};
         let store = self.store.clone();
         let r = request.clone();

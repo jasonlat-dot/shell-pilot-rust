@@ -27,20 +27,21 @@ pub enum ReasoningEffort {
     Xhigh,
 }
 
-fn enabled_tool_calls() -> bool {
+fn enabled_by_default() -> bool {
     true
 }
 
-/// Endpoint/model capabilities. Function calling is always enabled by product
-/// policy; vision is metadata for E1 and this adapter only accepts text today.
+/// Endpoint/model capabilities. Function calling and prepared image input are
+/// always enabled by product policy; stored opt-out values are normalized.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelCapabilities {
-    #[serde(default = "enabled_tool_calls")]
+    #[serde(default = "enabled_by_default")]
     pub tool_calls: bool,
     pub developer_role: bool,
     pub temperature: bool,
     pub reasoning_effort: bool,
+    #[serde(default = "enabled_by_default")]
     pub vision: bool,
 }
 impl Default for ModelCapabilities {
@@ -50,7 +51,7 @@ impl Default for ModelCapabilities {
             developer_role: false,
             temperature: true,
             reasoning_effort: false,
-            vision: false,
+            vision: true,
         }
     }
 }
@@ -87,9 +88,10 @@ impl ModelConfig {
         }
     }
     pub fn normalized(mut self) -> Result<Self> {
-        // Function calling is a product default, including profiles saved before
-        // the opt-in setting was removed. Protocol support is checked separately.
+        // Product defaults also apply to profiles saved before the opt-in
+        // settings were removed. Protocol support is checked separately.
         self.capabilities.tool_calls = true;
+        self.capabilities.vision = true;
         if self.model.trim().is_empty()
             || self.model.len() > 256
             || self.model.chars().any(char::is_control)

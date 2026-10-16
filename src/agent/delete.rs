@@ -37,6 +37,8 @@ fn delete_chat_data(db: &Connection, user: &str, id: &str) -> Result<()> {
         "DELETE FROM agent_checkpoints WHERE session_id=?1",
         "DELETE FROM agent_output_chunks WHERE output_id IN (SELECT id FROM agent_outputs WHERE session_id=?1)",
         "DELETE FROM agent_outputs WHERE session_id=?1",
+        "DELETE FROM agent_event_attachments WHERE session_id=?1",
+        "DELETE FROM agent_attachments WHERE session_id=?1",
         "DELETE FROM agent_events WHERE session_id=?1",
         "DELETE FROM agent_project_chats WHERE session_id=?1",
         "DELETE FROM agent_session_scopes WHERE session_id=?1",

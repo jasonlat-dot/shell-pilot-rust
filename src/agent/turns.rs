@@ -26,6 +26,8 @@ struct Input {
     message: String,
     terminal_session_id: String,
     target: Option<Target>,
+    #[serde(default)]
+    attachments: Vec<super::chat::Attachment>,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,6 +45,7 @@ pub struct Turn {
     pub updated_at: i64,
     pub tool_events: Vec<super::Event>,
     pub inputs: Vec<super::steering::Input>,
+    pub attachments: Vec<super::attachments::Reference>,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -103,6 +106,7 @@ fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
             updated_at: r.get("updated_at")?,
             tool_events: vec![],
             inputs: vec![],
+            attachments: vec![],
         },
         input,
         owner: r.get("owner")?,
@@ -113,14 +117,23 @@ fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
     })
 }
 fn row(db: &Connection, session: &str, request: &str) -> Result<Option<Row>> {
-    storage(
+    let mut result = storage(
         db.query_row(
             "SELECT * FROM agent_chat_turns WHERE session_id=?1 AND request_id=?2",
             params![session, request],
             read_row,
         )
         .optional(),
-    )
+    )?;
+    if let Some(row) = &mut result {
+        let user: String = storage(db.query_row(
+            "SELECT user_id FROM agent_sessions WHERE id=?1",
+            [session],
+            |r| r.get(0),
+        ))?;
+        row.turn.attachments = super::attachments::references(db, session, &user, row.turn.cursor)?;
+    }
+    Ok(result)
 }
 fn verify(s: &Session, agent: &str) -> Result<()> {
     if s.agent_id != agent {
@@ -134,6 +147,7 @@ fn input(request: &Request, target: Option<Target>) -> Input {
         message: request.message.clone(),
         terminal_session_id: request.terminal_session_id.clone(),
         target,
+        attachments: request.attachments.clone(),
     }
 }
 struct Finalization<'a> {
@@ -381,14 +395,15 @@ impl Turns {
             if storage(tx.query_row("SELECT EXISTS(SELECT 1 FROM agent_chat_turns WHERE session_id=?1 AND state='running')",[&s.id],|r|r.get::<_,bool>(0)))? {return Err(Error::Busy);}
             if s.task.as_ref().is_some_and(|t|t.target!=target) {return Err(Error::TargetMismatch);}
             if s.task.as_ref().is_none_or(|t|t.status!=TaskStatus::Active) {
-                let task=Task {id:uuid::Uuid::new_v4().to_string(),goal:request.message.clone(),
+                let task=Task {id:uuid::Uuid::new_v4().to_string(),goal:if request.message.trim().is_empty(){"分析所附文件".into()}else{request.message.clone()},
                     constraints:s.task.as_ref().map(|t|t.constraints.clone()).unwrap_or_default(),target:target.clone(),status:TaskStatus::Active};
                 let payload=Payload::TaskStarted{task:task.clone()};
                 if serde_json::to_vec(&payload).map_err(|_|Error::Storage)?.len()>65536 {return Err(Error::Invalid);}
                 insert_event(&tx,&s.id,Some(&task.id),&format!("{}:task",request.request_id),&payload)?;
                 s.task=Some(task);s.revision=next_revision(s.revision)?;
             }
-            let event=insert_event(&tx,&s.id,s.task.as_ref().map(|t|t.id.as_str()),&format!("{}:user",request.request_id),&Payload::UserMessage{text:request.message.clone()})?;
+            let event=insert_event(&tx,&s.id,s.task.as_ref().map(|t|t.id.as_str()),&format!("{}:user",request.request_id),&Payload::UserMessage{text:if request.message.trim().is_empty(){"请分析所附文件。".into()}else{request.message.clone()}})?;
+            super::attachments::link(&tx,request,event.id)?;
             s.revision=next_revision(s.revision)?;
             let task_json=s.task.as_ref().map(serde_json::to_string).transpose().map_err(|_|Error::Storage)?;
             storage(tx.execute("UPDATE agent_sessions SET revision=?1,task_json=?2 WHERE id=?3",params![s.revision,task_json,s.id]))?;
@@ -502,6 +517,7 @@ impl Turns {
             let has_more=turns.len()>limit;turns.truncate(limit);
             let next_after=turns.last().map(|t|t.cursor).unwrap_or(after);drop(stmt);
             for turn in &mut turns {
+                turn.attachments=super::attachments::references(&tx,&session.id,user,turn.cursor)?;
                 turn.inputs=super::steering::list(&tx,&session.id,&turn.request_id)?;
                 let end:Option<u64>=storage(tx.query_row("SELECT MIN(user_event_id) FROM agent_chat_turns WHERE session_id=?1 AND user_event_id>?2",params![session.id,turn.cursor],|r|r.get(0)))?;
                 let mut q=storage(tx.prepare("SELECT id,session_id,task_id,request_id,payload,created_at FROM agent_events WHERE session_id=?1 AND id>?2 AND (?3 IS NULL OR id<?3) ORDER BY id LIMIT 600"))?;
