@@ -1,5 +1,18 @@
 # Rust SSH Agent 实施清单与续接入口
 
+### 文档预览阅读布局调整（2026-10-16）
+
+- [x] 只读核对本机 Codex 桌面端 `26.1007.2314.0` 的 `app.asar`，定位 `webview/assets/text-document-preview-174237b8d637.js` 与 `file-preview-1f88dac8f350.js`：标题/操作与独立滚动正文分离，使用大预览区域和阅读留白；本次参考桌面端静态资源，未复制其实现代码。证据与适用范围记录于客户端 `docs/chat-attachments.md`。
+- [x] 客户端 `src/components/ChatAttachments.tsx` / .css：PDF/文本预览改为最大 1040px 的阅读弹窗，使用 Portal 避免聊天区域限制，文件名和工具栏固定、正文独立滚动，显示类型/大小/行数。文本默认保留原始长行并允许横向滚动，PDF 提取文本默认换行；支持自动换行切换、复制原始全文、键盘滚动及读取失败后重新加载。普通文本移除不相关的图片/PDF 说明，PDF 仅在底部保留提取范围提示。图片放大保留原实现；会话隔离、纯文本安全渲染及 Modal 原有关闭/焦点恢复继续沿用。
+- 验证：既有附件/输入队列回归 **22/22**，附件用例同步覆盖原文复制、换行切换和失败重试，TypeScript、Vite 资源构建及差异检查通过。实际 WebView 视觉尚未验收，未记作通过；未提交、推送或打包。
+
+
+### 文件卡片直接点击查看（2026-10-16）
+
+- [x] 客户端 `src/components/ChatAttachments.tsx` / .css：移除已发送 PDF/文本文件卡片中单独的“查看发送内容”文字，将图标、文件名及大小区域整体作为预览按钮，支持鼠标点击与键盘 Enter/空格；下载入口独立保留，避免与预览嵌套或误触。沿用原会话范围校验、过期响应隔离及读取失败提示。同步 docs/chat-attachments.md 和已有附件预览测试定位。
+- 验证：`node --import tsx --test tests/agent-attachment-ui.test.mjs tests/agent-composer-queue.test.mjs` **22/22**，TypeScript、Vite 资源构建及差异检查通过。实际 WebView 视觉尚未验收；未打包或提交。
+
+
 ### 深色提示统一增加悬停延迟（2026-10-16）
 
 - [x] 客户端 `src/components/AgentPanel.tsx`：添加附件、编辑/恢复、用户/回复复制及完整时间的共用深色提示均在鼠标持续悬停 400 ms 后显示。鼠标提前移开、操作激活、Esc、滚动/调整窗口/失焦、禁用状态或草稿范围切换时取消等待；即使浮层尚未显示也响应取消，卸载清理计时器，触发时复核节点仍连接且未禁用。键盘 focus 保留立即提示，原样式/文案/日期格式不变。同步 docs/chat-attachments.md。
