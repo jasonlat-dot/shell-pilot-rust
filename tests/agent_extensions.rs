@@ -46,6 +46,7 @@ struct Wire {
     mcp_release: Arc<Mutex<Option<CancellationToken>>>,
     legacy: Arc<Mutex<HashMap<String, tokio::sync::mpsc::Sender<Bytes>>>>,
     bearer_headers: Arc<Mutex<Vec<Option<String>>>>,
+    custom_headers: Arc<Mutex<Vec<Option<String>>>>,
 }
 async fn model(State(w): State<Wire>, Json(body): Json<Value>) -> Json<Value> {
     let child = body["messages"].as_array().is_some_and(|m| {
@@ -72,13 +73,22 @@ async fn model(State(w): State<Wire>, Json(body): Json<Value>) -> Json<Value> {
     }
     Json(response)
 }
-async fn mcp(State(w): State<Wire>, headers: HeaderMap, Json(body): Json<Value>) -> Json<Value> {
+fn record_mcp_headers(w: &Wire, headers: &HeaderMap) {
+    w.custom_headers.lock().unwrap().push(
+        headers
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned),
+    );
     w.bearer_headers.lock().unwrap().push(
         headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned),
     );
+}
+async fn mcp(State(w): State<Wire>, headers: HeaderMap, Json(body): Json<Value>) -> Json<Value> {
+    record_mcp_headers(&w, &headers);
     if body["method"] == "tools/call" && body["params"]["arguments"]["query"] == "malformed" {
         w.executed.fetch_add(1, Ordering::SeqCst);
         return Json(json!({"jsonrpc":"2.0","id":body["id"],"result":{"isError":"false"}}));
@@ -108,7 +118,8 @@ async fn mcp(State(w): State<Wire>, headers: HeaderMap, Json(body): Json<Value>)
     };
     Json(json!({"jsonrpc":"2.0","id":body["id"],"result":result}))
 }
-async fn legacy_get(State(w): State<Wire>) -> Response {
+async fn legacy_get(State(w): State<Wire>, headers: HeaderMap) -> Response {
+    record_mcp_headers(&w, &headers);
     let id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     tx.send(Bytes::from(format!(
@@ -130,6 +141,7 @@ async fn legacy_get(State(w): State<Wire>) -> Response {
 async fn legacy_post(
     State(w): State<Wire>,
     Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
     assert_eq!(query["api_key"], "fixture");
@@ -141,7 +153,7 @@ async fn legacy_post(
         .unwrap()
         .clone();
     if body.get("id").is_some() {
-        let response = mcp(State(w), HeaderMap::new(), Json(body)).await.0;
+        let response = mcp(State(w), headers, Json(body)).await.0;
         let _ = tx
             .send(Bytes::from(format!("event: message\ndata: {response}\n\n")))
             .await;
@@ -173,6 +185,7 @@ impl Fixture {
             mcp_release: Arc::new(Mutex::new(None)),
             legacy: Arc::new(Mutex::new(HashMap::new())),
             bearer_headers: Arc::default(),
+            custom_headers: Arc::default(),
         };
         let router = Router::new()
             .route("/v1/chat/completions", post(model))
@@ -221,6 +234,10 @@ impl Fixture {
                 config: Config {
                     servers: vec![Server {
                         name: "mock".into(),
+                        description: String::new(),
+                        connection_values: None,
+                        saved_headers: vec![],
+                        saved_env: vec![],
                         bearer_token: Default::default(),
                         bearer_token_configured: false,
                         enabled: true,
@@ -451,6 +468,10 @@ fn settings_compare_and_swap_and_roundtrip_preserve_transports() {
         config: Config {
             servers: vec![Server {
                 name: "local".into(),
+                description: String::new(),
+                connection_values: None,
+                saved_headers: vec![],
+                saved_env: vec![],
                 bearer_token: Default::default(),
                 bearer_token_configured: false,
                 enabled: false,
@@ -509,6 +530,63 @@ async fn mcp_client_token_flows_from_encrypted_storage_to_http_headers_without_e
     assert!(!serde_json::to_string(&*f.wire.bodies.lock().unwrap())
         .unwrap()
         .contains("fixture-client-token"));
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn json_mcp_headers_use_saved_values_for_http_and_sse_without_leaking_into_model_messages() {
+    for legacy in [false, true] {
+        let f = Fixture::new(vec![
+            calls("json-header", "call_mcp_tool", lookup("hello")),
+            final_reply("done"),
+        ])
+        .await;
+        if legacy {
+            f.use_legacy_sse();
+        }
+        let mut settings =
+            serde_json::to_value(extensions::settings(&f.store, "default").unwrap()).unwrap();
+        settings["config"]["servers"][0]["description"] = json!("实时搜索");
+        settings["config"]["servers"][0]["connectionValues"] = json!({"headers":{"Authorization":"Bearer fixture-json-token","X-API-Key":"fixture-custom-key"},"env":{}});
+        let saved = extensions::save(
+            &f.store,
+            "default",
+            serde_json::from_value(settings).unwrap(),
+        )
+        .unwrap();
+        let rendered = serde_json::to_string(&saved).unwrap();
+        assert!(!rendered.contains("fixture-json-token"));
+        assert!(!rendered.contains("fixture-custom-key"));
+        assert_eq!(
+            saved.config.servers[0].saved_headers,
+            vec!["authorization", "x-api-key"]
+        );
+        let request = f.request(Policy::FullAccess).await;
+        f.manager
+            .chat_desktop(request, None, true, &CancellationToken::new(), |_| async {
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(f
+            .wire
+            .bearer_headers
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|v| v.as_deref() == Some("Bearer fixture-json-token")));
+        assert!(f
+            .wire
+            .custom_headers
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|v| v.as_deref() == Some("fixture-custom-key")));
+        let bodies = serde_json::to_string(&*f.wire.bodies.lock().unwrap()).unwrap();
+        assert!(!bodies.contains("fixture-json-token"));
+        assert!(!bodies.contains("fixture-custom-key"));
+        assert_eq!(f.wire.executed.load(Ordering::SeqCst), 1);
+    }
 }
 
 #[test]

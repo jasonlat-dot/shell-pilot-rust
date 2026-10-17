@@ -1046,7 +1046,7 @@ mod tests {
                 .db(|db| Ok(db.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))?))
                 .await
                 .unwrap(),
-            20
+            21
         );
     }
 }

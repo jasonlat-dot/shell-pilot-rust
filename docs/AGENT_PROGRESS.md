@@ -1,5 +1,40 @@
 # Rust SSH Agent 实施清单与续接入口
 
+### E3 补充：MCP 编辑器鼠标定位（2026-10-17）
+
+- [x] 修复弹窗全局输入字体覆盖透明 textarea，导致输入命中位置与高亮文字不一致。编辑器统一输入层、高亮层和行号的字体、字重、字号、行高及字符间距；根据输入层实际 clientWidth/clientHeight 对齐高亮层和行号，编辑、滚动及 ResizeObserver 尺寸变化时同步，排除横纵滚动条占位差异。
+- 仅修改客户端编辑器 TSX / CSS 和说明文档；遵循用户要求，未运行测试、类型检查或构建。未提交、推送或打包。
+
+### E3 补充：enabled 回显与分区保存（2026-10-17）
+
+- [x] MCP JSON 回显始终保留 enabled 的 true / false，修复启用时字段被格式化逻辑省略的问题。
+- [x] 客户端三个入口显式传递 execution / mcp / skills 保存范围。原生 IPC 与 Rust 配置事务只合并对应分区，其余字段取数据库当前值，继续保留 revision 校验；外部保存只更新执行额度与子任务开关，非 MCP 保存不重写 MCP 凭据。弹窗保存保留页面未提交的额度和子任务草稿，取消丢弃弹窗草稿。
+- 按用户要求仅改代码，未运行测试、类型检查或构建；包含原生修改，需重新编译客户端加载。未提交、推送或打包。
+
+### E3 补充：Skills 目录配置弹窗（2026-10-17）
+
+- [x] 客户端 Skills 主页面只保留目录数量和“配置 Skills”入口；弹窗中每个目录一行，行号/文件夹图标、交替淡色背景、聚焦高亮及错误行标记区分。支持新增、移除和粘贴多行，最多 16 个；校验 Windows 盘符 / UNC 绝对路径和 UTF-8 字节上限。
+- [x] 独立保存目录，保留尚未保存的额度和子任务开关，MCP 后续保存沿用最新目录及 CAS revision。取消还原，失败保留草稿，生成中禁用，保存中不关闭；复用 Modal 焦点和 Esc 行为，支持 Ctrl+Enter 保存。
+- 验证：前端配置/目录/高亮编辑器/执行/历史/IPC **87 项**、TypeScript、Vite 构建通过。日志 `.codex-tmp/e3-skills-dialog-*.txt`。仅前端改动，未重跑 Rust 或 MCP 传输套件，实际浏览器视觉未验收。未提交、推送或打包。
+
+### E3 补充：MCP 配置弹窗与 JSON 高亮（2026-10-17）
+
+- [x] 客户端设置页只保留 MCP 服务摘要和“配置 MCP”入口，JSON 移至现有 Modal 弹窗。新增 JSON 高亮编辑器，区分键/字符串/数字/字面量，提供行号和滚动同步，兼容中文输入、明暗主题及高对比模式；复用原格式化、示例及校验逻辑，移除原页面编辑框的闲置样式。
+- [x] 弹窗独立保存 MCP，保留页面其他额度、Skills、子任务草稿；取消还原 JSON，失败在弹窗保留内容，保存中阻止关闭，生成中禁用编辑。支持 Ctrl+Enter 保存与 Ctrl+Shift+F 格式化；复用 Modal 焦点约束、Esc 和关闭后焦点恢复。
+- 验证：前端配置/编辑器/执行/历史/IPC **81 项**、TypeScript、Vite 构建通过。本次未修改 Rust 逻辑，不重跑传输测试。Tabbit 诊断在沙箱内外均无输出退出，未做实际浏览器视觉验收。日志 `.codex-tmp/e3-mcp-dialog-*.txt`；未提交、推送或打包。
+
+### E3 补充：HTTP / SSE 联合回归（2026-10-17）
+
+- [x] 按用户后续要求恢复 HTTP / SSE 测试。新增 Streamable HTTP 的 JSON / 碎片多行 SSE 回包、鉴权和会话头、401 / 重定向 / 畸形 JSON / 错误 ID / 断线 / 超时 / 超大响应及派发前后取消验证，确认不自动重放。
+- [x] SSE 验证 JSON 中的 Authorization 与自定义头同时用于 GET 和每次 POST，完整 URL 中查询 Key 及 `+` 保持。既有 BOM / UTF-8 / CRLF / CR / 多行、异源 endpoint 拒绝、连接释放、取消 / 超时 / 断线和不重连测试通过。Agent 集成验证 HTTP、SSE 均从加密配置读取凭据，审批后单次执行，未知结果不重放，模型消息不带 Token。
+- 验证：HTTP/SSE 协议 **10 项通过**（同批另含 stdio **1 项**），扩展集成 **28 项通过**，原生扩展配置 IPC **1 项通过**。日志 `.codex-tmp/e3-http-sse-protocol.txt`、`e3-http-sse-runtime.txt`、`e3-http-sse-native.txt`。使用回环模拟服务和测试凭据；未连接真实百度 MCP，未将真实第三方互操作标为通过。本次只补充测试和文档，未改动生产传输逻辑。
+
+### E3 补充：统一 MCP JSON 配置（2026-10-17）
+
+- [x] 客户端 MCP 表单改为固定高度的单一 JSON 编辑器，支持一个 mcpServers 对象批量管理 Streamable HTTP、旧版 SSE 和 stdio。提供格式化、停用示例、类型推断与错误提示；移除原服务卡片及闲置 CSS。兼容 type / transport、url / baseUrl、headers、description、command / args / env，旧环境变量名称列表仍可读取。
+- [x] schema 21 增加独立加密 headers/env 表，值通过 Windows DPAPI 绑定用户、服务和连接目标，读取仅返回键名。__SHELLPILOT_SAVED__ 保留原值，修改替换、删除清理；目标更改须重新填写。旧 Bearer Token 可迁移，配置版本 CAS 和审批失效语义保持。stdio 实际传入 env 值，HTTP 使用自定义头；不把凭据放入模型上下文。
+- 验证：按用户要求跳过 SSE 测试（名称过滤 sse），Rust **371 通过、1 既有忽略**，前端配置/执行/历史/IPC **75 通过**，原生 JSON 配置 IPC **1 通过**，TypeScript、Vite 构建和生产库严格 Clippy 通过。使用临时库与回环服务，未连接真实百度 MCP。日志 `.codex-tmp/e3-mcp-json-*.txt`；未完成实际 WebView 视觉验收。未提交、推送或打包。
+
 ### E3 补充：旧版 SSE MCP（2026-10-17）
 
 - [x] MCP 配置新增 `sse` 传输。前端选择“旧版 SSE”，直接填写含 Key 的完整 `sse-endpoint`；不增加独立 Key 输入或变量替换。服务名支持连字符，界面请求超时默认 300 秒、可设 1–300 秒。完整 URL 在用户本地保存，通过原生 IPC 往返保持查询参数及 `+`。

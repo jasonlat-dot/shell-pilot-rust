@@ -2,7 +2,7 @@ use super::*;
 use axum::{
     body::{Body, Bytes},
     extract::{OriginalUri, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -35,6 +35,7 @@ fn decoder_handles_fragmented_utf8_bom_crlf_cr_and_multiline_data_without_replay
 #[derive(Clone, Copy)]
 enum Mode {
     Normal,
+    Headers,
     Foreign,
     Redirect,
     Slow,
@@ -57,8 +58,16 @@ impl Drop for Active {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
-async fn connect(State(f): State<Fixture>, OriginalUri(uri): OriginalUri) -> Response {
+async fn connect(
+    State(f): State<Fixture>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Response {
     f.gets.fetch_add(1, Ordering::SeqCst);
+    if matches!(f.mode, Mode::Headers) {
+        assert_eq!(headers["authorization"], "Bearer fixture-json-token");
+        assert_eq!(headers["x-api-key"], "fixture-custom-key");
+    }
     if matches!(f.mode, Mode::Redirect) {
         return (StatusCode::FOUND, [("location", "/sse")]).into_response();
     }
@@ -87,8 +96,13 @@ async fn message(
     State(f): State<Fixture>,
     OriginalUri(uri): OriginalUri,
     Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> StatusCode {
+    if matches!(f.mode, Mode::Headers) {
+        assert_eq!(headers["authorization"], "Bearer fixture-json-token");
+        assert_eq!(headers["x-api-key"], "fixture-custom-key");
+    }
     f.requests
         .lock()
         .unwrap()
@@ -182,6 +196,10 @@ impl Server {
         Client::connect(
             &config::Server {
                 name: "legacy-search".into(),
+                description: String::new(),
+                connection_values: None,
+                saved_headers: vec![],
+                saved_env: vec![],
                 bearer_token: Default::default(),
                 bearer_token_configured: false,
                 enabled: true,
@@ -193,6 +211,17 @@ impl Server {
             },
             &CancellationToken::new(),
             None,
+            if matches!(self.state.mode, Mode::Headers) {
+                super::super::super::connection_values::Values {
+                    headers: BTreeMap::from([
+                        ("authorization".into(), "Bearer fixture-json-token".into()),
+                        ("x-api-key".into(), "fixture-custom-key".into()),
+                    ]),
+                    env: Default::default(),
+                }
+            } else {
+                Default::default()
+            },
         )
         .await
     }
@@ -254,6 +283,29 @@ async fn foreign_endpoint_and_redirect_are_rejected_before_any_post() {
         assert!(server.state.requests.lock().unwrap().is_empty());
         server.closed().await;
     }
+}
+
+#[tokio::test]
+async fn legacy_sse_json_headers_reach_both_get_and_every_post_with_query_key_preserved() {
+    let server = Server::start(Mode::Headers).await;
+    let mut client = server.client(3).await.unwrap();
+    let token = CancellationToken::new();
+    assert!(client.rpc("tools/list", json!({}), &token).await.unwrap()["tools"].is_array());
+    assert_eq!(
+        client
+            .rpc(
+                "tools/call",
+                json!({"name":"lookup","arguments":{}}),
+                &token
+            )
+            .await
+            .unwrap()["content"][0]["text"],
+        "汉🙂result"
+    );
+    assert_eq!(server.calls(), 1);
+    assert_eq!(server.state.gets.load(Ordering::SeqCst), 1);
+    drop(client);
+    server.closed().await;
 }
 #[tokio::test]
 async fn cancelling_a_dispatched_call_closes_the_reader_and_never_posts_the_call_again() {

@@ -6,8 +6,8 @@
 
 客户端设置 → **工具与 Skills**：
 
-- MCP 支持 stdio 程序、Streamable HTTP 及旧版 HTTP+SSE。每个服务有独立启用开关；最多 8 个。服务名称为 1–24 个字母、数字、下划线或连字符。
-- stdio 使用程序和参数数组启动，隐藏 Windows 控制台；继承基础系统环境及用户显式列出的环境变量。Streamable HTTP 的可选 Bearer 凭据从指定环境变量读取；远端地址要求 HTTPS，回环测试服务允许 HTTP。
+- MCP 支持 stdio 程序、Streamable HTTP 及旧版 HTTP+SSE。通过一个 mcpServers JSON 编辑器管理，enabled / disabled 控制启停；最多 8 个。服务名称为 1–24 个字母、数字、下划线或连字符。
+- stdio 使用程序和参数数组启动，隐藏 Windows 控制台；继承基础系统环境及用户显式列出的环境变量，支持 env 对象直接传值。HTTP 支持 headers 对象直接配置 Authorization 或其他自定义请求头，旧 bearerEnv 兼容；远端 Streamable HTTP 要求 HTTPS，回环测试服务允许 HTTP。headers/env 的值用 Windows DPAPI 加密保存并绑定用户、服务名及连接目标，IPC 只返回键名，JSON 编辑器用 __SHELLPILOT_SAVED__ 标记保留，删除键即清除。schema 21 新增独立凭据表，保留 schema 20 的旧 Token 数据并在 JSON 保存时迁移。
 - 旧版 SSE 直接填写包含 Key 的完整 `sse-endpoint` 地址，例如 `http://appbuilder.baidu.com/v2/ai_search/mcp/sse?api_key=Bearer+实际Key`，不额外配置 Key 或做环境变量替换。URL 原样保存在当前用户的本地配置，不发给主模型。兼容远端 HTTP（明文），支持 1–300 秒请求超时，界面新建默认 300 秒；省略该字段的 JSON 使用 45 秒。
 - SSE 按 2024-11-05 协议保持 GET 事件流，接收 `endpoint` 后向同源 POST 地址发送 JSON-RPC，并从 `message` 事件匹配结果。支持碎片 UTF-8、CRLF/CR/LF、多行 data 及通知；停止、超时或断线关闭连接，不自动重连或重放，不跟随重定向、不向异源 endpoint 发送请求。
 - Skills 指定本机绝对目录。先发现名称/描述，再由模型调用 `read_skill` 读取 SKILL.md 和同技能目录内的参考文件；不自动执行脚本。当前支持常见字符串及折叠描述的 frontmatter，单文件最多 64 KiB，最多 128 个技能，扫描有深度和数量限制。
@@ -16,6 +16,10 @@
 - `update_plan` 保存步骤及状态，最多 12 步，最多一个进行中步骤。计划声明不代表工具已经执行。
 
 配置修改从新轮次加载，修改还会使未消费的 MCP 审批失效。关闭子 Agent 后，既有调用签名仅用于读取历史；宿主拒绝新增委派。
+
+桌面保存按 execution / mcp / skills 分区：外部保存只改执行额度与子任务开关，两个配置弹窗各自保存 MCP 或 Skills。后端在事务内读取当前配置，仅合并指定分区，保留 revision 校验；非 MCP 保存不改写 MCP 凭据。JSON 编辑器重新打开时显式保留每项 enabled 布尔值。本次修复按用户要求未运行测试或构建。
+
+JSON 接受 type / transport、url / baseUrl、description、headers，以及 stdio 的 command / args / env。省略类型时按 command 或 /sse 路径推断。重复键、冲突别名、错误字段或参数类型均拒绝，不静默丢弃。编辑器提供格式化及三种停用示例，失败保留草稿；旧 Token 和配置可自动转换。完整使用示例见客户端 [agent-model-settings.md](../../ai-ssh-terminal-client/docs/agent-model-settings.md#mcp-json-配置)。
 
 ## 执行与审批
 
@@ -58,6 +62,7 @@
 
 ## 本地验证结果
 
+- 2026-10-17 JSON 配置后补测 HTTP/SSE：协议 10 项（同批 stdio 另 1 项）、扩展执行集成 28 项、原生配置 IPC 1 项全部通过。覆盖自定义头在 HTTP 和 SSE GET/POST 的传递、JSON / 碎片多行事件回包、会话头、审批单次执行、401 / 重定向 / 畸形回包 / 错误 ID / 大响应 / 断线 / 超时 / 取消、不自动重放及凭据不进入模型消息。日志 `.codex-tmp/e3-http-sse-*.txt`；使用回环模拟服务，未连接真实百度 MCP。以下为此前各阶段记录。
 - Rust 全量 381 项通过，1 项既有 POSIX 环境专用测试忽略。
 - E3 扩展集成 26 项覆盖原有授权/取消/并行/历史行为、额度配置及旧配置兼容，新增 SSE URL/超时校验、精确审批后单次执行、未知结果不重放。
 - 工具循环集成 11 项含最大并发数、串行屏障、协议顺序及未知结果停止排队；工具会话集成 24 项含子任务继承父服务器、双子任务 SSH 审批互斥及分页回查。主任务只有一次工具额度时，可执行一条命令及多次回查；子任务配置两次额度执行两条命令及六次回查后仍可报告。模型轮数仍独立生效。

@@ -57,6 +57,7 @@ impl Store {
         database.execute_batch(include_str!("../migrations/018_agent_memories.sql"))?;
         database.execute_batch(include_str!("../migrations/019_agent_chat_titles.sql"))?;
         database.execute_batch(include_str!("../migrations/020_agent_extensions.sql"))?;
+        database.execute_batch(include_str!("../migrations/021_mcp_connection_values.sql"))?;
         Ok(Self {
             database: Mutex::new(database),
             data_directory: None,

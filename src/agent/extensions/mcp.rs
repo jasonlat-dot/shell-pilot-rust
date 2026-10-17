@@ -1,4 +1,6 @@
 //! Per-turn MCP connections. No redirects, automatic replay, sampling or server-initiated tools.
+#[cfg(test)]
+mod http_tests;
 mod sse;
 use super::*;
 use config::{Server, Transport};
@@ -82,6 +84,10 @@ mod tests {
         let mut client = Client::connect(
             &Server {
                 name: "fixture".into(),
+                description: String::new(),
+                connection_values: None,
+                saved_headers: vec![],
+                saved_env: vec![],
                 bearer_token: Default::default(),
                 bearer_token_configured: false,
                 enabled: true,
@@ -92,6 +98,7 @@ mod tests {
             },
             &token,
             None,
+            Default::default(),
         )
         .await
         .unwrap();
@@ -112,12 +119,17 @@ mod tests {
             if ($r.method -eq 'notifications/initialized') { continue }
             $result = @{ tools = @() }
             if ($r.method -eq 'initialize') { $result = @{ protocolVersion = '2025-03-26'; capabilities = @{}; serverInfo = @{ name = 'fixture'; version = '1' } } }
+            if ($r.method -eq 'fixture/environment') { $result = @{ value = $env:SHELLPILOT_FIXTURE_MCP_ENV } }
             [Console]::WriteLine((@{ jsonrpc = '2.0'; id = $r.id; result = $result } | ConvertTo-Json -Depth 10 -Compress))
         }"#;
         let token = CancellationToken::new();
         let mut client = Client::connect(
             &Server {
                 name: "fixture".into(),
+                description: String::new(),
+                connection_values: None,
+                saved_headers: vec![],
+                saved_env: vec![],
                 bearer_token: Default::default(),
                 bearer_token_configured: false,
                 enabled: true,
@@ -135,6 +147,13 @@ mod tests {
             },
             &token,
             None,
+            super::super::connection_values::Values {
+                headers: Default::default(),
+                env: BTreeMap::from([(
+                    "SHELLPILOT_FIXTURE_MCP_ENV".into(),
+                    "fixture-env-value".into(),
+                )]),
+            },
         )
         .await
         .unwrap();
@@ -143,6 +162,13 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .is_empty()
+        );
+        assert_eq!(
+            client
+                .rpc("fixture/environment", json!({}), &token)
+                .await
+                .unwrap()["value"],
+            "fixture-env-value"
         );
         token.cancel();
         assert!(matches!(
@@ -176,9 +202,17 @@ impl Client {
         server: &Server,
         cancel: &CancellationToken,
         bearer: Option<String>,
+        values: super::connection_values::Values,
     ) -> Result<Self> {
         let transport = match &server.transport {
             Transport::Stdio { command, args, env } => {
+                // Node's Windows installation supplies these launchers as .cmd files.
+                #[cfg(windows)]
+                let command = match command.to_ascii_lowercase().as_str() {
+                    "npx" => "npx.cmd",
+                    "npm" => "npm.cmd",
+                    _ => command.as_str(),
+                };
                 let mut command = tokio::process::Command::new(command);
                 command
                     .args(args)
@@ -205,6 +239,7 @@ impl Client {
                         command.env(key, value);
                     }
                 }
+                command.envs(&values.env);
                 #[cfg(windows)]
                 command.creation_flags(0x08000000);
                 let mut child = command.spawn().map_err(|_| Error::Unavailable)?;
@@ -223,22 +258,30 @@ impl Client {
             } => {
                 let timeout = Duration::from_secs(*timeout_seconds);
                 let open = sse::Connection::open(
-                    http_client(url)?,
+                    http_client(url, &values)?,
                     url.clone(),
-                    bearer_value(bearer_env)?,
+                    if values.headers.contains_key("authorization") {
+                        None
+                    } else {
+                        bearer_value(bearer_env)?
+                    },
                 );
                 Wire::Sse(
                     tokio::select! {biased;_=cancel.cancelled()=>return Err(Error::Cancelled), result=tokio::time::timeout(timeout,open)=>result.map_err(|_|Error::Unavailable)??},
                 )
             }
             Transport::StreamableHttp { url, bearer_env } => {
-                let client = http_client(url)?;
+                let client = http_client(url, &values)?;
                 Wire::Http {
                     client,
                     url: url.clone(),
-                    bearer: match bearer {
-                        Some(token) => Some(token),
-                        None => bearer_value(bearer_env)?,
+                    bearer: if values.headers.contains_key("authorization") {
+                        None
+                    } else {
+                        match bearer {
+                            Some(token) => Some(token),
+                            None => bearer_value(bearer_env)?,
+                        }
                     },
                     session: None,
                     version: "2025-03-26".into(),
@@ -433,8 +476,18 @@ fn bearer_value(name: &str) -> Result<Option<String>> {
             .map_err(|_| Error::Unavailable)
     }
 }
-fn http_client(raw: &str) -> Result<reqwest::Client> {
+fn http_client(raw: &str, values: &super::connection_values::Values) -> Result<reqwest::Client> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    for (key, value) in &values.headers {
+        let name =
+            reqwest::header::HeaderName::from_bytes(key.as_bytes()).map_err(|_| Error::Invalid)?;
+        let mut value =
+            reqwest::header::HeaderValue::from_str(value).map_err(|_| Error::Invalid)?;
+        value.set_sensitive(true);
+        headers.insert(name, value);
+    }
     let mut builder = reqwest::Client::builder()
+        .default_headers(headers)
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
         .connect_timeout(Duration::from_secs(10));

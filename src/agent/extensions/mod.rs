@@ -1,6 +1,7 @@
 //! E3 extension runtime. Host-owned catalogs, progressive Skills, bounded child workflows.
 mod approval;
 pub mod config;
+mod connection_values;
 mod credentials;
 mod mcp;
 pub mod skills;
@@ -208,7 +209,9 @@ impl Runtime {
         if remote.client.is_none() {
             let bearer =
                 credentials::resolve(&self.store, &self.user, spec, self.settings.revision)?;
-            remote.client = Some(mcp::Client::connect(spec, cancel, bearer).await?);
+            let values =
+                connection_values::resolve(&self.store, &self.user, spec, self.settings.revision)?;
+            remote.client = Some(mcp::Client::connect(spec, cancel, bearer, values).await?);
         }
         if remote.tools.is_none() {
             let mut tools = vec![];
@@ -281,7 +284,9 @@ impl Runtime {
             "list_mcp_tools" => {
                 let server = a["server"].as_str().unwrap_or("");
                 if server.is_empty() {
-                    Ok(json!({"servers":self.remotes.keys().collect::<Vec<_>>()}))
+                    Ok(
+                        json!({"servers":self.remotes.keys().collect::<Vec<_>>(),"descriptions":self.settings.config.servers.iter().filter(|s|s.enabled&&!s.description.is_empty()).map(|s|(s.name.clone(),s.description.clone())).collect::<BTreeMap<_,_>>()}),
+                    )
                 } else {
                     self.catalog(server,cancel).await.map(|r|json!({"server":server,"tools":r.tools.as_ref().unwrap().iter().map(|t|json!({"name":t["name"],"description":t["description"],"inputSchema":t["inputSchema"],"callable":tool_loop::external_schema_supported(&t["inputSchema"])})).collect::<Vec<_>>()}))
                 }
@@ -408,6 +413,14 @@ impl super::chat::Manager {
             Some(v) => save(&self.store, user, v),
             None => settings(&self.store, user),
         }
+    }
+    pub fn save_extension_section(
+        &self,
+        user: &str,
+        value: Settings,
+        scope: config::SaveScope,
+    ) -> Result<Settings> {
+        config::save_scoped(&self.store, user, value, scope)
     }
     pub async fn extension_requests(
         &self,

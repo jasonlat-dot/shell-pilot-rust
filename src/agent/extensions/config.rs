@@ -69,6 +69,18 @@ impl ExecutionLimits {
 pub struct Server {
     pub name: String,
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, rename = "connectionValues", skip_serializing)]
+    pub connection_values: Option<super::connection_values::Values>,
+    #[serde(
+        default,
+        rename = "savedHeaders",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub saved_headers: Vec<String>,
+    #[serde(default, rename = "savedEnv", skip_serializing_if = "Vec::is_empty")]
+    pub saved_env: Vec<String>,
     #[serde(default, rename = "bearerToken", skip_serializing)]
     pub bearer_token: crate::agent::provider::KeyChange,
     #[serde(
@@ -130,6 +142,13 @@ pub struct Settings {
     pub revision: u64,
     pub config: Config,
 }
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SaveScope {
+    Execution,
+    Mcp,
+    Skills,
+}
 pub(super) fn settings_revision(db: &rusqlite::Connection, user: &str) -> Result<u64> {
     Ok(db
         .query_row(
@@ -151,6 +170,12 @@ impl Config {
         }
         let mut names = std::collections::HashSet::new();
         for s in &self.servers {
+            if s.description.len() > 8192 || s.description.chars().count() > 2048 {
+                return Err(Error::Invalid);
+            }
+            if let Some(values) = &s.connection_values {
+                values.validate(&s.transport)?;
+            }
             if let crate::agent::provider::KeyChange::Set { value } = &s.bearer_token {
                 if !matches!(s.transport, Transport::StreamableHttp { .. }) {
                     return Err(Error::Invalid);
@@ -219,6 +244,7 @@ pub fn settings(store: &Store, user: &str) -> Result<Settings> {
         Some((revision, raw)) => {
             let mut config = serde_json::from_str(&raw).map_err(|_| Error::Storage)?;
             super::credentials::decorate(&db, user, &mut config)?;
+            super::connection_values::decorate(&db, user, &mut config)?;
             Ok(Settings { revision, config })
         }
         None => Ok(Settings {
@@ -227,24 +253,62 @@ pub fn settings(store: &Store, user: &str) -> Result<Settings> {
         }),
     }
 }
-pub fn save(store: &Store, user: &str, mut value: Settings) -> Result<Settings> {
-    value.config.validate()?;
+pub fn save(store: &Store, user: &str, value: Settings) -> Result<Settings> {
+    save_inner(store, user, value, None)
+}
+pub fn save_scoped(
+    store: &Store,
+    user: &str,
+    value: Settings,
+    scope: SaveScope,
+) -> Result<Settings> {
+    save_inner(store, user, value, Some(scope))
+}
+fn save_inner(
+    store: &Store,
+    user: &str,
+    mut value: Settings,
+    scope: Option<SaveScope>,
+) -> Result<Settings> {
     super::super::model::identifier(user).map_err(|_| Error::Invalid)?;
     let mut db = store.database.lock().map_err(|_| Error::Storage)?;
     let tx = db.transaction()?;
-    let old: u64 = tx
+    let row: Option<(u64, String)> = tx
         .query_row(
-            "SELECT revision FROM agent_extension_settings WHERE user_id=?1",
+            "SELECT revision,config_json FROM agent_extension_settings WHERE user_id=?1",
             [user],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .optional()?
-        .unwrap_or(0);
+        .optional()?;
+    let old = row.as_ref().map_or(0, |(revision, _)| *revision);
     if value.revision != old {
         return Err(Error::Changed);
     }
+    if let Some(scope) = scope {
+        // Only the selected section may change; preserve the other sections from storage.
+        let mut current: Config = match row {
+            Some((_, raw)) => serde_json::from_str(&raw).map_err(|_| Error::Storage)?,
+            None => Config::default(),
+        };
+        match scope {
+            SaveScope::Execution => {
+                current.execution_limits = value.config.execution_limits;
+                current.sub_agents = value.config.sub_agents;
+            }
+            SaveScope::Mcp => current.servers = value.config.servers,
+            SaveScope::Skills => current.skill_roots = value.config.skill_roots,
+        }
+        value.config = current;
+    }
+    value.config.validate()?;
     let next = old.checked_add(1).ok_or(Error::Storage)?;
-    super::credentials::update(&tx, user, &mut value.config)?;
+    if matches!(scope, None | Some(SaveScope::Mcp)) {
+        super::connection_values::update(&tx, user, &mut value.config)?;
+        super::credentials::update(&tx, user, &mut value.config)?;
+    } else {
+        super::credentials::decorate(&tx, user, &mut value.config)?;
+        super::connection_values::decorate(&tx, user, &mut value.config)?;
+    }
     tx.execute("INSERT INTO agent_extension_settings(user_id,revision,config_json) VALUES(?1,?2,?3) ON CONFLICT(user_id) DO UPDATE SET revision=excluded.revision,config_json=excluded.config_json",rusqlite::params![user,next,serde_json::to_string(&value.config).map_err(|_|Error::Invalid)?])?;
     // Editing/removing an MCP server invalidates every unconsumed exact-call approval.
     tx.execute("UPDATE agent_extension_approvals SET state='cancelled' WHERE user_id=?1 AND state IN ('pending','approved')",[user])?;
