@@ -5,3 +5,4 @@
 *.sqlite3-wal
 /.idea/
 __pycache__/
+/evals/e6/

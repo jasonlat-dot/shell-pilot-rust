@@ -3,6 +3,8 @@ mod approval;
 pub mod config;
 mod connection_values;
 mod credentials;
+#[cfg(test)]
+mod live_tests;
 mod mcp;
 pub mod skills;
 use super::{

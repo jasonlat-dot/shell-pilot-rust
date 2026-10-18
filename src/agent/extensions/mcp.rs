@@ -29,155 +29,6 @@ enum Wire {
     },
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::{
-        body::{Body, Bytes},
-        http::{HeaderMap, StatusCode},
-        response::{IntoResponse, Response},
-        routing::post,
-        Json, Router,
-    };
-    async fn http(headers: HeaderMap, Json(request): Json<Value>) -> Response {
-        if request["method"] != "initialize" {
-            assert_eq!(headers["mcp-session-id"], "fixture-session");
-            assert_eq!(headers["mcp-protocol-version"], "2025-03-26");
-        }
-        match request["method"].as_str().unwrap() {
-            "initialize" => {
-                let mut response=Json(json!({"jsonrpc":"2.0","id":request["id"],"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"test","version":"1"}}})).into_response();
-                response
-                    .headers_mut()
-                    .insert("mcp-session-id", "fixture-session".parse().unwrap());
-                response
-            }
-            "notifications/initialized" => StatusCode::ACCEPTED.into_response(),
-            "tools/list" => {
-                let raw = format!(
-                    "data: {}\r\n\r\ndata: {}\r\n\r\n",
-                    json!({"jsonrpc":"2.0","method":"notifications/message","params":{"data":"汉🙂"}}),
-                    json!({"jsonrpc":"2.0","id":request["id"],"result":{"tools":[]}})
-                );
-                Response::builder()
-                    .header("content-type", "text/event-stream")
-                    .body(Body::from_stream(futures_util::stream::iter(
-                        raw.into_bytes()
-                            .into_iter()
-                            .map(|b| Ok::<_, std::io::Error>(Bytes::from(vec![b]))),
-                    )))
-                    .unwrap()
-            }
-            _ => StatusCode::BAD_REQUEST.into_response(),
-        }
-    }
-    #[tokio::test]
-    async fn streamable_http_keeps_session_headers_and_accepts_fragmented_sse_notifications() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move {
-            axum::serve(listener, Router::new().route("/mcp", post(http)))
-                .await
-                .unwrap();
-        });
-        let token = CancellationToken::new();
-        let mut client = Client::connect(
-            &Server {
-                name: "fixture".into(),
-                description: String::new(),
-                connection_values: None,
-                saved_headers: vec![],
-                saved_env: vec![],
-                bearer_token: Default::default(),
-                bearer_token_configured: false,
-                enabled: true,
-                transport: Transport::StreamableHttp {
-                    url,
-                    bearer_env: String::new(),
-                },
-            },
-            &token,
-            None,
-            Default::default(),
-        )
-        .await
-        .unwrap();
-        let result = client.rpc("tools/list", json!({}), &token).await.unwrap();
-        assert!(result["tools"].as_array().unwrap().is_empty());
-        token.cancel();
-        assert!(matches!(
-            client.rpc("tools/list", json!({}), &token).await,
-            Err(Error::Cancelled)
-        ));
-        server.abort();
-    }
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn stdio_initialization_notifications_and_rpc_use_a_hidden_scoped_process() {
-        let script = r#"while ($null -ne ($line = [Console]::ReadLine())) {
-            $r = ConvertFrom-Json $line
-            if ($r.method -eq 'notifications/initialized') { continue }
-            $result = @{ tools = @() }
-            if ($r.method -eq 'initialize') { $result = @{ protocolVersion = '2025-03-26'; capabilities = @{}; serverInfo = @{ name = 'fixture'; version = '1' } } }
-            if ($r.method -eq 'fixture/environment') { $result = @{ value = $env:SHELLPILOT_FIXTURE_MCP_ENV } }
-            [Console]::WriteLine((@{ jsonrpc = '2.0'; id = $r.id; result = $result } | ConvertTo-Json -Depth 10 -Compress))
-        }"#;
-        let token = CancellationToken::new();
-        let mut client = Client::connect(
-            &Server {
-                name: "fixture".into(),
-                description: String::new(),
-                connection_values: None,
-                saved_headers: vec![],
-                saved_env: vec![],
-                bearer_token: Default::default(),
-                bearer_token_configured: false,
-                enabled: true,
-                transport: Transport::Stdio {
-                    command: "powershell.exe".into(),
-                    args: vec![
-                        "-NoLogo".into(),
-                        "-NoProfile".into(),
-                        "-NonInteractive".into(),
-                        "-Command".into(),
-                        script.into(),
-                    ],
-                    env: vec![],
-                },
-            },
-            &token,
-            None,
-            super::super::connection_values::Values {
-                headers: Default::default(),
-                env: BTreeMap::from([(
-                    "SHELLPILOT_FIXTURE_MCP_ENV".into(),
-                    "fixture-env-value".into(),
-                )]),
-            },
-        )
-        .await
-        .unwrap();
-        assert!(
-            client.rpc("tools/list", json!({}), &token).await.unwrap()["tools"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            client
-                .rpc("fixture/environment", json!({}), &token)
-                .await
-                .unwrap()["value"],
-            "fixture-env-value"
-        );
-        token.cancel();
-        assert!(matches!(
-            client.rpc("tools/list", json!({}), &token).await,
-            Err(Error::Cancelled)
-        ));
-        drop(client);
-    }
-}
 async fn line(reader: &mut BufReader<tokio::process::ChildStdout>) -> Result<Vec<u8>> {
     let mut line = vec![];
     loop {
@@ -501,4 +352,154 @@ fn http_client(raw: &str, values: &super::connection_values::Values) -> Result<r
         builder = builder.no_proxy();
     }
     builder.build().map_err(|_| Error::Unavailable)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::{Body, Bytes},
+        http::{HeaderMap, StatusCode},
+        response::{IntoResponse, Response},
+        routing::post,
+        Json, Router,
+    };
+    async fn http(headers: HeaderMap, Json(request): Json<Value>) -> Response {
+        if request["method"] != "initialize" {
+            assert_eq!(headers["mcp-session-id"], "fixture-session");
+            assert_eq!(headers["mcp-protocol-version"], "2025-03-26");
+        }
+        match request["method"].as_str().unwrap() {
+            "initialize" => {
+                let mut response=Json(json!({"jsonrpc":"2.0","id":request["id"],"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"test","version":"1"}}})).into_response();
+                response
+                    .headers_mut()
+                    .insert("mcp-session-id", "fixture-session".parse().unwrap());
+                response
+            }
+            "notifications/initialized" => StatusCode::ACCEPTED.into_response(),
+            "tools/list" => {
+                let raw = format!(
+                    "data: {}\r\n\r\ndata: {}\r\n\r\n",
+                    json!({"jsonrpc":"2.0","method":"notifications/message","params":{"data":"汉🙂"}}),
+                    json!({"jsonrpc":"2.0","id":request["id"],"result":{"tools":[]}})
+                );
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(futures_util::stream::iter(
+                        raw.into_bytes()
+                            .into_iter()
+                            .map(|b| Ok::<_, std::io::Error>(Bytes::from(vec![b]))),
+                    )))
+                    .unwrap()
+            }
+            _ => StatusCode::BAD_REQUEST.into_response(),
+        }
+    }
+    #[tokio::test]
+    async fn streamable_http_keeps_session_headers_and_accepts_fragmented_sse_notifications() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/mcp", post(http)))
+                .await
+                .unwrap();
+        });
+        let token = CancellationToken::new();
+        let mut client = Client::connect(
+            &Server {
+                name: "fixture".into(),
+                description: String::new(),
+                connection_values: None,
+                saved_headers: vec![],
+                saved_env: vec![],
+                bearer_token: Default::default(),
+                bearer_token_configured: false,
+                enabled: true,
+                transport: Transport::StreamableHttp {
+                    url,
+                    bearer_env: String::new(),
+                },
+            },
+            &token,
+            None,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let result = client.rpc("tools/list", json!({}), &token).await.unwrap();
+        assert!(result["tools"].as_array().unwrap().is_empty());
+        token.cancel();
+        assert!(matches!(
+            client.rpc("tools/list", json!({}), &token).await,
+            Err(Error::Cancelled)
+        ));
+        server.abort();
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn stdio_initialization_notifications_and_rpc_use_a_hidden_scoped_process() {
+        let script = r#"while ($null -ne ($line = [Console]::ReadLine())) {
+            $r = ConvertFrom-Json $line
+            if ($r.method -eq 'notifications/initialized') { continue }
+            $result = @{ tools = @() }
+            if ($r.method -eq 'initialize') { $result = @{ protocolVersion = '2025-03-26'; capabilities = @{}; serverInfo = @{ name = 'fixture'; version = '1' } } }
+            if ($r.method -eq 'fixture/environment') { $result = @{ value = $env:SHELLPILOT_FIXTURE_MCP_ENV } }
+            [Console]::WriteLine((@{ jsonrpc = '2.0'; id = $r.id; result = $result } | ConvertTo-Json -Depth 10 -Compress))
+        }"#;
+        let token = CancellationToken::new();
+        let mut client = Client::connect(
+            &Server {
+                name: "fixture".into(),
+                description: String::new(),
+                connection_values: None,
+                saved_headers: vec![],
+                saved_env: vec![],
+                bearer_token: Default::default(),
+                bearer_token_configured: false,
+                enabled: true,
+                transport: Transport::Stdio {
+                    command: "powershell.exe".into(),
+                    args: vec![
+                        "-NoLogo".into(),
+                        "-NoProfile".into(),
+                        "-NonInteractive".into(),
+                        "-Command".into(),
+                        script.into(),
+                    ],
+                    env: vec![],
+                },
+            },
+            &token,
+            None,
+            super::super::connection_values::Values {
+                headers: Default::default(),
+                env: BTreeMap::from([(
+                    "SHELLPILOT_FIXTURE_MCP_ENV".into(),
+                    "fixture-env-value".into(),
+                )]),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            client.rpc("tools/list", json!({}), &token).await.unwrap()["tools"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            client
+                .rpc("fixture/environment", json!({}), &token)
+                .await
+                .unwrap()["value"],
+            "fixture-env-value"
+        );
+        token.cancel();
+        assert!(matches!(
+            client.rpc("tools/list", json!({}), &token).await,
+            Err(Error::Cancelled)
+        ));
+        drop(client);
+    }
 }
