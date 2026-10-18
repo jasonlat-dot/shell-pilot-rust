@@ -937,17 +937,16 @@ async fn same_mcp_service_queues_transport_work_without_showing_the_second_call_
     .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(f.wire.executed.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        events
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(
-                |e| matches!(e,StreamEvent::ToolCall{tool_name,..} if tool_name=="call_mcp_tool")
-            )
-            .count(),
-        1
-    );
+    // Independent authorization futures can finish in either order. Assert the
+    // queue contract against the call that actually acquired the service gate.
+    let running_ids: Vec<String> = events.lock().unwrap().iter().filter_map(|event| {
+        match event {
+            StreamEvent::ToolCall { tool_name, tool_call_id, .. } if tool_name == "call_mcp_tool" => Some(tool_call_id.clone()),
+            _ => None,
+        }
+    }).collect();
+    assert_eq!(running_ids.len(), 1);
+    assert!(matches!(running_ids[0].as_str(), "first" | "second"));
     let history = f
         .manager
         .history(
@@ -959,14 +958,9 @@ async fn same_mcp_service_queues_transport_work_without_showing_the_second_call_
         )
         .await
         .unwrap();
-    assert!(history.turns[0]
-        .started_tool_call_ids
-        .iter()
-        .any(|id| id == "first"));
-    assert!(!history.turns[0]
-        .started_tool_call_ids
-        .iter()
-        .any(|id| id == "second"));
+    let started: Vec<_> = history.turns[0].started_tool_call_ids.iter()
+        .filter(|id| matches!(id.as_str(), "first" | "second")).cloned().collect();
+    assert_eq!(started, running_ids, "queued calls must remain absent from durable running state");
     release.cancel();
     tokio::time::timeout(Duration::from_secs(5), run)
         .await

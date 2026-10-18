@@ -30,6 +30,24 @@ pub enum ReasoningEffort {
 fn enabled_by_default() -> bool {
     true
 }
+fn default_context_window() -> u64 {
+    256_000
+}
+fn default_output_reserve() -> u64 {
+    2_048
+}
+fn default_safety_reserve() -> u64 {
+    8_192
+}
+fn default_compact_percent() -> u8 {
+    75
+}
+fn default_timeout_seconds() -> u64 {
+    120
+}
+fn default_max_response_bytes() -> usize {
+    1_048_576
+}
 
 /// Endpoint/model capabilities. Function calling and prepared image input are
 /// always enabled by product policy; stored opt-out values are normalized.
@@ -66,15 +84,21 @@ pub struct ModelConfig {
     /// Relative suffix, e.g. chat/completions. No absolute URL or parent traversal.
     pub completions_path: String,
     pub model: String,
+    #[serde(default = "default_context_window")]
     pub context_window: u64,
+    #[serde(default = "default_output_reserve")]
     pub output_reserve: u64,
+    #[serde(default = "default_safety_reserve")]
     pub safety_reserve: u64,
+    #[serde(default = "default_compact_percent")]
     pub compact_percent: u8,
     pub output_token_parameter: OutputTokenParameter,
     pub capabilities: ModelCapabilities,
     pub temperature: Option<f64>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
+    #[serde(default = "default_max_response_bytes")]
     pub max_response_bytes: usize,
     pub require_api_key: bool,
 }
@@ -230,4 +254,54 @@ pub struct ModelProfile {
     pub config: ModelConfig,
     pub api_key_configured: bool,
     pub ready: bool,
+}
+
+#[cfg(test)]
+mod default_tests {
+    use super::*;
+
+    #[test]
+    fn omitted_limits_use_product_defaults_and_explicit_limits_are_preserved() {
+        let base = serde_json::json!({
+            "provider":"openAiCompatible","baseUrl":"http://127.0.0.1/v1/",
+            "completionsPath":"chat/completions","model":"test",
+            "outputTokenParameter":"maxCompletionTokens",
+            "capabilities":{"toolCalls":true,"developerRole":false,"temperature":false,"reasoningEffort":false,"vision":true},
+            "requireApiKey":false
+        });
+        let defaults: ModelConfig = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(
+            (
+                defaults.context_window,
+                defaults.output_reserve,
+                defaults.safety_reserve
+            ),
+            (256_000, 2_048, 8_192)
+        );
+        assert_eq!(
+            (
+                defaults.compact_percent,
+                defaults.timeout_seconds,
+                defaults.max_response_bytes
+            ),
+            (75, 120, 1_048_576)
+        );
+        assert_eq!(defaults.temperature, None);
+        assert!(defaults.normalized().is_ok());
+        let mut explicit = base;
+        explicit["contextWindow"] = 8192.into();
+        explicit["outputReserve"] = 1024.into();
+        explicit["safetyReserve"] = 512.into();
+        explicit["compactPercent"] = 60.into();
+        let explicit: ModelConfig = serde_json::from_value(explicit).unwrap();
+        assert_eq!(
+            (
+                explicit.context_window,
+                explicit.output_reserve,
+                explicit.safety_reserve,
+                explicit.compact_percent
+            ),
+            (8192, 1024, 512, 60)
+        );
+    }
 }

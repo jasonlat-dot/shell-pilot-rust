@@ -89,6 +89,7 @@ pub struct Controller {
     store: Arc<Store>,
     source: crate::agent::live::Source,
     reporter: Reporter,
+    force: bool,
 }
 impl Controller {
     pub fn new(store: Arc<Store>) -> Self {
@@ -96,6 +97,7 @@ impl Controller {
             source: crate::agent::live::Source::new(store.clone(), None),
             store,
             reporter: Reporter::default(),
+            force: false,
         }
     }
     pub(crate) fn with_source(store: Arc<Store>, source: crate::agent::live::Source) -> Self {
@@ -103,10 +105,15 @@ impl Controller {
             store,
             source,
             reporter: Reporter::default(),
+            force: false,
         }
     }
     pub(crate) fn with_reporter(mut self, reporter: Reporter) -> Self {
         self.reporter = reporter;
+        self
+    }
+    pub(crate) fn force(mut self) -> Self {
+        self.force = true;
         self
     }
     async fn check_live(&self, request: &Request, target: &Option<Target>) -> Result<()> {
@@ -182,6 +189,9 @@ impl Controller {
         let mut context = worker(move || load(store, &r, t, None, source)).await?;
         cancel.check()?;
         if context.runtime.config.provider == provider::ProviderKind::OpenAiResponses {
+            if self.force && !context.runtime.config.remote_compaction {
+                return Err(ModelError::RemoteUnsupported.into());
+            }
             return self
                 .prepare_responses(context, request, target, cancel)
                 .await;
@@ -201,7 +211,7 @@ impl Controller {
             Source::Estimated,
         )?;
         provider::prepare_request(&context.runtime.config, &pinned)?;
-        let force = context.events.len() >= 200;
+        let force = self.force || context.events.len() >= 200;
         if !check.should_compact && !force {
             return Ok(Prepared {
                 runtime: context.runtime,
@@ -656,13 +666,15 @@ fn project(
     // rejected, but the unanswered correction must still reach the next model request.
     // Failed/cancelled turn inputs were excluded above; only real pending user events remain.
     messages.append(&mut pending);
-    messages.push(crate::agent::attachments::message(
-        &context.store,
-        &request.session_id,
-        &request.user_id,
-        &request.message,
-        &request.attachments,
-    )?);
+    if !request.message.is_empty() || !request.attachments.is_empty() {
+        messages.push(crate::agent::attachments::message(
+            &context.store,
+            &request.session_id,
+            &request.user_id,
+            &request.message,
+            &request.attachments,
+        )?);
+    }
     Ok(ChatRequest {
         messages,
         tools: vec![],

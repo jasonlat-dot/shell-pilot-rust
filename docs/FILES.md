@@ -35,7 +35,7 @@ Rust Preview 0.4.0 将附件存储直接嵌入 Tauri 主程序。前端顶部“
 - 附件根目录和读取对象拒绝 junction/reparse/symlink。根目录持有 OS 文件锁，同一数据目录只能有一个附件服务实例；第二实例返回 FILE_STORAGE_BUSY，不能误清理第一实例的上传。
 
 默认附件目录为数据库父目录下 attachments。桌面默认：
-%LOCALAPPDATA%\com.jasonlat.shellpilot.rust-preview\backend-data\attachments。
+%LOCALAPPDATA%\com.jasonlat.shellpilot\backend-data\attachments。
 SQLite schema 版本 2 自动创建 file_assets 表，保留现有连接配置。切换目录不会搬迁数据；备份需同时保留 SQLite 与附件目录。
 
 下载以 application/octet-stream、Content-Disposition: attachment、UTF-8 文件名、nosniff 和 no-store 返回。下载链接是有效期内的持有者凭据，应保持完整且避免分享。该服务仍面向本机单用户，userId 不是身份认证。未集成 MinIO、云对象存储或自动导入 Java 附件。

@@ -66,7 +66,7 @@ npm run tauri dev
 
 Tauri 初始化 `Services::native`，前端通过 invoke/Channel 进入 Tauri Rust 桥，再直接调用本库函数。无需另外启动 Rust 服务；桌面业务不监听本地 HTTP 端口，不提供远程后端配置。
 
-数据目录由桌面设置管理，默认 SQLite 与附件位于 `%LOCALAPPDATA%\com.jasonlat.shellpilot.rust-preview\backend-data`。数据与原 Java 版相互独立，尚无 MySQL 数据导入工具。
+数据目录由桌面设置管理，默认 SQLite 与附件位于 `%LOCALAPPDATA%\com.jasonlat.shellpilot\backend-data`。数据与原 Java 版相互独立，尚无 MySQL 数据导入工具。
 
 ## 历史 HTTP 协议回归参考（非程序启动入口）
 
@@ -120,13 +120,13 @@ SQLite 随程序构建。密码/私钥使用 Windows 用户级 DPAPI 加密为 B
 
 ## 嵌入与打包
 
-本项目只输出 `shellpilot_server` 库。客户端通过 Cargo 路径依赖将它编译进 `shellpilot-rust-preview.exe`，无需 JRE/JAR 或独立后端 exe。
+本项目只输出 `shellpilot_server` 库。客户端通过 Cargo 路径依赖将它编译进 `ShellPilot.exe`，无需 JRE/JAR 或独立后端 exe。
 
 试用版拥有独立应用标识和数据目录，业务、健康检查和附件保存使用 IPC，无本地 HTTP 监听端口。支持本地工作区自动初始化、停止、重新初始化与数据设置。SSH/SFTP 直接连接目标服务器；AI 对话和模型附件处理尚未迁移。
 
 客户端目录中的 `npm run bundle:nsis` 可生成安装包，但修改业务代码后的开发验证只需重新运行 `npm run tauri dev`。
 
-安装说明见兄弟客户端的 docs/RUST_PREVIEW_INSTALL.md，详细迁移清单见 docs/MIGRATION.md。以下旧二进制与 HTTP 验证记录是历史证据，不代表当前源码仍提供独立程序。
+安装说明见兄弟客户端的 docs/INSTALL.md，详细迁移清单见 docs/MIGRATION.md。以下旧二进制与 HTTP 验证记录是历史证据，不代表当前源码仍提供独立程序。
 
 ## 验证范围
 

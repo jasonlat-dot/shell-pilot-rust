@@ -1,5 +1,7 @@
 //! Desktop text and explicitly enabled SSH tool turns share durable lifecycle and cancellation.
 mod execution;
+mod manual_compact;
+pub use manual_compact::CompactionResult;
 pub use super::turns::{History, Turn, TurnState};
 use super::{
     provider::{ModelClient, ModelError, ModelRepository},

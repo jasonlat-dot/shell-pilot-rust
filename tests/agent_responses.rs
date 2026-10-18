@@ -423,6 +423,29 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn manual_remote_compaction_uses_the_existing_window_without_creating_an_answer() {
+    let f = Fixture::new().await;
+    f.seed().await;
+    let before = f.repo.events(&f.session, "default", 0, 200).unwrap();
+    let result = f.manager.compact_context("model".into(), "default".into(), f.session.clone(), &CancellationToken::new()).await.unwrap();
+    assert!(result.compacted);
+    assert!(matches!(result.status.method, Some(context_status::Method::Remote)));
+    assert_eq!(f.calls("compact"), 1);
+    assert_eq!(f.calls("/responses"), 0);
+    assert_eq!(f.repo.events(&f.session, "default", 0, 200).unwrap(), before);
+}
+
+#[tokio::test]
+async fn manual_remote_compaction_requires_explicit_provider_support() {
+    let f = Fixture::new().await;
+    f.seed().await;
+    f.edit(|config| config.remote_compaction = false);
+    let result = f.manager.compact_context("model".into(), "default".into(), f.session.clone(), &CancellationToken::new()).await.unwrap_err();
+    assert!(matches!(result, chat::Error::Model(ModelError::RemoteUnsupported)));
+    assert!(f.mock.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn responses_text_stream_and_complete_keep_raw_provider_output_native_and_replay_it() {
     let f = Fixture::new().await;
     let r = f.request("first");

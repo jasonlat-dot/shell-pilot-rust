@@ -28,7 +28,7 @@ impl Controller {
             .measured(&context.runtime.config, before, Source::ProviderCount)?;
         let trigger = u128::from(before) * 100
             >= u128::from(available) * u128::from(context.runtime.config.compact_percent);
-        let force = context.events.len() >= 200;
+        let force = self.force || context.events.len() >= 200;
         if !context.runtime.config.remote_compaction || (!trigger && !force) {
             model.require_fit(before)?;
             ensure_current(self.store.clone(), context.snapshot.clone()).await?;
@@ -84,15 +84,18 @@ impl Controller {
             .join("\n")
             .into();
         let inputs = source["input"].as_array_mut().ok_or(Error::Storage)?;
-        let latest = inputs.pop().ok_or(Error::Storage)?;
-        if latest
-            != protocol::body(&context.runtime.config, &pinned)?["input"]
-                .as_array()
-                .and_then(|v| v.last())
-                .cloned()
-                .ok_or(Error::Storage)?
-        {
-            return Err(Error::Storage);
+        let has_incoming = !request.message.is_empty() || !request.attachments.is_empty();
+        if has_incoming {
+            let latest = inputs.pop().ok_or(Error::Storage)?;
+            if latest
+                != protocol::body(&context.runtime.config, &pinned)?["input"]
+                    .as_array()
+                    .and_then(|v| v.last())
+                    .cloned()
+                    .ok_or(Error::Storage)?
+            {
+                return Err(Error::Storage);
+            }
         }
         if inputs.is_empty() {
             model.require_fit(before)?;
@@ -170,8 +173,10 @@ impl Controller {
         next.messages.push(ChatMessage::Responses {
             window: window.clone(),
         });
-        next.messages
-            .push(reinjected.messages.last().cloned().ok_or(Error::Storage)?);
+        if has_incoming {
+            next.messages
+                .push(reinjected.messages.last().cloned().ok_or(Error::Storage)?);
+        }
         let operation = model.prepare_responses(&next, &cancel.local);
         let result = tokio::select! {biased;
             _=cancel.caller.cancelled()=>return Err(ModelError::Cancelled.into()),

@@ -317,6 +317,84 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn manual_compaction_below_threshold_commits_without_new_turns_or_answer_requests() {
+    let f = Fixture::new().await;
+    f.seed().await;
+    let events = f.events();
+    let history = f.manager.history("model".into(), "default".into(), f.session.clone(), 0, 20).await.unwrap();
+    let before = serde_json::to_value(history.turns).unwrap();
+    let measured = f.status().await.usage.unwrap();
+    assert!(measured.input_tokens * 100 < measured.available_input_tokens * 75);
+    let result = f.manager.compact_context("model".into(), "default".into(), f.session.clone(), &CancellationToken::new()).await.unwrap();
+    assert!(result.compacted);
+    assert!(matches!(result.status.phase, context_status::Phase::Succeeded));
+    assert!(result.status.checkpoint_id.is_some());
+    assert_eq!(result.status.compaction_count, 1);
+    assert_eq!(f.events(), events);
+    let after = f.manager.history("model".into(), "default".into(), f.session.clone(), 0, 20).await.unwrap();
+    assert_eq!(serde_json::to_value(after.turns).unwrap(), before);
+    assert!(f.summaries() >= 1);
+    assert_eq!(f.streams(), 0);
+    f.chat(f.request("继续解释之前的日志")).await.unwrap();
+    assert_eq!(f.streams(), 1);
+    assert!(f.last_stream().to_string().contains("历史检查点"));
+}
+
+#[tokio::test]
+async fn manual_compaction_empty_history_and_wrong_owner_never_call_the_model() {
+    let f = Fixture::new().await;
+    let result = f.manager.compact_context("model".into(), "default".into(), f.session.clone(), &CancellationToken::new()).await.unwrap();
+    assert!(!result.compacted);
+    assert_eq!(f.summaries(), 0);
+    assert_eq!(f.streams(), 0);
+    assert!(f.manager.compact_context("model".into(), "other-user".into(), f.session.clone(), &CancellationToken::new()).await.is_err());
+    assert!(f.manager.compact_context("other-model".into(), "default".into(), f.session.clone(), &CancellationToken::new()).await.is_err());
+    assert_eq!(f.summaries(), 0);
+    assert!(f.events().is_empty());
+}
+
+#[tokio::test]
+async fn manual_compaction_provider_failure_preserves_history_and_checkpoint() {
+    let f = Fixture::new().await;
+    f.seed().await;
+    let before = f.events();
+    *f.mock.mode.lock().unwrap() = Mode::Http;
+    let result = f.manager.compact_context("model".into(), "default".into(), f.session.clone(), &CancellationToken::new()).await.unwrap();
+    assert!(!result.compacted);
+    assert!(matches!(result.status.phase, context_status::Phase::Failed));
+    assert_eq!(result.status.compaction_count, 0);
+    assert!(f.repo.checkpoint(&f.session, "default").unwrap().is_none());
+    assert_eq!(f.events(), before);
+    assert_eq!(f.streams(), 0);
+}
+
+#[tokio::test]
+async fn manual_compaction_rejects_concurrent_chat_and_duplicate_compaction_and_can_be_cancelled() {
+    let f = Fixture::new().await;
+    f.seed().await;
+    let before = f.events();
+    f.mock.hold.store(true, Ordering::SeqCst);
+    let manager = f.manager.clone();
+    let session = f.session.clone();
+    let cancel = CancellationToken::new();
+    let operation_cancel = cancel.clone();
+    let operation = tokio::spawn(async move {
+        manager.compact_context("model".into(), "default".into(), session, &operation_cancel).await
+    });
+    tokio::time::timeout(Duration::from_secs(2), f.mock.arrived.notified()).await.unwrap();
+    assert_eq!(f.manager.compact_context("model".into(), "default".into(), f.session.clone(), &CancellationToken::new()).await.unwrap_err().code(), "AGENT_BUSY");
+    assert_eq!(f.chat(f.request("不要在整理期间生成新回复")).await.unwrap_err().code(), "AGENT_BUSY");
+    cancel.cancel();
+    assert!(tokio::time::timeout(Duration::from_secs(2), operation).await.unwrap().unwrap().is_err());
+    assert_eq!(f.events(), before);
+    assert!(f.repo.checkpoint(&f.session, "default").unwrap().is_none());
+    f.mock.hold.store(false, Ordering::SeqCst);
+    f.mock.release.notify_waiters();
+    let retry = f.manager.compact_context("model".into(), "default".into(), f.session.clone(), &CancellationToken::new()).await.unwrap();
+    assert!(retry.compacted);
+}
+
+#[tokio::test]
 async fn c6_smaller_window_recompacts_existing_checkpoint_and_keeps_constraints_and_facts() {
     let f = Fixture::new().await;
     let constraints = vec![
