@@ -1,0 +1,82 @@
+{
+  "originalPrimaryReportUnchanged": true,
+  "originalFailureRootCause": "not recoverable: original summary rejection details were not captured",
+  "diagnosticConclusion": "invalid retained fact quotes observed; missing trusted rejection feedback in retries reproduced and repaired",
+  "regressionsPassed": 109,
+  "strictClippyPassed": true,
+  "batches": {
+    "diagnosis": {
+      "trials": 10,
+      "passes": 10,
+      "summaryRequests": 12,
+      "invalidFactSummaryResponses": 2,
+      "model": "gpt-6-luna",
+      "parameters": {
+        "contextWindow": 16384,
+        "maxResponseBytes": 1048576,
+        "model": "gpt-6-luna",
+        "outputReserve": 8192,
+        "outputTokenParameter": "maxCompletionTokens",
+        "provider": "openAiCompatible",
+        "reasoningEffort": "medium",
+        "safetyReserve": 512,
+        "temperature": null,
+        "timeoutSeconds": 117
+      },
+      "parameterFingerprints": [
+        "bbde37ee27aee6fb5b3a1fe0f018658f8e50d38ac84017e621e6ec89a62c5521"
+      ],
+      "perArm": {
+        "A_late_99": {
+          "trials": 5,
+          "passes": 5
+        },
+        "B_proactive_60": {
+          "trials": 5,
+          "passes": 5
+        }
+      }
+    },
+    "repaired": {
+      "trials": 10,
+      "passes": 10,
+      "summaryRequests": 10,
+      "invalidFactSummaryResponses": 0,
+      "model": "gpt-6-luna",
+      "parameters": {
+        "contextWindow": 16384,
+        "maxResponseBytes": 1048576,
+        "model": "gpt-6-luna",
+        "outputReserve": 8192,
+        "outputTokenParameter": "maxCompletionTokens",
+        "provider": "openAiCompatible",
+        "reasoningEffort": "medium",
+        "safetyReserve": 512,
+        "temperature": null,
+        "timeoutSeconds": 117
+      },
+      "parameterFingerprints": [
+        "bbde37ee27aee6fb5b3a1fe0f018658f8e50d38ac84017e621e6ec89a62c5521"
+      ],
+      "perArm": {
+        "A_late_99": {
+          "trials": 5,
+          "passes": 5
+        },
+        "B_proactive_60": {
+          "trials": 5,
+          "passes": 5
+        }
+      }
+    }
+  },
+  "currentSourceSha256": {
+    "src/agent/compact.rs": "a32687f1891f3250020149f20fc4574978cabe369a7d77be68b55d5c75f83e8e",
+    "src/agent/compact/auto.rs": "8f217b1bff3887597f0b5cad338ea98ffe9935c306128ccf2dee9626cebf0462",
+    "src/agent/tool_session/context.rs": "900630a7cd512644637c458ca4275e74a9688c26b5340e525ecf3f038b4088c0",
+    "examples/e5_eval.rs": "5cdd9573122f9fe334806d86d77eb9f9d68f6326c2dea3507c5e066bf266cedb",
+    "examples/e5/model.rs": "c16cc194d966cad18b0f430f5e01c4bd9b3b6824a8b91e896415c6e6df92aa13",
+    "tests/agent_auto_compact.rs": "61bc7698f522993915ead794fd9db8f6c2841c34851874016636775a3e987c48",
+    "tests/agent_extensions.rs": "f1d93413aeb2e99e56de41a340de2f85a6bd13deb44b6b9e32410e23507b2369"
+  }
+}

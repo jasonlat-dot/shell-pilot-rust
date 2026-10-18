@@ -175,6 +175,8 @@ pub struct Manager {
 pub(crate) struct Session {
     pub view: SessionView,
     pub transport: Arc<Transport>,
+    // Session-only secret. Never serialized, logged, or written to saved connections.
+    pub sudo_password: Mutex<Option<String>>,
     pub connect_timeout: Duration,
     pub openings: Arc<Semaphore>,
     pub slots: Arc<Semaphore>,
@@ -194,6 +196,7 @@ impl Session {
     }
     fn close(&self) {
         self.stop.cancel();
+        self.sudo_password.lock().unwrap().take();
         for task in self.tasks.lock().unwrap().values() {
             task.cancel();
         }
@@ -264,6 +267,18 @@ impl Manager {
         }
     }
     pub async fn open(&self, request: OpenRequest) -> Result<SessionView> {
+        if request
+            .sudo_password
+            .as_ref()
+            .is_some_and(|value| value.len() > 4096 || value.contains(['\r', '\n', '\0']))
+        {
+            return Err(Error::invalid(
+                "sudo 密码不能包含换行、空字符或超过 4096 字节",
+            ));
+        }
+        if request.access_mode == AccessMode::Login && request.sudo_password.is_some() {
+            return Err(Error::invalid("普通 SFTP 连接不接受 sudo 密码"));
+        }
         if self.stop.is_cancelled() {
             return Err(Error::cancelled());
         }
@@ -291,9 +306,17 @@ impl Manager {
                 sftp_session_id: uuid::Uuid::new_v4().to_string(),
                 connection_id: connection.connection_id,
                 root_path: "/".into(),
+                login_username: connection.username.clone(),
+                access_username: if request.access_mode == AccessMode::SudoRoot {
+                    "root".into()
+                } else {
+                    connection.username.clone()
+                },
+                access_mode: request.access_mode,
                 created_at: chrono::Utc::now(),
             },
             transport: Arc::new(transport),
+            sudo_password: Mutex::new(request.sudo_password.filter(|value| !value.is_empty())),
             connect_timeout: timeout,
             openings: self.openings.clone(),
             slots: Arc::new(Semaphore::new(2)),

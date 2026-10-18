@@ -1,0 +1,62 @@
+{
+  "status": "upstream_unavailable_no_quality_samples",
+  "note": "Preflight probes before final report metadata/fail-fast additions; user chose to repair service before rerunning. No requests after that choice.",
+  "probes": [
+    {
+      "createdAt": "2026-10-17T19:59:35.683511900+00:00",
+      "transport": "initial_nonstream_bridge",
+      "runs": [
+        {
+          "arm": "A_late_99",
+          "model": "gpt-5-6-mini",
+          "error": "MODEL_HTTP_ERROR",
+          "modelErrors": [
+            "Model provider returned HTTP 502"
+          ],
+          "usage": [
+            null
+          ]
+        },
+        {
+          "arm": "B_proactive_60",
+          "model": "gpt-5-6-mini",
+          "error": "MODEL_HTTP_ERROR",
+          "modelErrors": [
+            "Model provider returned HTTP 502"
+          ],
+          "usage": [
+            null
+          ]
+        }
+      ]
+    },
+    {
+      "createdAt": "2026-10-17T20:00:13.486576800+00:00",
+      "transport": "product_stream_choice",
+      "runs": [
+        {
+          "arm": "A_late_99",
+          "model": "gpt-5-6-mini",
+          "error": "MODEL_HTTP_ERROR",
+          "modelErrors": [
+            "Model provider returned HTTP 502"
+          ],
+          "usage": [
+            null
+          ]
+        },
+        {
+          "arm": "B_proactive_60",
+          "model": "gpt-5-6-mini",
+          "error": "MODEL_HTTP_ERROR",
+          "modelErrors": [
+            "Model provider returned HTTP 502"
+          ],
+          "usage": [
+            null
+          ]
+        }
+      ]
+    }
+  ]
+}

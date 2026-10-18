@@ -23,12 +23,64 @@ use shellpilot_server::{
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
+
+#[tokio::test]
+async fn late_compaction_finds_a_fitting_older_prefix_and_preserves_mcp_evidence() {
+    check_late_compaction(false).await;
+}
+
+#[tokio::test]
+async fn late_compaction_retry_explains_oversized_fact_rejection_without_relaxing_validation() {
+    check_late_compaction(true).await;
+}
+
+async fn check_late_compaction(reject_first: bool) {
+    let mut first=calls("catalog","list_mcp_tools",json!({"server":"mock"}));
+    first["choices"][0]["message"]["content"]=json!("Planning the read-only inventory query. ".repeat(30));
+    let f=Fixture::new(vec![first,
+        calls("lookup","call_mcp_tool",json!({"server":"mock","tool":"lookup","argumentsJson":"{\"query\":\"hello\"}"})),
+        final_reply("beta 的查询完成，未重启。")]).await;
+    f.wire.auto_summary.store(true,Ordering::SeqCst);
+    f.wire.reject_first_summary.store(reject_first, Ordering::SeqCst);
+    let models=ModelRepository::new(f.store.clone());
+    let old=models.get("agent","default").unwrap();
+    let mut config=old.config;
+    config.context_window=16384;config.output_reserve=8192;config.safety_reserve=512;config.compact_percent=99;
+    models.save("agent","default",old.revision,ModelConfigUpdate{config,api_key:KeyChange::Keep}).unwrap();
+    let request=f.request(Policy::FullAccess).await;
+    let repo=Repository::new(f.store.clone());
+    let mut texts=vec!["目标 beta；禁止重启服务。".to_string()];
+    texts.extend((0..10).map(|i|format!("历史背景 {i}: {}","archived telemetry row=ok latency=12ms batch=closed; ".repeat(26))));
+    for (i,text) in texts.into_iter().enumerate() {
+        let revision=repo.session(&request.session_id,"default").unwrap().revision;
+        repo.append(&request.session_id,"default",revision,&format!("seed-user-{i}"),Payload::UserMessage{text}).unwrap();
+        let revision=repo.session(&request.session_id,"default").unwrap().revision;
+        repo.append(&request.session_id,"default",revision,&format!("seed-answer-{i}"),Payload::AssistantMessage{text:"已记录背景。".into()}).unwrap();
+    }
+    f.manager.chat_desktop(request.clone(),None,true,&CancellationToken::new(),|_|async{Ok(())}).await.unwrap();
+    assert_eq!(f.wire.executed.load(Ordering::SeqCst),1);
+    let checkpoint=repo.checkpoint(&request.session_id,"default").unwrap().unwrap();
+    assert!(checkpoint.content.retained_user_facts.iter().any(|f|f.quote.contains("目标 beta")));
+    let bodies=f.wire.bodies.lock().unwrap();
+    let summaries=bodies.iter().filter(|b|b["tools"].as_array().is_none_or(Vec::is_empty)).count();
+    assert!((1..=2).contains(&summaries));
+    if reject_first {
+        let attempts: Vec<_> = bodies.iter().filter(|b| b["tools"].as_array().is_none_or(Vec::is_empty)).collect();
+        assert_eq!(attempts.len(), 2);
+        assert!(attempts[1]["messages"][0]["content"].as_str().unwrap().contains("fact_quote_byte_limit"), "retry must explain the actual validation failure");
+        assert!(checkpoint.content.retained_user_facts.iter().all(|fact| fact.quote.len() <= 512));
+    }
+    drop(bodies);
+    let history=repo.events(&request.session_id,"default",0,200).unwrap();
+    assert!(history.iter().any(|e|matches!(&e.payload,Payload::ToolResult{call_id,..} if call_id=="lookup")));
+    assert!(shellpilot_server::agent::budget::group_history(&history).unwrap().iter().all(|g|g.complete));
+}
 
 fn calls(id: &str, name: &str, args: Value) -> Value {
     json!({"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]})
@@ -38,6 +90,8 @@ fn final_reply(text: &str) -> Value {
 }
 #[derive(Clone)]
 struct Wire {
+    auto_summary: Arc<AtomicBool>,
+    reject_first_summary: Arc<AtomicBool>,
     replies: Arc<Mutex<VecDeque<Value>>>,
     bodies: Arc<Mutex<Vec<Value>>>,
     executed: Arc<AtomicUsize>,
@@ -57,7 +111,21 @@ async fn model(State(w): State<Wire>, Json(body): Json<Value>) -> Json<Value> {
                     .is_some_and(|s| s.starts_with("委派子任务："))
         })
     });
-    w.bodies.lock().unwrap().push(body);
+    w.bodies.lock().unwrap().push(body.clone());
+    if w.auto_summary.load(Ordering::SeqCst) && body["tools"].as_array().is_none_or(Vec::is_empty) {
+        let source:Value=serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+        let mut facts:Vec<_>=source["events"].as_array().unwrap().iter().filter_map(|e| {
+            let text=e["payload"]["text"].as_str()?;
+            (e["payload"]["type"]=="userMessage"&&text.starts_with("目标 beta"))
+                .then(||json!({"eventId":e["id"],"quote":text}))
+        }).collect();
+        if w.reject_first_summary.swap(false, Ordering::SeqCst) {
+            let event = source["events"].as_array().unwrap().iter().find(|event|
+                event["payload"]["type"] == "userMessage" && event["payload"]["text"].as_str().is_some_and(|text| text.len() > 512)).unwrap();
+            facts.push(json!({"eventId":event["id"],"quote":event["payload"]["text"]}));
+        }
+        return Json(final_reply(&json!({"summary":"已确认目标 beta，禁止重启，历史遥测是背景证据。","nextSteps":["继续只读查询"],"retainedUserFacts":facts,"evidenceEventIds":source["availableEvidenceEventIds"]}).to_string()));
+    }
     let response = w
         .replies
         .lock()
@@ -177,6 +245,8 @@ impl Fixture {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let wire = Wire {
+            auto_summary: Arc::new(AtomicBool::new(false)),
+            reject_first_summary: Arc::new(AtomicBool::new(false)),
             replies: Arc::new(Mutex::new(replies.into())),
             bodies: Arc::new(Mutex::new(vec![])),
             executed: Arc::new(AtomicUsize::new(0)),
@@ -313,14 +383,15 @@ async fn ordinary_chat_executes_mcp_under_full_access_without_registering_ssh_an
         .await
         .unwrap();
     assert_eq!(f.wire.executed.load(Ordering::SeqCst), 1);
-    let bodies = f.wire.bodies.lock().unwrap();
-    assert_eq!(bodies.len(), 2);
-    assert!(!bodies[0]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|t| t["function"]["name"] == "ssh_execute"));
-    drop(bodies);
+    {
+        let bodies = f.wire.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert!(!bodies[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["function"]["name"] == "ssh_execute"));
+    }
     f.manager
         .chat_desktop(
             request.clone(),

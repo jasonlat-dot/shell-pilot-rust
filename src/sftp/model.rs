@@ -35,11 +35,21 @@ pub enum Status {
     Failed,
     Cancelled,
 }
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum AccessMode {
+    #[default]
+    Login,
+    SudoRoot,
+}
+#[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OpenRequest {
     pub connection_id: String,
     pub root_path: Option<String>,
+    #[serde(default)]
+    pub access_mode: AccessMode,
+    pub sudo_password: Option<String>,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,6 +57,9 @@ pub struct SessionView {
     pub sftp_session_id: String,
     pub connection_id: String,
     pub root_path: String,
+    pub login_username: String,
+    pub access_username: String,
+    pub access_mode: AccessMode,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 #[derive(Clone, Debug, Serialize)]

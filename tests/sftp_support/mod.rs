@@ -29,6 +29,15 @@ pub struct Stats {
     pub channels: AtomicUsize,
     pub live: AtomicUsize,
     pub connections: AtomicUsize,
+    pub root_commands: Mutex<Vec<String>>,
+    pub password_prompts: AtomicUsize,
+}
+#[derive(Clone, Copy, Default)]
+pub enum RootAccess {
+    #[default]
+    Denied,
+    Passwordless,
+    Password,
 }
 pub struct Fixture {
     pub root: tempfile::TempDir,
@@ -37,16 +46,19 @@ pub struct Fixture {
     pub client: PrivateKey,
     pub stats: Arc<Stats>,
     pub delay: Arc<Mutex<Duration>>,
+    pub root_access: Arc<Mutex<RootAccess>>,
     stop: CancellationToken,
 }
 impl Fixture {
     pub async fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("home")).unwrap();
+        std::fs::create_dir(root.path().join("root")).unwrap();
         let host = PrivateKey::random(&mut safe_rng(), Algorithm::Ed25519).unwrap();
         let client = PrivateKey::random(&mut safe_rng(), Algorithm::Ed25519).unwrap();
         let stats = Arc::new(Stats::default());
         let delay = Arc::new(Mutex::new(Duration::ZERO));
+        let root_access = Arc::new(Mutex::new(RootAccess::default()));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let mut server = Server {
@@ -54,6 +66,7 @@ impl Fixture {
             stats: stats.clone(),
             delay: delay.clone(),
             client: client.public_key().clone(),
+            root_access: root_access.clone(),
         };
         let config = Arc::new(server::Config {
             keys: vec![host.clone()],
@@ -79,6 +92,7 @@ impl Fixture {
             client,
             stats,
             delay,
+            root_access,
             stop,
         }
     }
@@ -119,6 +133,7 @@ impl Fixture {
             .open(OpenRequest {
                 connection_id: connection.connection_id.clone(),
                 root_path: Some("/home".into()),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -143,6 +158,7 @@ struct Server {
     stats: Arc<Stats>,
     delay: Arc<Mutex<Duration>>,
     client: PublicKey,
+    root_access: Arc<Mutex<RootAccess>>,
 }
 impl server::Server for Server {
     type Handler = Ssh;
@@ -157,6 +173,8 @@ impl server::Server for Server {
             channels: HashMap::new(),
             ids: HashSet::new(),
             sftp: HashSet::new(),
+            root_access: self.root_access.clone(),
+            password_pending: HashMap::new(),
         }
     }
 }
@@ -168,6 +186,34 @@ struct Ssh {
     channels: HashMap<ChannelId, Channel<server::Msg>>,
     ids: HashSet<ChannelId>,
     sftp: HashSet<ChannelId>,
+    root_access: Arc<Mutex<RootAccess>>,
+    password_pending: HashMap<ChannelId, Vec<u8>>,
+}
+impl Ssh {
+    fn start_sftp(
+        &mut self,
+        id: ChannelId,
+        session: &mut Session,
+        elevated: bool,
+    ) -> Result<(), russh::Error> {
+        self.sftp.insert(id);
+        let channel = self.channels.remove(&id).unwrap();
+        if elevated {
+            // Fragmented readiness and password prompts exercise incremental parsing.
+            session.data(id, b"SHELLPILOT_ROOT_".to_vec())?;
+            session.data(id, b"SFTP_READY\n".to_vec())?;
+        }
+        let handler = Fs {
+            root: self.root.clone(),
+            delay: self.delay.clone(),
+            handles: HashMap::new(),
+            elevated,
+        };
+        tokio::spawn(async move {
+            russh_sftp::server::run(channel.into_stream(), handler).await;
+        });
+        Ok(())
+    }
 }
 impl Drop for Ssh {
     fn drop(&mut self) {
@@ -245,17 +291,45 @@ impl server::Handler for Ssh {
             session.channel_failure(id)?;
             return Ok(());
         }
-        self.sftp.insert(id);
-        let channel = self.channels.remove(&id).unwrap();
-        let handler = Fs {
-            root: self.root.clone(),
-            delay: self.delay.clone(),
-            handles: HashMap::new(),
-        };
         session.channel_success(id)?;
-        tokio::spawn(async move {
-            russh_sftp::server::run(channel.into_stream(), handler).await;
-        });
+        self.start_sftp(id, session, false)?;
+        Ok(())
+    }
+    async fn exec_request(
+        &mut self,
+        id: ChannelId,
+        command: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let command = String::from_utf8_lossy(command).into_owned();
+        self.stats
+            .root_commands
+            .lock()
+            .unwrap()
+            .push(command.clone());
+        if !command.starts_with("sudo ")
+            || !command.contains("test \"$(id -u)\" = 0")
+            || !command.contains("sftp-server")
+        {
+            session.channel_failure(id)?;
+            return Ok(());
+        }
+        session.channel_success(id)?;
+        let access = *self.root_access.lock().unwrap();
+        match access {
+            RootAccess::Passwordless => self.start_sftp(id, session, true)?,
+            RootAccess::Password if command.contains("sudo -S ") => {
+                self.stats.password_prompts.fetch_add(1, Ordering::SeqCst);
+                self.password_pending.insert(id, Vec::new());
+                session.extended_data(id, 1, b"SHELLPILOT_SUDO_".to_vec())?;
+                session.extended_data(id, 1, b"PASSWORD:".to_vec())?;
+            }
+            _ => {
+                session.exit_status_request(id, 1)?;
+                session.eof(id)?;
+                session.close(id)?;
+            }
+        }
         Ok(())
     }
     #[allow(clippy::too_many_arguments)]
@@ -288,6 +362,27 @@ impl server::Handler for Ssh {
         bytes: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if let Some(password) = self.password_pending.get_mut(&id) {
+            // russh delivers data both to this callback and the channel receiver.
+            // Consume sudo's input before handing that receiver to the SFTP server.
+            while let Some(message) = self.channels.get_mut(&id).unwrap().wait().await {
+                if matches!(message, russh::ChannelMsg::Data { .. }) {
+                    break;
+                }
+            }
+            password.extend_from_slice(bytes);
+            if password.ends_with(b"\n") {
+                let correct = password == b"sudo-test-password\n";
+                self.password_pending.remove(&id);
+                if correct {
+                    self.start_sftp(id, session, true)?;
+                } else {
+                    // sudo asks again after a wrong password; the client must stop.
+                    session.extended_data(id, 1, b"SHELLPILOT_SUDO_PASSWORD:".to_vec())?;
+                }
+            }
+            return Ok(());
+        }
         if !self.sftp.contains(&id) {
             session.data(id, bytes.to_vec())?;
         }
@@ -302,6 +397,7 @@ struct Fs {
     root: Arc<PathBuf>,
     delay: Arc<Mutex<Duration>>,
     handles: HashMap<String, Handle>,
+    elevated: bool,
 }
 fn io(error: std::io::Error) -> StatusCode {
     match error.kind() {
@@ -335,7 +431,18 @@ fn ok(id: u32) -> p::Status {
 }
 impl Fs {
     fn path(&self, value: &str) -> Result<PathBuf, StatusCode> {
-        let value = if value == "." { "/home" } else { value };
+        let value = if value == "." {
+            if self.elevated {
+                "/root"
+            } else {
+                "/home"
+            }
+        } else {
+            value
+        };
+        if !self.elevated && (value == "/root" || value.starts_with("/root/")) {
+            return Err(StatusCode::PermissionDenied);
+        }
         if !value.starts_with('/') || value.contains('\\') {
             return Err(StatusCode::PermissionDenied);
         }
@@ -393,7 +500,11 @@ impl russh_sftp::server::Handler for Fs {
     }
     async fn realpath(&mut self, id: u32, value: String) -> Result<p::Name, Self::Error> {
         let path = if value == "." {
-            "/home".into()
+            if self.elevated {
+                "/root".into()
+            } else {
+                "/home".into()
+            }
         } else if value.starts_with("/home/link") {
             "/outside".into()
         } else {

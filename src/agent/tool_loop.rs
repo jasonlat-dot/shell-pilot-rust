@@ -459,10 +459,12 @@ impl<'a> ToolLoop<'a> {
                 ));
             }
             // Protocol errors leave the previous complete transcript untouched.
-            // Hard/soft budget errors retain this whole unexecuted batch for the host.
+            // The managed host rebuilds context after a complete result batch.
             let preflight = if self.context.is_some() {
-                // A pending batch may cross the soft trigger. Compact only after real results.
-                prepare_request(client.config(), &batch)
+                // This is a local transcript, not another provider request. Validate
+                // protocol now; allow the host to compact completed results before
+                // the next send. boundary() still enforces every actual wire budget.
+                super::provider::measure_request(client.config(), &batch)
                     .map(|_| ())
                     .map_err(Error::from)
             } else {

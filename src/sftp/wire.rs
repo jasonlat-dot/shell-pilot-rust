@@ -19,12 +19,28 @@ impl Wire {
             .clone()
             .try_acquire_owned()
             .map_err(|_| Error::busy())?;
-        let stream = session
-            .transport
-            .clone()
-            .sftp_stream(session.connect_timeout, permit)
-            .await
-            .map_err(Error::ssh)?;
+        let stream = if session.view.access_mode == super::model::AccessMode::SudoRoot {
+            let password = session.sudo_password.lock().unwrap().clone();
+            session
+                .transport
+                .clone()
+                .root_sftp_stream(session.connect_timeout, permit, password.as_deref())
+                .await
+                .map_err(|error| {
+                    Error::new(
+                        "SFTP_ELEVATION_FAILED",
+                        error.to_string(),
+                        axum::http::StatusCode::FORBIDDEN,
+                    )
+                })?
+        } else {
+            session
+                .transport
+                .clone()
+                .sftp_stream(session.connect_timeout, permit)
+                .await
+                .map_err(Error::ssh)?
+        };
         let raw = RawSftpSession::new_with_config(
             stream,
             russh_sftp::client::Config {

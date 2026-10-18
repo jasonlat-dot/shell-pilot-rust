@@ -254,6 +254,7 @@ impl Controller {
                     through: candidates[mid],
                     runtime: runtime.clone(),
                     summary_bytes: 4096,
+                    retry_reason: None,
                 };
                 match prefix_fits(store.clone(), &id, &user, &p) {
                     Ok(true) => {
@@ -305,6 +306,7 @@ impl Controller {
                 }
             }
         }
+        let mut retry_reason = None;
         for attempt in 0..MAX_ATTEMPTS {
             cancel.check()?;
             if attempt == 0 {
@@ -316,6 +318,7 @@ impl Controller {
                 through: frontier,
                 runtime: context.runtime.clone(),
                 summary_bytes: if attempt == 0 { 4096 } else { 2048 },
+                retry_reason,
             };
             let summarizer = Summarizer::new(self.store.clone());
             let operation = summarizer.summarize_prefix(
@@ -330,7 +333,10 @@ impl Controller {
             };
             let draft = match draft {
                 Ok(draft) => draft,
-                Err(super::Error::InvalidSummary) if attempt + 1 < MAX_ATTEMPTS => continue,
+                Err(error) if error.rejection_reason().is_some() && attempt + 1 < MAX_ATTEMPTS => {
+                    retry_reason = error.rejection_reason();
+                    continue;
+                }
                 Err(error) => {
                     let error = summary_error(error);
                     cancel.check()?;
@@ -374,6 +380,7 @@ impl Controller {
             let reduced =
                 after.estimated_input_tokens < check.estimated_input_tokens || count_reduced;
             if !fits || !reduced || after.estimated_input_tokens > lower {
+                retry_reason = Some("projected_context_budget");
                 if attempt + 1 < MAX_ATTEMPTS {
                     continue;
                 }

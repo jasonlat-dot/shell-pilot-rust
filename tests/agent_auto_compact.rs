@@ -832,6 +832,12 @@ async fn invalid_summary_retries_at_most_twice_then_uses_only_an_unchanged_fitti
     );
     assert_eq!(f.summaries(), 2);
     assert_eq!(f.streams(), 1);
+    let requests = f.mock.requests.lock().unwrap();
+    let summaries: Vec<_> = requests.iter().filter(|request| request["stream"] == false).collect();
+    let instructions = summaries[1]["messages"][0]["content"].as_str().unwrap();
+    assert!(instructions.contains("json_schema"));
+    assert!(!instructions.contains("private-invalid"), "untrusted rejected prose must not become retry instructions");
+    drop(requests);
     assert_eq!(f.snapshot().session.checkpoint_id, cp);
     assert_eq!(&f.events()[..original.len()], &original);
 }

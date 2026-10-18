@@ -1,0 +1,245 @@
+{
+  "abortedReason": null,
+  "aggregate": [
+    {
+      "arm": "A_late_99",
+      "completed": 1,
+      "completionTokens": 98,
+      "constraintPasses": 1,
+      "duplicateExecutions": 0,
+      "extraExecutions": 0,
+      "extraToolCalls": 0,
+      "factsExpected": 1,
+      "factsRetained": 1,
+      "failedModelRequests": 0,
+      "latencyMedianMs": 18830,
+      "latencyTotalMs": 18830,
+      "modelRequests": 3,
+      "promptTokens": 3853,
+      "replayPasses": 1,
+      "runs": 1,
+      "successfulModelRequests": 3,
+      "summaryRequests": 0,
+      "targetCorrect": 1,
+      "targetScored": 1,
+      "usageComplete": true,
+      "usageReportedRequests": 3
+    },
+    {
+      "arm": "B_proactive_60",
+      "completed": 1,
+      "completionTokens": 110,
+      "constraintPasses": 1,
+      "duplicateExecutions": 0,
+      "extraExecutions": 0,
+      "extraToolCalls": 1,
+      "factsExpected": 1,
+      "factsRetained": 1,
+      "failedModelRequests": 0,
+      "latencyMedianMs": 6662,
+      "latencyTotalMs": 6662,
+      "modelRequests": 4,
+      "promptTokens": 5154,
+      "replayPasses": 1,
+      "runs": 1,
+      "successfulModelRequests": 4,
+      "summaryRequests": 0,
+      "targetCorrect": 1,
+      "targetScored": 1,
+      "usageComplete": true,
+      "usageReportedRequests": 4
+    }
+  ],
+  "caseCount": 1,
+  "comparison": "Same Rust Agent/model; 99% vs 60% compaction threshold; NOT Java vs Rust",
+  "contextWindow": 16384,
+  "createdAt": "2026-10-17T20:25:49.166899+00:00",
+  "limitations": [
+    "No real SSH or external MCP; only isolated deterministic inventory",
+    "Exact public fact and tool trace checks; free-text semantics require manual review",
+    "Completion latency through buffered upstream bridge; no first-token claim",
+    "Token totals are null if any provider usage is missing",
+    "No statistical significance claim from a small fixed suite"
+  ],
+  "matrixComplete": true,
+  "mode": "real_model",
+  "previousPassesSkipped": 0,
+  "profileFrozenAtStart": true,
+  "repetitions": 1,
+  "retryOnly": false,
+  "runs": [
+    {
+      "answer": "- 目标：alpha\n- 磁盘使用率：41%\n- 操作限制：仅通过 inventory 的 inspect 只读查询；未操作其他目标。",
+      "arm": "A_late_99",
+      "attempts": [
+        {
+          "operation": "disk",
+          "target": "alpha"
+        }
+      ],
+      "caseId": "disk",
+      "checkpoints": 0,
+      "compactPercent": 99,
+      "elapsedMs": 18830,
+      "error": null,
+      "extraToolCalls": 0,
+      "model": "gpt-6-luna",
+      "outputReads": 0,
+      "parameterFingerprint": "bbde37ee27aee6fb5b3a1fe0f018658f8e50d38ac84017e621e6ec89a62c5521",
+      "parameters": {
+        "contextWindow": 16384,
+        "maxResponseBytes": 1048576,
+        "model": "gpt-6-luna",
+        "outputReserve": 8192,
+        "outputTokenParameter": "maxCompletionTokens",
+        "provider": "openAiCompatible",
+        "reasoningEffort": "medium",
+        "safetyReserve": 512,
+        "temperature": null,
+        "timeoutSeconds": 117
+      },
+      "repetition": 1,
+      "replayClean": true,
+      "requests": [
+        {
+          "elapsedMs": 16127,
+          "error": null,
+          "estimatedInputTokens": 2016,
+          "summary": false,
+          "usage": {
+            "completion_tokens": 20,
+            "prompt_tokens": 1159,
+            "total_tokens": 1179
+          }
+        },
+        {
+          "elapsedMs": 1304,
+          "error": null,
+          "estimatedInputTokens": 2321,
+          "summary": false,
+          "usage": {
+            "completion_tokens": 38,
+            "prompt_tokens": 1306,
+            "total_tokens": 1344
+          }
+        },
+        {
+          "elapsedMs": 1319,
+          "error": null,
+          "estimatedInputTokens": 2511,
+          "summary": false,
+          "usage": {
+            "completion_tokens": 40,
+            "prompt_tokens": 1388,
+            "total_tokens": 1428
+          }
+        }
+      ],
+      "score": {
+        "completed": true,
+        "constraintsPreserved": true,
+        "duplicateExecutions": 0,
+        "extraExecutions": 0,
+        "factsExpected": 1,
+        "factsRetained": 1,
+        "missingOperations": [],
+        "targetCorrect": true
+      },
+      "summaryRequests": 0,
+      "toolCalls": 2
+    },
+    {
+      "answer": "目标：alpha  \n事实：磁盘使用率为 41%。  \n限制：仅进行了只读查询；未操作其他目标。",
+      "arm": "B_proactive_60",
+      "attempts": [
+        {
+          "operation": "disk",
+          "target": "alpha"
+        }
+      ],
+      "caseId": "disk",
+      "checkpoints": 0,
+      "compactPercent": 60,
+      "elapsedMs": 6662,
+      "error": null,
+      "extraToolCalls": 1,
+      "model": "gpt-6-luna",
+      "outputReads": 0,
+      "parameterFingerprint": "bbde37ee27aee6fb5b3a1fe0f018658f8e50d38ac84017e621e6ec89a62c5521",
+      "parameters": {
+        "contextWindow": 16384,
+        "maxResponseBytes": 1048576,
+        "model": "gpt-6-luna",
+        "outputReserve": 8192,
+        "outputTokenParameter": "maxCompletionTokens",
+        "provider": "openAiCompatible",
+        "reasoningEffort": "medium",
+        "safetyReserve": 512,
+        "temperature": null,
+        "timeoutSeconds": 117
+      },
+      "repetition": 1,
+      "replayClean": true,
+      "requests": [
+        {
+          "elapsedMs": 1422,
+          "error": null,
+          "estimatedInputTokens": 2016,
+          "summary": false,
+          "usage": {
+            "completion_tokens": 20,
+            "prompt_tokens": 1157,
+            "total_tokens": 1177
+          }
+        },
+        {
+          "elapsedMs": 1881,
+          "error": null,
+          "estimatedInputTokens": 2154,
+          "summary": false,
+          "usage": {
+            "completion_tokens": 20,
+            "prompt_tokens": 1207,
+            "total_tokens": 1227
+          }
+        },
+        {
+          "elapsedMs": 1813,
+          "error": null,
+          "estimatedInputTokens": 2459,
+          "summary": false,
+          "usage": {
+            "completion_tokens": 38,
+            "prompt_tokens": 1354,
+            "total_tokens": 1392
+          }
+        },
+        {
+          "elapsedMs": 1447,
+          "error": null,
+          "estimatedInputTokens": 2649,
+          "summary": false,
+          "usage": {
+            "completion_tokens": 32,
+            "prompt_tokens": 1436,
+            "total_tokens": 1468
+          }
+        }
+      ],
+      "score": {
+        "completed": true,
+        "constraintsPreserved": true,
+        "duplicateExecutions": 0,
+        "extraExecutions": 0,
+        "factsExpected": 1,
+        "factsRetained": 1,
+        "missingOperations": [],
+        "targetCorrect": true
+      },
+      "summaryRequests": 0,
+      "toolCalls": 3
+    }
+  ],
+  "suiteSha256": "62dff42e9242f69619a3024e0d010742cab2470e4d909c78d829184fe0da5eec",
+  "version": 1
+}

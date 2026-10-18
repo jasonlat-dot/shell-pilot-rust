@@ -53,6 +53,9 @@ pub enum Error {
     InputLimit,
     #[error("Model summary structure or evidence is invalid")]
     InvalidSummary,
+    #[doc(hidden)]
+    #[error("Model summary rejected: {0}")]
+    RejectedSummary(&'static str),
     #[error("Summary source operation failed: {0}")]
     Context(#[from] super::Error),
     #[error("Summary model request failed: {0}")]
@@ -61,6 +64,21 @@ pub enum Error {
     Worker,
 }
 pub type Result<T> = std::result::Result<T, Error>;
+
+fn rejected(reason: &'static str) -> Error {
+    // Deliberately record no model prose, source events, credentials or quotes.
+    tracing::warn!(summary_rejection = reason, "compaction summary rejected");
+    Error::RejectedSummary(reason)
+}
+impl Error {
+    pub(crate) fn rejection_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::RejectedSummary(reason) => Some(reason),
+            Self::InvalidSummary => Some("invalid_summary"),
+            _ => None,
+        }
+    }
+}
 
 /// Only the adapter constructs trusted checkpoint fields. C2 must still perform A4's CAS at commit.
 #[derive(Debug)]
@@ -112,6 +130,7 @@ pub(crate) struct Prefix {
     pub runtime: super::provider::RuntimeConfig,
     pub summary_bytes: usize,
     pub tool_turn: Option<(String, String)>,
+    pub retry_reason: Option<&'static str>,
 }
 pub struct Summarizer {
     store: Arc<Store>,
@@ -129,7 +148,16 @@ impl Summarizer {
         user: &str,
         cancel: &CancellationToken,
     ) -> Result<Draft> {
-        self.generate(session, user, cancel, None).await
+        self.generate(session, user, cancel, None)
+            .await
+            .map_err(|error| {
+                // Preserve the public one-shot summarizer's existing error contract.
+                if error.rejection_reason().is_some() {
+                    Error::InvalidSummary
+                } else {
+                    error
+                }
+            })
     }
     pub(crate) async fn summarize_prefix(
         &self,
@@ -172,14 +200,14 @@ impl Summarizer {
                 .as_ref()
                 .is_some_and(|s| !s.is_empty())
         {
-            return Err(Error::InvalidSummary);
+            return Err(rejected("incomplete_or_non_text_completion"));
         }
         let repository = Repository::new(self.store.clone());
         let raw = completion
             .message
             .content
             .clone()
-            .ok_or(Error::InvalidSummary)?;
+            .ok_or_else(|| rejected("missing_content"))?;
         let validating_repo = repository.clone();
         let validating_snapshot = snapshot.clone();
         let validating = tokio::task::spawn_blocking(move || {
@@ -198,7 +226,12 @@ impl Summarizer {
             result=validating=>result.map_err(|_|Error::Worker)??,
         };
         if content.summary.len() > limit {
-            return Err(Error::InvalidSummary);
+            tracing::warn!(
+                summary_bytes = content.summary.len(),
+                limit,
+                "compaction summary exceeds requested byte limit"
+            );
+            return Err(rejected("summary_byte_limit"));
         }
         let expected = snapshot.clone();
         let checking = tokio::task::spawn_blocking(move || {
@@ -388,11 +421,14 @@ fn prepare(
     if !(64..=MAX_SUMMARY_BYTES).contains(&limit) {
         return Err(Error::InputLimit);
     }
-    let instructions = if prefix.is_some() {
+    let mut instructions = if prefix.is_some() {
         format!("{INSTRUCTIONS}\nFor this request keep summary <= {limit} UTF-8 bytes and nextSteps <= 4 concise items.")
     } else {
         INSTRUCTIONS.into()
     };
+    if let Some(reason) = prefix.and_then(|p| p.retry_reason) {
+        instructions.push_str(&format!("\nRetry after host rejection ({reason}): return corrected JSON. Each retainedUserFacts quote must be a verbatim user_message substring <=512 UTF-8 bytes, not a whole long background message. Use [] only when no new important facts. Preserve required facts; obey summary/nextSteps limits. No tools."));
+    }
     let mut request = ChatRequest {
         messages: vec![
             ChatMessage::System {
@@ -448,27 +484,33 @@ fn validate(
     repository: &Repository,
 ) -> Result<CheckpointContent> {
     if text.len() > 65536 {
-        return Err(Error::InvalidSummary);
+        return Err(rejected("document_byte_limit"));
     }
     // Do not extract arbitrary embedded JSON or repair/follow model instructions.
-    let document: Document = serde_json::from_str(text).map_err(|_| Error::InvalidSummary)?;
+    let document: Document = serde_json::from_str(text).map_err(|_| rejected("json_schema"))?;
     if document.retained_user_facts.len() > super::facts::MAX_FACTS {
-        return Err(Error::InvalidSummary);
+        return Err(rejected("too_many_new_facts"));
     }
     let mut facts = inherited.to_vec();
     for fact in document.retained_user_facts {
         if !available.contains(&fact.event_id) {
-            return Err(Error::InvalidSummary);
+            return Err(rejected("fact_outside_source"));
         }
         if !facts.contains(&fact) {
             facts.push(fact);
         }
     }
+    if facts
+        .iter()
+        .any(|fact| fact.quote.len() > super::facts::MAX_QUOTE_BYTES)
+    {
+        return Err(rejected("fact_quote_byte_limit"));
+    }
     repository
         .db(|db| super::facts::validate(db, &snapshot.session.id, through, &facts))
-        .map_err(|_| Error::InvalidSummary)?;
-    text_value(&document.summary, MAX_SUMMARY_BYTES).map_err(|_| Error::InvalidSummary)?;
-    text_list(&document.next_steps).map_err(|_| Error::InvalidSummary)?;
+        .map_err(|_| rejected("fact_provenance_or_size"))?;
+    text_value(&document.summary, MAX_SUMMARY_BYTES).map_err(|_| rejected("summary_text"))?;
+    text_list(&document.next_steps).map_err(|_| rejected("next_steps"))?;
     let allowed: HashSet<_> = available.iter().copied().collect();
     let mut seen = HashSet::new();
     if document.evidence_event_ids.is_empty()
@@ -478,7 +520,7 @@ fn validate(
             .iter()
             .any(|id| !allowed.contains(id) || !seen.insert(*id))
     {
-        return Err(Error::InvalidSummary);
+        return Err(rejected("evidence_ids"));
     }
     // Evidence from earlier checkpoints, unfinished calls and failed turns is never model-discardable.
     let mut evidence = document.evidence_event_ids;
@@ -487,7 +529,7 @@ fn validate(
     evidence.sort_unstable();
     evidence.dedup();
     if evidence.len() > MAX_EVENTS {
-        return Err(Error::InvalidSummary);
+        return Err(rejected("merged_evidence_limit"));
     }
     let content = CheckpointContent {
         task: snapshot.session.task.clone(),
@@ -499,11 +541,11 @@ fn validate(
         uncertain_tool_call_ids: snapshot.uncertain_tool_call_ids.clone(),
     };
     if serde_json::to_vec(&content)
-        .map_err(|_| Error::InvalidSummary)?
+        .map_err(|_| rejected("checkpoint_serialization"))?
         .len()
         > 65536
     {
-        return Err(Error::InvalidSummary);
+        return Err(rejected("checkpoint_byte_limit"));
     }
     Ok(content)
 }

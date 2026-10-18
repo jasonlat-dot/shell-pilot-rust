@@ -4,13 +4,23 @@ Rust Preview 0.3.0 使用 russh-sftp 3.0.1，兼容既有客户端 HTTP 和 Taur
 每个文件窗口建立独立 SSH 连接，复用已保存的连接参数、DPAPI 凭据和严格主机身份校验；每次元数据操作或文件传输独占 SFTP 子通道。
 终端与 SFTP 互不依赖。当前固定桌面用户 default；打开会话时拒绝其他 userId 的连接。
 
+### 访问身份
+
+终端内的 `su` / `sudo` 只改变当前交互式 Shell，不改变独立 SFTP 连接。文件管理返回 `loginUsername`、`accessUsername` 和 `accessMode`，客户端显示实际选用的文件访问身份。
+
+打开会话可传 `accessMode: "login"`（默认，兼容旧请求）或 `"sudoRoot"`。root 模式在独立 SSH exec 通道启动固定的 sudo 引导命令，确认 UID 为 0 后启动 OpenSSH `sftp-server`，元数据与所有传输通道统一采用同一模式。不会借用、注入或修改用户终端。root 模式默认目录为 `/root`；需要浏览整个文件系统可将根目录设为 `/`。
+
+`sudoPassword` 可选，免密 sudo 留空；需要认证时填写当前 SSH 登录账号的 sudo 密码。仅在收到专用 sudo 提示后通过 SSH stdin 发送一次，不放进命令行、会话响应或保存的连接；会话期间在内存保留以供新通道认证，关闭时释放。密码错误、sudo 拒绝、要求 TTY 或找不到独立 sftp-server 时不会回退普通账号，返回 `SFTP_ELEVATION_FAILED`。不支持只有 `su` 权限的提权方式；这种情况使用独立 root SSH 配置。
+
+服务器需允许该账号通过 sudo 执行 root 引导命令，并安装下列任一路径的独立程序：`/usr/lib/openssh/sftp-server`、`/usr/libexec/openssh/sftp-server`、`/usr/lib/ssh/sftp-server`、`/usr/libexec/sftp-server`。仅配置 `internal-sftp`、禁用 exec 或受限 sudo 白名单不一定支持本模式。
+
 ## 接口
 
 前缀 /api/v1/sftp。JSON 成功响应沿用 SUCCESS_0000 与 {code, info, data}，错误使用 SFTP_* 和对应 HTTP 状态。
 
 | 方法 | 路径 | 功能 |
 |---|---|---|
-| POST | /sessions | connectionId、可选 rootPath -> 会话 |
+| POST | /sessions | connectionId、可选 rootPath / accessMode / sudoPassword -> 会话 |
 | GET / DELETE | /sessions/{id} | 查询 / 关闭会话，关闭时取消任务和断开独立 SSH 连接 |
 | GET / DELETE | /sessions/{id}/entries?path=... | 列目录 / 删除普通文件或空目录 |
 | POST | /sessions/{id}/directories | path，新建目录 |
@@ -61,6 +71,8 @@ SSE 首次发送快照，后续每 300ms 检查变化，15 秒心跳；一个会
 客户端已修正过期会话返回 404 的分类，并确保关闭过期窗口仍能清理本地记录。
 
 ## 验证
+
+2026-10-18 访问身份修复：后端 SFTP 集成 17 项、客户端原生 SFTP 桥接/路径 8 项、前端 SFTP 3 项通过；TypeScript、前端生产构建、Tauri cargo check 与后端严格 Clippy 通过。新增验证包含免密和带密码 root、分片提示、错误密码/拒绝提权、普通账号权限隔离以及 root 上传下载。使用临时本机协议服务模拟 sudo 和权限，未连接用户服务器；真实 sudo 策略、OpenSSH 程序路径和 GUI 操作仍需在目标环境核实。
 
 Windows x64，2026-10-13：
 

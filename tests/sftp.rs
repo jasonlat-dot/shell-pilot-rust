@@ -50,6 +50,231 @@ fn no_part(fixture: &Fixture) -> bool {
 }
 
 #[tokio::test]
+async fn sudo_root_covers_metadata_and_transfers_without_changing_login_session() {
+    let fixture = Fixture::new().await;
+    *fixture.root_access.lock().unwrap() = RootAccess::Passwordless;
+    let (store, connection) = fixture.saved(false);
+    let manager = Manager::new(store);
+    let login = manager
+        .open(OpenRequest {
+            connection_id: connection.connection_id.clone(),
+            root_path: Some("/".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(login.access_username, "tester");
+    assert_eq!(login.access_mode, AccessMode::Login);
+    assert_eq!(
+        manager
+            .entries(&login.sftp_session_id, Some("/root"))
+            .await
+            .unwrap_err()
+            .code,
+        "SFTP_FORBIDDEN"
+    );
+    let root = manager
+        .open(OpenRequest {
+            connection_id: connection.connection_id,
+            access_mode: AccessMode::SudoRoot,
+            // NOPASSWD must never send this value into the binary SFTP stream.
+            sudo_password: Some("not-needed-secret".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(root.access_username, "root");
+    assert_eq!(root.login_username, "tester");
+    assert_eq!(root.root_path, "/root");
+    let id = &root.sftp_session_id;
+    manager
+        .change_entry(id, "/root/work", "mkdir")
+        .await
+        .unwrap();
+    let upload = manager
+        .create_transfer(create(
+            id,
+            Direction::Upload,
+            "/root/work",
+            Some(vec![file("private.txt", 5)]),
+        ))
+        .await
+        .unwrap();
+    manager
+        .upload(
+            &upload.transfer_id,
+            &upload.items[0].item_id,
+            Body::from("hello"),
+            Some(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fixture.read("/root/work/private.txt"), b"hello");
+    assert_eq!(
+        manager.entries(id, Some("/root/work")).await.unwrap()[0].name,
+        "private.txt"
+    );
+    let download = manager
+        .create_transfer(create(
+            id,
+            Direction::Download,
+            "/root/work/private.txt",
+            None,
+        ))
+        .await
+        .unwrap();
+    let response = manager
+        .download(&download.transfer_id, &download.items[0].item_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        to_bytes(response.into_body(), 1024).await.unwrap().as_ref(),
+        b"hello"
+    );
+    manager
+        .confirm(&download.transfer_id, &download.items[0].item_id, true)
+        .unwrap();
+    manager
+        .change_entry(id, "/root/work/private.txt", "delete")
+        .await
+        .unwrap();
+    manager
+        .change_entry(id, "/root/work", "delete")
+        .await
+        .unwrap();
+    assert_eq!(
+        manager
+            .entries(&login.sftp_session_id, Some("/root"))
+            .await
+            .unwrap_err()
+            .code,
+        "SFTP_FORBIDDEN"
+    );
+    assert!(fixture.stats.root_commands.lock().unwrap().len() >= 7);
+    assert_eq!(fixture.stats.password_prompts.load(Ordering::SeqCst), 0);
+    assert!(!serde_json::to_string(&root)
+        .unwrap()
+        .contains("not-needed-secret"));
+    manager.shutdown();
+}
+
+#[tokio::test]
+async fn sudo_password_is_prompt_driven_session_only_and_never_in_exec_command() {
+    let fixture = Fixture::new().await;
+    *fixture.root_access.lock().unwrap() = RootAccess::Password;
+    let (store, connection) = fixture.saved(false);
+    let manager = Manager::new(store.clone());
+    let root = manager
+        .open(OpenRequest {
+            connection_id: connection.connection_id.clone(),
+            access_mode: AccessMode::SudoRoot,
+            sudo_password: Some("sudo-test-password".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    manager
+        .change_entry(&root.sftp_session_id, "/root/private", "file")
+        .await
+        .unwrap();
+    assert_eq!(
+        manager.entries(&root.sftp_session_id, None).await.unwrap()[0].name,
+        "private"
+    );
+    assert!(fixture.stats.password_prompts.load(Ordering::SeqCst) >= 3);
+    assert!(fixture
+        .stats
+        .root_commands
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|cmd| !cmd.contains("sudo-test-password")));
+    assert!(!serde_json::to_string(&root)
+        .unwrap()
+        .contains("sudo-test-password"));
+    assert_eq!(
+        store
+            .credentials(&connection.connection_id)
+            .unwrap()
+            .password
+            .as_deref(),
+        Some("test-password")
+    );
+    manager.close(&root.sftp_session_id).unwrap();
+    assert!(manager.session_view(&root.sftp_session_id).is_err());
+    manager.shutdown();
+}
+
+#[tokio::test]
+async fn sudo_denied_or_wrong_password_never_falls_back_to_login_permissions() {
+    let fixture = Fixture::new().await;
+    let (store, connection) = fixture.saved(false);
+    let manager = Manager::new(store);
+    for (access, password) in [
+        (RootAccess::Denied, None),
+        (RootAccess::Password, None),
+        (RootAccess::Password, Some("wrong-password")),
+    ] {
+        *fixture.root_access.lock().unwrap() = access;
+        let error = manager
+            .open(OpenRequest {
+                connection_id: connection.connection_id.clone(),
+                access_mode: AccessMode::SudoRoot,
+                sudo_password: password.map(String::from),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "SFTP_ELEVATION_FAILED");
+        assert!(error.message.contains("sudo"));
+        assert!(!error.message.contains("wrong-password"));
+    }
+    eventually(|| fixture.stats.channels.load(Ordering::SeqCst) == 0).await;
+    // Failed opens must release the independent SSH connection and all channels.
+    eventually(|| fixture.stats.live.load(Ordering::SeqCst) == 0).await;
+    manager.shutdown();
+}
+
+#[test]
+fn sftp_old_requests_default_to_login_and_sudo_secrets_are_validated() {
+    let old: OpenRequest =
+        serde_json::from_value(serde_json::json!({"connectionId":"saved"})).unwrap();
+    assert_eq!(old.access_mode, AccessMode::Login);
+    assert!(old.sudo_password.is_none());
+    assert!(serde_json::from_value::<OpenRequest>(
+        serde_json::json!({"connectionId":"saved", "accessMode":"root"})
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn sudo_password_cannot_inject_an_extra_input_line_or_be_used_in_login_mode() {
+    let fixture = Fixture::new().await;
+    let (store, connection) = fixture.saved(false);
+    let manager = Manager::new(store);
+    for (mode, password) in [
+        (AccessMode::SudoRoot, "secret\nextra"),
+        (AccessMode::Login, "secret"),
+    ] {
+        assert_eq!(
+            manager
+                .open(OpenRequest {
+                    connection_id: connection.connection_id.clone(),
+                    access_mode: mode,
+                    sudo_password: Some(password.into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err()
+                .code,
+            "SFTP_INVALID"
+        );
+    }
+    assert_eq!(fixture.stats.connections.load(Ordering::SeqCst), 0);
+    manager.shutdown();
+}
+
+#[tokio::test]
 async fn sessions_private_key_host_identity_and_terminal_independence() {
     let fixture = Fixture::new().await;
     let (store, connection) = fixture.saved(true);
@@ -68,6 +293,7 @@ async fn sessions_private_key_host_identity_and_terminal_independence() {
         .open(OpenRequest {
             connection_id: connection.connection_id.clone(),
             root_path: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -109,7 +335,8 @@ async fn sessions_private_key_host_identity_and_terminal_independence() {
         manager
             .open(OpenRequest {
                 connection_id: connection.connection_id,
-                root_path: None
+                root_path: None,
+                ..Default::default()
             })
             .await
             .unwrap_err()
@@ -521,7 +748,8 @@ async fn idle_reaping_capacity_and_task_retention_are_bounded() {
         manager
             .open(OpenRequest {
                 connection_id: connection.connection_id.clone(),
-                root_path: None
+                root_path: None,
+                ..Default::default()
             })
             .await
             .unwrap_err()
@@ -575,6 +803,7 @@ async fn idle_reaping_capacity_and_task_retention_are_bounded() {
         .open(OpenRequest {
             connection_id: connection.connection_id,
             root_path: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -596,6 +825,7 @@ async fn manifest_limits_and_other_owners_are_rejected() {
         .open(OpenRequest {
             connection_id: connection.connection_id.clone(),
             root_path: Some("/home".into()),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -622,7 +852,8 @@ async fn manifest_limits_and_other_owners_are_rejected() {
         manager
             .open(OpenRequest {
                 connection_id: connection.connection_id,
-                root_path: None
+                root_path: None,
+                ..Default::default()
             })
             .await
             .unwrap_err()

@@ -181,13 +181,7 @@ impl ToolSession {
         self.apply_inputs(None, false, cancel).await?;
         let frame = self.frame().await?;
         let available = self.target_available().await;
-        let initial = project(
-            &frame,
-            &request.tools,
-            self.ssh_binding(),
-            available,
-            None,
-        )?;
+        let initial = project(&frame, &request.tools, self.ssh_binding(), available, None)?;
         self.reporter
             .measured(
                 &frame.runtime.config,
@@ -231,7 +225,12 @@ impl ToolSession {
         if candidates.len() > 1 {
             candidates.swap(0, 1);
         }
-        for (attempt, through) in candidates.into_iter().take(2).enumerate() {
+        let mut attempts = 0;
+        let mut retry_reason = None;
+        for through in candidates.into_iter().take(200) {
+            if attempts >= 2 {
+                break;
+            }
             if cancel.is_cancelled() {
                 return Err(tool_loop::Error::Cancelled);
             }
@@ -266,8 +265,30 @@ impl ToolSession {
                 snapshot: frame.snapshot.clone(),
                 through,
                 runtime: frame.runtime.clone(),
-                summary_bytes: if attempt == 0 { 2048 } else { 1024 },
+                summary_bytes: if attempts == 0 { 2048 } else { 1024 },
+                retry_reason,
             };
+            // Large recent results can make their evidence bundle too large to
+            // summarize. Look for an earlier whole-group frontier locally; such
+            // rejected candidates must not consume the two model attempts.
+            let store = self.repository.store.clone();
+            let sid = frame.snapshot.session.id.clone();
+            let user = frame.snapshot.session.user_id.clone();
+            let prefix = worker(
+                move || match compact::prefix_fits(store, &sid, &user, &prefix) {
+                    Ok(true) => Ok(Some(prefix)),
+                    Ok(false) => Ok(None),
+                    Err(compact::Error::ContextChanged | compact::Error::Busy) => {
+                        Err(tool_loop::Error::Context)
+                    }
+                    Err(_) => Ok(None),
+                },
+            )
+            .await?;
+            let Some(prefix) = prefix else {
+                continue;
+            };
+            attempts += 1;
             self.reporter.emit(context_status::Update::ToolStarted(
                 frame.snapshot.session.checkpoint_id.clone(),
             ));
@@ -288,11 +309,27 @@ impl ToolSession {
                 Err(compact::Error::Model(provider::ModelError::Cancelled)) => {
                     return Err(tool_loop::Error::Cancelled)
                 }
+                Err(error) if error.rejection_reason().is_some() => {
+                    retry_reason = error.rejection_reason();
+                    tracing::warn!(
+                        attempt = attempts,
+                        through,
+                        reason = retry_reason,
+                        "tool compaction draft rejected before projection"
+                    );
+                    continue;
+                }
                 Err(
                     compact::Error::InputLimit
-                    | compact::Error::InvalidSummary
                     | compact::Error::Model(provider::ModelError::BudgetExceeded),
-                ) => continue,
+                ) => {
+                    tracing::warn!(
+                        attempt = attempts,
+                        through,
+                        "tool compaction draft rejected before projection"
+                    );
+                    continue;
+                }
                 Err(_) => break,
             };
             let available = self.target_available().await;
@@ -307,6 +344,14 @@ impl ToolSession {
             if measured.estimated_input_tokens > lower
                 || provider::prepare_request(config, &projected).is_err()
             {
+                retry_reason = Some("projected_context_budget");
+                tracing::warn!(
+                    attempt = attempts,
+                    through,
+                    projected_tokens = measured.estimated_input_tokens,
+                    low_water_tokens = lower,
+                    "tool compaction draft does not fit the commit budget"
+                );
                 continue;
             }
             let repository = self.repository.clone();
@@ -413,10 +458,25 @@ fn project(
             }
         });
     }
-    let nested:std::collections::HashSet<&str>=frame.events.iter().filter_map(|e|match &e.payload {Payload::ToolCall{call_id,arguments,..} if arguments.get("parentToolCallId").is_some()=>Some(call_id.as_str()),_=>None}).collect();
+    let nested: std::collections::HashSet<&str> = frame
+        .events
+        .iter()
+        .filter_map(|e| match &e.payload {
+            Payload::ToolCall {
+                call_id, arguments, ..
+            } if arguments.get("parentToolCallId").is_some() => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
     let mut calls = vec![];
     for event in frame.events.iter().filter(|e| e.id > after) {
-        if event.payload.call_id().is_some_and(|id|nested.contains(id)){continue;}
+        if event
+            .payload
+            .call_id()
+            .is_some_and(|id| nested.contains(id))
+        {
+            continue;
+        }
         if let Payload::ToolCall {
             call_id,
             tool_name,

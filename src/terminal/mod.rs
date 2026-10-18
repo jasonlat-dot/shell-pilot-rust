@@ -3,6 +3,7 @@ mod host_key;
 mod http;
 mod output;
 mod shared_shell;
+mod sftp_access;
 use crate::{
     error::Error,
     model::{Connection, ConnectionRequest, Credentials},

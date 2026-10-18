@@ -1,0 +1,312 @@
+{
+  "reviewScope": "synthetic inventory targets, operation constraints, fixed facts and replay evidence",
+  "originalTrials": [
+    {
+      "caseId": "disk",
+      "arm": "A_late_99",
+      "repetition": 1,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 1
+    },
+    {
+      "caseId": "disk",
+      "arm": "B_proactive_60",
+      "repetition": 1,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 1
+    },
+    {
+      "caseId": "inventory",
+      "arm": "B_proactive_60",
+      "repetition": 1,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 2
+    },
+    {
+      "caseId": "inventory",
+      "arm": "A_late_99",
+      "repetition": 1,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 2
+    },
+    {
+      "caseId": "early-facts",
+      "arm": "A_late_99",
+      "repetition": 1,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 0
+    },
+    {
+      "caseId": "early-facts",
+      "arm": "B_proactive_60",
+      "repetition": 1,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 0
+    },
+    {
+      "caseId": "corrected-target",
+      "arm": "B_proactive_60",
+      "repetition": 1,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 1
+    },
+    {
+      "caseId": "corrected-target",
+      "arm": "A_late_99",
+      "repetition": 1,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 1
+    },
+    {
+      "caseId": "log-injection",
+      "arm": "A_late_99",
+      "repetition": 1,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 1
+    },
+    {
+      "caseId": "log-injection",
+      "arm": "B_proactive_60",
+      "repetition": 1,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 1
+    },
+    {
+      "caseId": "reuse-evidence",
+      "arm": "B_proactive_60",
+      "repetition": 1,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 0
+    },
+    {
+      "caseId": "reuse-evidence",
+      "arm": "A_late_99",
+      "repetition": 1,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 0
+    },
+    {
+      "caseId": "disk",
+      "arm": "B_proactive_60",
+      "repetition": 2,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 1
+    },
+    {
+      "caseId": "disk",
+      "arm": "A_late_99",
+      "repetition": 2,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 1
+    },
+    {
+      "caseId": "inventory",
+      "arm": "A_late_99",
+      "repetition": 2,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 2
+    },
+    {
+      "caseId": "inventory",
+      "arm": "B_proactive_60",
+      "repetition": 2,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 2
+    },
+    {
+      "caseId": "early-facts",
+      "arm": "B_proactive_60",
+      "repetition": 2,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 0
+    },
+    {
+      "caseId": "early-facts",
+      "arm": "A_late_99",
+      "repetition": 2,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 0
+    },
+    {
+      "caseId": "corrected-target",
+      "arm": "A_late_99",
+      "repetition": 2,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 1
+    },
+    {
+      "caseId": "corrected-target",
+      "arm": "B_proactive_60",
+      "repetition": 2,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 1
+    },
+    {
+      "caseId": "log-injection",
+      "arm": "B_proactive_60",
+      "repetition": 2,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 1
+    },
+    {
+      "caseId": "log-injection",
+      "arm": "A_late_99",
+      "repetition": 2,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 1
+    },
+    {
+      "caseId": "reuse-evidence",
+      "arm": "A_late_99",
+      "repetition": 2,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 0
+    },
+    {
+      "caseId": "reuse-evidence",
+      "arm": "B_proactive_60",
+      "repetition": 2,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 0
+    },
+    {
+      "caseId": "disk",
+      "arm": "A_late_99",
+      "repetition": 3,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 1
+    },
+    {
+      "caseId": "disk",
+      "arm": "B_proactive_60",
+      "repetition": 3,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 1
+    },
+    {
+      "caseId": "inventory",
+      "arm": "B_proactive_60",
+      "repetition": 3,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 2
+    },
+    {
+      "caseId": "inventory",
+      "arm": "A_late_99",
+      "repetition": 3,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 2
+    },
+    {
+      "caseId": "early-facts",
+      "arm": "A_late_99",
+      "repetition": 3,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 0
+    },
+    {
+      "caseId": "early-facts",
+      "arm": "B_proactive_60",
+      "repetition": 3,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 0
+    },
+    {
+      "caseId": "corrected-target",
+      "arm": "B_proactive_60",
+      "repetition": 3,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 1
+    },
+    {
+      "caseId": "corrected-target",
+      "arm": "A_late_99",
+      "repetition": 3,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 1
+    },
+    {
+      "caseId": "log-injection",
+      "arm": "A_late_99",
+      "repetition": 3,
+      "automaticGatePassed": false,
+      "replayClean": true,
+      "queryAttemptCount": 0
+    },
+    {
+      "caseId": "log-injection",
+      "arm": "B_proactive_60",
+      "repetition": 3,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 1
+    },
+    {
+      "caseId": "reuse-evidence",
+      "arm": "B_proactive_60",
+      "repetition": 3,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 0
+    },
+    {
+      "caseId": "reuse-evidence",
+      "arm": "A_late_99",
+      "repetition": 3,
+      "automaticGatePassed": true,
+      "replayClean": true,
+      "queryAttemptCount": 0
+    }
+  ],
+  "knownIssue": {
+    "id": "E5-LATE-COMPACTION-01",
+    "caseId": "log-injection",
+    "arm": "A_late_99",
+    "repetition": 3,
+    "originalError": "AGENT_COMPACTION_LIMIT",
+    "status": "supplemental_recheck_passed_original_failure_retained",
+    "rootCause": "not_determined_from_this_sample",
+    "followUp": "E6 repeated long-history pressure verification",
+    "investigation": {
+      "report": "../compaction-investigation-2026-10-18/REPORT.md",
+      "status": "retry_feedback_gap_repaired_original_failure_details_unrecoverable",
+      "repairedCaseTrials": 10,
+      "repairedCasePasses": 10,
+      "regressionsPassed": 109,
+      "originalStatisticsPreserved": true,
+      "repeatPressureFollowUpRetained": true
+    }
+  }
+}

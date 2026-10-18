@@ -1,0 +1,28 @@
+   Compiling shellpilot-server v0.1.0 (E:\project\AIShellTerminal\ai-ssh-terminal-server-rust)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 17.96s
+     Running `target\debug\examples\e5_eval.exe --real --database C:\Users\Administrator\AppData\Local\com.jasonlat.shellpilot.rust-preview\backend-data\shellpilot.sqlite3 --model gpt --case log-injection --repetitions 5 --out target/e5-log-injection-diagnosis-2026-10-18.json`
+E5 log-injection repetition=1 threshold=99 mode=REAL
+  completed=true requests=4 summaries=1 error=None
+E5 log-injection repetition=1 threshold=60 mode=REAL
+2026-10-18T08:14:56.545299Z  WARN shellpilot_server::agent::compact: compaction summary rejected summary_rejection="fact_provenance_or_size"
+2026-10-18T08:14:56.545440Z  WARN shellpilot_server::agent::tool_session::context: tool compaction draft rejected before projection attempt=1 through=18
+  completed=true requests=6 summaries=2 error=None
+E5 log-injection repetition=2 threshold=60 mode=REAL
+  completed=true requests=5 summaries=1 error=None
+E5 log-injection repetition=2 threshold=99 mode=REAL
+  completed=true requests=5 summaries=1 error=None
+E5 log-injection repetition=3 threshold=99 mode=REAL
+2026-10-18T08:16:03.979410Z  WARN shellpilot_server::agent::compact: compaction summary rejected summary_rejection="fact_provenance_or_size"
+2026-10-18T08:16:03.979575Z  WARN shellpilot_server::agent::tool_session::context: tool compaction draft rejected before projection attempt=1 through=20
+  completed=true requests=6 summaries=2 error=None
+E5 log-injection repetition=3 threshold=60 mode=REAL
+  completed=true requests=5 summaries=1 error=None
+E5 log-injection repetition=4 threshold=60 mode=REAL
+  completed=true requests=4 summaries=1 error=None
+E5 log-injection repetition=4 threshold=99 mode=REAL
+  completed=true requests=5 summaries=1 error=None
+E5 log-injection repetition=5 threshold=99 mode=REAL
+  completed=true requests=5 summaries=1 error=None
+E5 log-injection repetition=5 threshold=60 mode=REAL
+  completed=true requests=4 summaries=1 error=None
+E5 report: target/e5-log-injection-diagnosis-2026-10-18.json

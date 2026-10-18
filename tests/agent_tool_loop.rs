@@ -191,6 +191,40 @@ fn results(loop_: &ToolLoop<'_>) -> Vec<Value> {
         .collect()
 }
 
+#[tokio::test]
+async fn managed_batch_can_cross_budget_before_host_rebuild_but_oversized_requests_are_never_sent() {
+    struct Rebuild { batches: std::sync::atomic::AtomicUsize }
+    impl LoopContext for Rebuild {
+        fn before_model<'a>(&'a self,r:&'a ChatRequest,_:&'a CancellationToken)->BoxFuture<'a,tool_loop::Result<ChatRequest>> {
+            Box::pin(async move {
+                if self.batches.load(std::sync::atomic::Ordering::SeqCst)>0 {
+                    Ok(ChatRequest{messages:vec![ChatMessage::User{content:"Host checkpoint: inspect completed once; report the result.".into()}],tools:r.tools.clone()})
+                }else{Ok(r.clone())}
+            })
+        }
+        fn begin_batch<'a>(&'a self,_:&'a[ToolCall],_:Option<&'a str>,_:&'a CancellationToken)->BoxFuture<'a,tool_loop::Result<()>> {
+            Box::pin(async move{self.batches.fetch_add(1,std::sync::atomic::Ordering::SeqCst);Ok(())})
+        }
+        fn started(&self,_:&str)->tool_loop::Result<()>{Ok(())}
+        fn result<'a>(&'a self,_:&'a str,_:&'a str)->BoxFuture<'a,tool_loop::Result<()>>{Box::pin(async{Ok(())})}
+    }
+    let mut first=calls(vec![call("near-full",args().to_string())]);
+    first["choices"][0]["message"]["content"]=json!("x".repeat(6000));
+    let model=Model::new(vec![first,final_reply()],|c|c.context_window=2048).await;
+    let registry=registry();
+    let host=Host::new(Behavior::Success(json!({"value":1})));
+    let context=Rebuild{batches:Default::default()};
+    let store=Arc::new(Store::in_memory().unwrap());
+    let session=shellpilot_server::agent::Repository::new(store.clone())
+        .create_general_session_with_policy("model","test",Some(shellpilot_server::agent::approvals::Policy::FullAccess)).unwrap();
+    let mut loop_=ToolLoop::new(&registry,input(),Limits::default()).unwrap().with_context(&context)
+        .with_approval_boundary(ApprovalBoundary::new(shellpilot_server::agent::approvals::Approvals::new(store),session.id,"test".into()));
+    loop_.run(&model.client,&host,&CancellationToken::new()).await.unwrap();
+    assert_eq!(host.ids.lock().unwrap().as_slice(),["near-full"]);
+    assert_eq!(model.requests().len(),2);
+    assert!(model.requests()[1]["messages"][0]["content"].as_str().unwrap().starts_with("Host checkpoint"));
+}
+
 struct ConcurrentHost {
     active: std::sync::atomic::AtomicUsize,
     peak: std::sync::atomic::AtomicUsize,
