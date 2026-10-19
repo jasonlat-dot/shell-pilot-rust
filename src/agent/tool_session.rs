@@ -138,7 +138,7 @@ pub struct ToolSession {
 async fn worker<T: Send + 'static>(
     action: impl FnOnce() -> tool_loop::Result<T> + Send + 'static,
 ) -> tool_loop::Result<T> {
-    tokio::task::spawn_blocking(action)
+    crate::diagnostics::spawn_blocking(action)
         .await
         .map_err(|_| tool_loop::Error::Context)?
 }
@@ -913,7 +913,7 @@ impl ToolSession {
     async fn read(&self, args: Value) -> ToolOutcome {
         let repository = self.repository.clone();
         let binding = self.binding.clone();
-        let read=tokio::task::spawn_blocking(move||->super::Result<Value>{
+        let read=crate::diagnostics::spawn_blocking(move||->super::Result<Value>{
             let output_id=args["outputId"].as_str().ok_or(Error::OutputUnavailable)?;
             let offset=args["offset"].as_u64().ok_or(Error::OutputUnavailable)?;
             let limit=args["limit"].as_u64().filter(|n|(1..=OUTPUT_PAGE_BYTES).contains(n)).ok_or(Error::OutputUnavailable)? as usize;

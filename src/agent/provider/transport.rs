@@ -13,6 +13,7 @@ pub struct ModelClient {
     pub(super) adapter: &'static dyn super::adapter::ProviderAdapter,
 }
 pub(super) fn network(error: reqwest::Error) -> ModelError {
+    crate::diagnostics::event(crate::diagnostics::Level::Error,"model.transport_error",serde_json::json!({"timeout":error.is_timeout(),"connect":error.is_connect(),"body":error.is_body(),"decode":error.is_decode()}));
     if error.is_timeout() {
         ModelError::Timeout
     } else {
@@ -57,7 +58,10 @@ impl ModelClient {
     }
 
     /// Non-streaming request through the selected wire strategy.
-    pub async fn complete(
+    pub async fn complete(&self, request: &ChatRequest, cancel: &CancellationToken) -> Result<Completion> {
+        super::diagnostics::observe(&self.config,request,"complete",self.complete_inner(request,cancel)).await
+    }
+    async fn complete_inner(
         &self,
         request: &ChatRequest,
         cancel: &CancellationToken,
@@ -78,9 +82,9 @@ impl ModelClient {
                 .headers(self.headers.clone())
                 .body(prepared.body);
             let mut response = request.send().await.map_err(network)?;
+            super::diagnostics::response(&response);
             if !response.status().is_success() {
-                // Do not return provider error bodies: providers may echo secrets or prompts.
-                return Err(ModelError::Http(response.status().as_u16()));
+                return Err(super::diagnostics::http_error(response).await);
             }
             if response
                 .content_length()

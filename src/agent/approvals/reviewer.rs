@@ -76,7 +76,7 @@ pub(crate) async fn review_tool_action(
     cancel: &CancellationToken,
 ) -> Option<Review> {
     let mut runtime =
-        tokio::task::spawn_blocking(move || ModelRepository::new(store).runtime(&agent, &user))
+        crate::diagnostics::spawn_blocking(move || ModelRepository::new(store).runtime(&agent, &user))
             .await
             .ok()?
             .ok()?;
@@ -141,6 +141,7 @@ impl Approvals {
             target: serde_json::to_value(&candidate.input.context.binding.identity)?,
             recent_user_messages: candidate.user_messages.clone(),
         };
+        crate::diagnostics::event(crate::diagnostics::Level::Info,"approval.auto_review_started",serde_json::json!({"approvalId":ticket.id}));
         let review_cancel = cancel.child_token();
         let _cancel_review = review_cancel.clone().drop_guard();
         let changed_policy = async {
@@ -176,6 +177,7 @@ impl Approvals {
         if cancel.is_cancelled() {
             return Err(Error::Denied);
         }
+        crate::diagnostics::event(crate::diagnostics::Level::Info,"approval.auto_review_result",serde_json::json!({"approvalId":ticket.id,"decision":verdict.decision,"risk":verdict.risk}));
         match self
             .commit_review(
                 ticket,

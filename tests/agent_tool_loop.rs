@@ -667,3 +667,19 @@ async fn legacy_tool_capability_is_enabled_and_responses_stay_unsupported() {
         assert!(host.ids.lock().unwrap().is_empty());
     }
 }
+
+#[tokio::test]
+async fn diagnostic_trace_covers_tools_and_model_followup_without_raw_arguments() {
+    use shellpilot_server::diagnostics::{Diagnostics,Level};
+    let model=Model::new(vec![calls(vec![call("trace-call",args().to_string())]),final_reply()],|_|{}).await;
+    let logs=tempfile::tempdir().unwrap();let sink=Arc::new(Diagnostics::default());sink.configure(logs.path().into(),Level::Debug).unwrap();
+    let trace=sink.trace("tool-trace","chat","model");let r=registry();let host=Host::new(Behavior::Success(json!({"exitCode":0,"status":"healthy"})));
+    let mut loop_=ToolLoop::new(&r,input(),Limits::default()).unwrap();
+    trace.scope(loop_.run(&model.client,&host,&CancellationToken::new())).await.unwrap();
+    let path=logs.path().join(chrono::Local::now().format("%Y-%m-%d").to_string()).join("tool-trace.jsonl");
+    let raw=std::fs::read_to_string(path).unwrap();let rows:Vec<Value>=raw.lines().map(|line|serde_json::from_str(line).unwrap()).collect();
+    for name in ["tool.proposed","tool.authorization_started","tool.execution_started","tool.execution_finished","tool.result_recorded"] {assert!(rows.iter().any(|row|row["event"]==name),"missing {name}");}
+    assert_eq!(rows.iter().filter(|row|row["event"]=="model.request_started").count(),2);
+    assert!(rows.iter().all(|row|row["traceId"]=="tool-trace"));
+    assert!(rows.iter().any(|row|row["event"]=="tool.execution_finished"&&row["fields"]["exitCode"]==0));
+}

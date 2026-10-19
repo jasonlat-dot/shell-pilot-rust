@@ -273,14 +273,11 @@ impl ModelClient {
                 .header(header::ACCEPT, "application/json")
                 .body(bytes);
             let mut response = request.send().await.map_err(network)?;
+            super::diagnostics::response(&response);
             if !response.status().is_success() {
-                return Err(
-                    if !suffix.is_empty() && matches!(response.status().as_u16(), 404 | 405 | 501) {
-                        ModelError::RemoteUnsupported
-                    } else {
-                        ModelError::Http(response.status().as_u16())
-                    },
-                );
+                let unsupported = !suffix.is_empty() && matches!(response.status().as_u16(),404|405|501);
+                let error = super::diagnostics::http_error(response).await;
+                return Err(if unsupported { ModelError::RemoteUnsupported } else { error });
             }
             if response
                 .content_length()
@@ -402,7 +399,12 @@ impl ModelClient {
         self.stream_prepared_responses(prepared, cancel, on_text)
             .await
     }
-    pub(crate) async fn stream_with_responses<F, Fut>(
+    pub(crate) async fn stream_with_responses<F,Fut>(&self, request: &ChatRequest, prepared: Option<PreparedResponses>, cancel: &CancellationToken, on_text: F) -> Result<Completion>
+    where F: FnMut(String)->Fut, Fut: Future<Output=Result<()>> {
+        if prepared.is_none() {return self.stream(request,cancel,on_text).await;}
+        super::diagnostics::observe(&self.config,request,"responses_stream",self.stream_with_responses_inner(request,prepared,cancel,on_text)).await
+    }
+    async fn stream_with_responses_inner<F, Fut>(
         &self,
         request: &ChatRequest,
         prepared: Option<PreparedResponses>,
@@ -446,8 +448,9 @@ impl ModelClient {
                 .header(header::ACCEPT, "text/event-stream")
                 .json(&prepared.body);
             let mut response = request.send().await.map_err(network)?;
+            super::diagnostics::response(&response);
             if !response.status().is_success() {
-                return Err(ModelError::Http(response.status().as_u16()));
+                return Err(super::diagnostics::http_error(response).await);
             }
             if !response
                 .headers()

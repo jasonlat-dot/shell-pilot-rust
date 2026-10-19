@@ -397,6 +397,7 @@ impl<'a> ToolLoop<'a> {
             }
             self.boundary(client)?;
             self.model_rounds += 1;
+            crate::diagnostics::event(crate::diagnostics::Level::Debug,"agent.model_round",json!({"round":self.model_rounds,"toolCalls":self.tool_calls}));
             let reply =
                 if let Some(context) = self.context.filter(|context| context.streams_replies()) {
                     client
@@ -575,7 +576,10 @@ impl<'a> ToolLoop<'a> {
         cancel: &'b CancellationToken,
     ) -> BoxFuture<'b, Result<(String, bool)>> {
         Box::pin(async move {
+            use crate::diagnostics::{event,Level};
+            event(Level::Info,"tool.proposed",json!({"callId":raw.id,"toolName":raw.function.name,"argumentBytes":raw.function.arguments.len()}));
             let Some(call) = call else {
+                event(Level::Warn,"tool.rejected",json!({"callId":raw.id,"reason":"invalid_arguments"}));
                 let content = failure("invalid_arguments").to_string();
                 if let Some(context) = self.context {
                     context.result(&raw.id, &content).await?;
@@ -585,6 +589,7 @@ impl<'a> ToolLoop<'a> {
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
             }
+            event(Level::Info,"tool.authorization_started",json!({"callId":raw.id,"toolName":raw.function.name}));
             let authorized = tokio::select! {biased;
                 _=cancel.cancelled()=>return Err(Error::Cancelled),
                 result=async {match &self.approval_boundary {
@@ -594,6 +599,7 @@ impl<'a> ToolLoop<'a> {
                 }}=>result,
             };
             if !authorized {
+                event(Level::Warn,"tool.denied",json!({"callId":raw.id,"toolName":raw.function.name}));
                 let content = failure("denied").to_string();
                 if let Some(context) = self.context {
                     context.result(call.id(), &content).await?;
@@ -606,6 +612,8 @@ impl<'a> ToolLoop<'a> {
             if let Some(context) = self.context {
                 context.started(call.id())?;
             }
+            let started = std::time::Instant::now();
+            event(Level::Info,"tool.execution_started",json!({"callId":raw.id,"toolName":raw.function.name}));
             let child = cancel.child_token();
             let _guard = child.clone().drop_guard();
             let outcome = tokio::select! {biased;
@@ -625,6 +633,7 @@ impl<'a> ToolLoop<'a> {
                 ToolOutcome::Denied => (failure("denied"), false),
                 ToolOutcome::OutcomeUnknown => (failure("result_unknown"), true),
             };
+            event(if unknown || value["ok"]==false {Level::Warn}else{Level::Info},"tool.execution_finished",json!({"callId":raw.id,"toolName":raw.function.name,"durationMs":started.elapsed().as_millis(),"ok":value["ok"],"unknown":unknown,"exitCode":value["data"]["exitCode"],"outputTruncated":value["data"]["outputTruncated"],"errorCode":value["error"]}));
             let mut content = value.to_string();
             if content.len() > self.limits.result_bytes {
                 content = failure("output_too_large").to_string();
@@ -632,6 +641,7 @@ impl<'a> ToolLoop<'a> {
             if let Some(context) = self.context {
                 context.result(call.id(), &content).await?;
             }
+            event(Level::Info,"tool.result_recorded",json!({"callId":raw.id,"resultBytes":content.len(),"unknown":unknown}));
             Ok((content, unknown))
         })
     }

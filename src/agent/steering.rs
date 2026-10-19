@@ -93,6 +93,8 @@ pub(crate) fn accept(
     tx.execute("UPDATE agent_execution_requests SET state='cancelled',updated_at=?3 WHERE session_id=?1 AND state IN ('pending','approved') AND call_id IN (SELECT call_id FROM agent_events WHERE session_id=?1 AND id>(SELECT user_event_id FROM agent_chat_turns WHERE session_id=?1 AND request_id=?2) AND kind='tool_call')",params![session,request,now]).map_err(storage)?;
     tx.execute("UPDATE agent_execution_grants SET revoked=1 WHERE session_id=?1 AND task_id=(SELECT task_id FROM agent_chat_turns WHERE session_id=?1 AND request_id=?2)",params![session,request]).map_err(storage)?;
     tx.commit().map_err(storage)?;
+    drop(db);
+    repo.store.diagnostics.trace(request,session,agent).event(crate::diagnostics::Level::Info,"request.input_steered",serde_json::json!({"inputId":id,"messageBytes":message.len()}));
     Ok(Input {
         id: id.into(),
         message: message.into(),

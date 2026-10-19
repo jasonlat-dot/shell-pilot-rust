@@ -274,7 +274,7 @@ impl Approvals {
         f: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
     ) -> Result<T> {
         let store = self.store.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::diagnostics::spawn_blocking(move || {
             let mut db = store.database.lock().map_err(|_| Error::Storage)?;
             f(&mut db)
         })
@@ -350,7 +350,26 @@ impl Approvals {
         result
     }
     /// Only a trusted human-facing host may call this; the model registry never exposes it.
+    async fn log_action(&self, id: &str, user: &str, action: &str, future: impl std::future::Future<Output=Result<()>>) -> Result<()> {
+        use crate::diagnostics::{event,Level};
+        let trace = if let Some(trace)=crate::diagnostics::current() { Some(trace) } else {
+            let id=id.to_owned();let user=user.to_owned();
+            self.db(move|db|Ok(row(db,&id,&user)?.receipt())).await.ok().and_then(|receipt|
+                super::Repository::new(self.store.clone()).diagnostic_trace(&receipt.binding.session_id,&receipt.binding.user_id,&receipt.call_id))
+        };
+        let operation = async {
+            event(Level::Info,"approval.decision_requested",serde_json::json!({"approvalId":id,"action":action}));
+            let result = future.await;
+            event(if result.is_ok(){Level::Info}else{Level::Warn},"approval.decision_recorded",serde_json::json!({"approvalId":id,"action":action,"accepted":result.is_ok()}));
+            result
+        };
+        match trace {Some(trace)=>trace.scope(operation).await,None=>operation.await}
+    }
     pub async fn decide(&self, id: String, user: String, decision: Decision) -> Result<()> {
+        let action = match decision {Decision::Deny=>"deny",Decision::ApproveOnce=>"approveOnce",Decision::ApproveTaskCommand{..}=>"approveTaskCommand"};
+        self.log_action(&id,&user,action,self.decide_inner(id.clone(),user.clone(),decision)).await
+    }
+    async fn decide_inner(&self, id: String, user: String, decision: Decision) -> Result<()> {
         let result=self.db(move|db|{
    let tx=db.transaction()?;let old=row(&tx,&id,&user)?;
    if old.state!=State::Pending{return Err(Error::Conflict);}
@@ -370,6 +389,9 @@ impl Approvals {
         result
     }
     pub async fn revoke_grant(&self, id: String, user: String) -> Result<()> {
+        self.log_action(&id,&user,"revoke",self.revoke_grant_inner(id.clone(),user.clone())).await
+    }
+    async fn revoke_grant_inner(&self, id: String, user: String) -> Result<()> {
         let result = self
             .db(move |db| {
                 let tx = db.transaction()?;
@@ -387,6 +409,9 @@ impl Approvals {
     }
     /// Withdraw an outstanding request, including after restart. Does not terminate remote processes.
     pub async fn cancel_pending(&self, id: String, user: String) -> Result<()> {
+        self.log_action(&id,&user,"cancel",self.cancel_pending_inner(id.clone(),user.clone())).await
+    }
+    async fn cancel_pending_inner(&self, id: String, user: String) -> Result<()> {
         let result=self.db(move|db|{
             let tx=db.transaction()?;let r=row(&tx,&id,&user)?;
             if !matches!(r.state,State::Pending|State::Approved){return Err(Error::Conflict);}
@@ -452,6 +477,8 @@ impl Approvals {
   }).await
     }
     pub(crate) async fn wait(&self, ticket: &Ticket, cancel: &CancellationToken) -> Result<()> {
+        crate::diagnostics::event(crate::diagnostics::Level::Info,"approval.wait_started",serde_json::json!({"approvalId":ticket.id}));
+        let mut last_state = None;
         loop {
             let notified = self.changed.notified();
             let id = ticket.id.clone();
@@ -465,6 +492,10 @@ impl Approvals {
             // The reviewer itself retires stale decisions when the mode changes.
             self.review_pending(ticket, cancel).await?;
             let receipt = self.receipt(ticket.id.clone(), ticket.user.clone()).await?;
+            if last_state.as_ref()!=Some(&receipt.state) {
+                crate::diagnostics::event(crate::diagnostics::Level::Info,"approval.state_changed",serde_json::json!({"approvalId":ticket.id,"state":receipt.state}));
+                last_state=Some(receipt.state.clone());
+            }
             match receipt.state {
                 State::Approved => return Ok(()),
                 State::Pending => {}

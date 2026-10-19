@@ -312,7 +312,7 @@ impl Drop for Running<'_> {
 async fn worker<T: Send + 'static>(
     action: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
-    tokio::task::spawn_blocking(action)
+    crate::diagnostics::spawn_blocking(action)
         .await
         .map_err(|_| Error::Storage)?
 }
@@ -747,6 +747,12 @@ impl Manager {
             Ok(())
         })
         .await?;
+        // Resolve the active exact request before the independent stop IPC changes state.
+        if let Some(active)=self.active.lock().unwrap().get(&(user.clone(),session.clone())) {
+            if request.as_ref().is_none_or(|id| id==&active.request) {
+                self.store.diagnostics.trace(&active.request,&session,&agent).event(crate::diagnostics::Level::Warn,"request.stop_requested",serde_json::json!({"source":"user"}));
+            }
+        }
         // Preparing work has no turn row yet. Cancel its exact token before waiting on SQLite.
         let preparing = {
             let active = self.active.lock().unwrap();
@@ -777,6 +783,13 @@ impl Manager {
         }
     }
     pub async fn chat<F, Fut>(
+        &self, request: Request, target: Option<Target>, cancel: &CancellationToken, send: F,
+    ) -> Result<()> where F: FnMut(StreamEvent) -> Fut, Fut: Future<Output=Result<()>> {
+        let trace = self.store.diagnostics.trace(&request.request_id,&request.session_id,&request.agent_id);
+        let fields = serde_json::json!({"messageBytes":request.message.len(),"attachmentCount":request.attachments.len(),"entry":"text"});
+        trace.request(fields,self.chat_inner(request,target,cancel,send)).await
+    }
+    async fn chat_inner<F, Fut>(
         &self,
         request: Request,
         target: Option<Target>,
@@ -1068,6 +1081,13 @@ impl Manager {
         }
     }
 }
+
+impl crate::diagnostics::Failure for Error {
+    fn diagnostic_code(&self) -> &str { self.code() }
+    fn upstream_status(&self) -> Option<u16> { match self { Self::Model(ModelError::Http(status)) => Some(*status), _ => None } }
+    fn cancelled(&self) -> bool { matches!(self.code(), "AGENT_CANCELLED"|"AGENT_INTERRUPTED"|"BACKEND_UNAVAILABLE") }
+}
+
 
 #[cfg(test)]
 mod lifecycle_tests {

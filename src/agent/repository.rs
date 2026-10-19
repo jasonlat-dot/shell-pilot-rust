@@ -437,3 +437,17 @@ pub(super) fn next_revision(revision: u64) -> Result<u64> {
         .filter(|value| *value <= i64::MAX as u64)
         .ok_or(Error::Conflict)
 }
+
+impl Repository {
+    /// Resolve an out-of-band human decision to the turn that authored the call.
+    pub(crate) fn diagnostic_trace(&self, session: &str, user: &str, call: &str) -> Option<crate::diagnostics::Trace> {
+        let found = self.db(|db| {
+            let found = db.query_row(
+                "SELECT t.request_id,s.agent_id FROM agent_events e JOIN agent_sessions s ON s.id=e.session_id JOIN agent_chat_turns t ON t.session_id=e.session_id AND t.user_event_id<=e.id WHERE e.session_id=?1 AND s.user_id=?2 AND e.call_id=?3 AND e.kind='tool_call' ORDER BY t.user_event_id DESC LIMIT 1",
+                params![session,user,call], |r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)),
+            ).optional()?;
+            Ok(found)
+        }).ok().flatten()?;
+        Some(self.store.diagnostics.trace(&found.0,session,&found.1))
+    }
+}

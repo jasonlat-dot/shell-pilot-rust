@@ -73,7 +73,7 @@ pub fn decide(store: &Store, user: &str, session: &str, id: &str, allow: bool) -
     let tx = db.transaction()?;
     let current =
         super::super::repository::read_session(&tx, session, user).map_err(|_| Error::Changed)?;
-    let(task,revision,expires,state):(String,u64,i64,String)=tx.query_row("SELECT task_json,policy_revision,expires_at,state FROM agent_extension_approvals WHERE id=?1 AND session_id=?2 AND user_id=?3",params![id,session,user],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?.ok_or(Error::Unavailable)?;
+    let(task,revision,expires,state,call):(String,u64,i64,String,String)=tx.query_row("SELECT task_json,policy_revision,expires_at,state,call_id FROM agent_extension_approvals WHERE id=?1 AND session_id=?2 AND user_id=?3",params![id,session,user],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?.ok_or(Error::Unavailable)?;
     let policy: u64 = tx
         .query_row(
             "SELECT revision FROM agent_execution_policies WHERE session_id=?1",
@@ -101,6 +101,9 @@ pub fn decide(store: &Store, user: &str, session: &str, id: &str, allow: bool) -
         params![id, if allow { "approved" } else { "denied" }],
     )?;
     tx.commit()?;
+    let metadata = db.query_row("SELECT t.request_id,s.agent_id FROM agent_events e JOIN agent_sessions s ON s.id=e.session_id JOIN agent_chat_turns t ON t.session_id=e.session_id AND t.user_event_id<=e.id WHERE e.session_id=?1 AND s.user_id=?2 AND e.call_id=?3 AND e.kind='tool_call' ORDER BY t.user_event_id DESC LIMIT 1",params![session,user,call],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional().ok().flatten();
+    drop(db);
+    if let Some((request,agent))=metadata {store.diagnostics.trace(&request,session,&agent).event(if allow{crate::diagnostics::Level::Info}else{crate::diagnostics::Level::Warn},"approval.mcp_decision",json!({"approvalId":id,"callId":call,"allowed":allow}));}
     Ok(())
 }
 impl Runtime {
@@ -135,6 +138,7 @@ impl Runtime {
             // A repeated call ID is never a new permission, including after crash/restart.
             db.execute("INSERT INTO agent_extension_approvals(id,session_id,user_id,call_id,task_json,tool_name,arguments_json,destination,config_revision,policy_revision,state,created_at,expires_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'pending',?11,?12)",params![id,self.session,self.user,call.id(),serde_json::to_string(&self.task).map_err(|_|Error::Storage)?,call.name(),arguments.to_string(),destination,self.settings.revision,revision,now(),now()+300000])?;
         }
+        crate::diagnostics::event(crate::diagnostics::Level::Info,"approval.mcp_created",json!({"approvalId":id,"callId":call.id(),"toolName":call.name(),"policy":mode}));
         let _pending = PendingApproval {
             store: &self.store,
             id: &id,
@@ -173,11 +177,14 @@ impl Runtime {
             None
         };
         if let Some(review) = verdict {
+            crate::diagnostics::event(crate::diagnostics::Level::Info,"approval.mcp_review_result",json!({"approvalId":id,"callId":call.id(),"decision":review["decision"],"risk":review["risk"]}));
             let db = self.store.database.lock().map_err(|_| Error::Storage)?;
             db.execute("UPDATE agent_extension_approvals SET review_json=?2,state=?3 WHERE id=?1 AND state='pending'",params![id,review.to_string(),if review["decision"]=="allow"{"approved"}else{"pending"}])?;
         }
+        let mut previous = String::new();
         loop {
             let state = self.try_admit(&id, revision, cancel)?;
+            if state!=previous {crate::diagnostics::event(crate::diagnostics::Level::Info,"approval.mcp_state",json!({"approvalId":id,"callId":call.id(),"state":state}));previous=state.clone();}
             match state.as_str() {
                 "admitted" => return Ok(id.clone()),
                 "pending" => {}

@@ -73,6 +73,15 @@ impl Reporter {
         (Self(Some(tx), Some(observation)), rx)
     }
     pub fn emit(&self, update: Update) {
+        use crate::diagnostics::{event,Level};
+        match &update {
+            Update::Measured(usage)=>event(Level::Debug,"context.measured",serde_json::json!({"inputTokens":usage.input_tokens})),
+            Update::Started(method)=>event(Level::Info,"context.compaction_started",serde_json::json!({"method":method})),
+            Update::ToolStarted(checkpoint)=>event(Level::Info,"context.tool_compaction_started",serde_json::json!({"checkpointId":checkpoint})),
+            Update::Committed(checkpoint)=>event(Level::Info,"context.compaction_committed",serde_json::json!({"checkpointId":checkpoint})),
+            Update::Failed{code,fallback}=>event(Level::Warn,"context.compaction_failed",serde_json::json!({"errorCode":code,"fallback":fallback})),
+            Update::Finished(code)=>event(Level::Debug,"context.finished",serde_json::json!({"errorCode":code})),
+        }
         // Called immediately after the guarded checkpoint transaction, in its blocking worker.
         // Persist success before waiting for a UI ACK; cancellation or a closed subscriber must
         // not turn an actually committed checkpoint into a cancelled compaction record.

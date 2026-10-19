@@ -681,3 +681,29 @@ async fn native_withdrawal_and_expired_grants_require_new_approval() {
     assert_eq!(b.execs(), 0);
     b.terminals.shutdown().await;
 }
+
+#[tokio::test]
+async fn diagnostic_trace_links_out_of_band_human_decision_to_original_turn() {
+    use shellpilot_server::diagnostics::Level;
+    let b=Bound::new(Spec::default()).await;
+    let logs=tempfile::tempdir().unwrap();b.store.diagnostics.configure(logs.path().into(),Level::Debug).unwrap();
+    let session=b.repo.session(&b.session.id,"default").unwrap();
+    let event=b.repo.append(&session.id,"default",session.revision,"trace-user",Payload::UserMessage{text:"diagnostic only".into()}).unwrap();
+    let session=b.repo.session(&b.session.id,"default").unwrap();
+    let trace_id="approval-trace";
+    let db=rusqlite::Connection::open(&b.path).unwrap();
+    db.execute("INSERT INTO agent_chat_turns(session_id,request_id,input_json,owner,state,user_event_id,revision,lease_until,created_at,updated_at) VALUES(?1,?2,'{}','test','running',?3,?4,?5,?5,?5)",rusqlite::params![session.id,trace_id,event.event.id,session.revision,chrono::Utc::now().timestamp_millis()]).unwrap();
+    b.repo.append(&session.id,"default",session.revision,"trace-tool-event",Payload::ToolCall{call_id:"trace-approval-call".into(),tool_name:"ssh_execute".into(),arguments:serde_json::json!({})}).unwrap();
+    let trace=b.store.diagnostics.trace(trace_id,&b.session.id,"model");let executor=b.executor().await;
+    let job=tokio::spawn(async move{trace.scope(executor.execute_command("trace-approval-call",&command("__exec_unicode__"),&CancellationToken::new())).await});
+    let pending=b.pending("trace-approval-call").await;
+    // This independent future has no inherited task-local Trace.
+    b.decide(&pending,Decision::ApproveOnce).await;
+    job.await.unwrap().unwrap();
+    let path=logs.path().join(chrono::Local::now().format("%Y-%m-%d").to_string()).join(format!("{trace_id}.jsonl"));
+    let raw=std::fs::read_to_string(path).unwrap();let rows:Vec<serde_json::Value>=raw.lines().map(|line|serde_json::from_str(line).unwrap()).collect();
+    assert!(rows.iter().all(|row|row["traceId"]==trace_id));
+    assert!(rows.iter().any(|row|row["event"]=="approval.decision_recorded"&&row["fields"]["approvalId"]==pending.id&&row["fields"]["accepted"]==true));
+    assert!(!raw.contains("__exec_unicode__"));assert_eq!(b.execs(),1);
+    b.terminals.shutdown().await;
+}

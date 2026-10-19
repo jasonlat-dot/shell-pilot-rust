@@ -469,7 +469,7 @@ fn summary_error(error: super::Error) -> Error {
     }
 }
 async fn worker<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
-    tokio::task::spawn_blocking(f)
+    crate::diagnostics::spawn_blocking(f)
         .await
         .map_err(|_| Error::Storage)?
 }

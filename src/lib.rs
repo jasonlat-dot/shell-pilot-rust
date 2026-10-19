@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod diagnostics;
 pub mod error;
 pub mod files;
 mod http;

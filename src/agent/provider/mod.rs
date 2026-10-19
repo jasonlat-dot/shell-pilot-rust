@@ -3,6 +3,7 @@ mod adapter;
 mod anthropic;
 mod config;
 mod dispatch;
+mod diagnostics;
 mod protocol;
 mod repository;
 pub mod responses;

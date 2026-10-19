@@ -13,6 +13,7 @@ use std::{
 pub struct Store {
     pub(crate) database: Mutex<Database>,
     pub(crate) data_directory: Option<PathBuf>,
+    pub diagnostics: std::sync::Arc<crate::diagnostics::Diagnostics>,
 }
 
 impl Store {
@@ -26,6 +27,7 @@ impl Store {
                 .filter(|p| !p.as_os_str().is_empty())
                 .unwrap_or(Path::new(".")),
         )?);
+        store.diagnostics.configure(store.data_directory.as_ref().unwrap().join("logs/agent"), crate::diagnostics::Level::Info)?;
         Ok(store)
     }
 
@@ -61,6 +63,7 @@ impl Store {
         Ok(Self {
             database: Mutex::new(database),
             data_directory: None,
+            diagnostics: std::sync::Arc::new(crate::diagnostics::Diagnostics::default()),
         })
     }
 

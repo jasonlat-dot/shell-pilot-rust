@@ -241,6 +241,13 @@ impl Manager {
         }).await
     }
     pub async fn chat_desktop<F, Fut>(
+        &self, request: Request, target: Option<Target>, execution_enabled: bool, cancel: &CancellationToken, send: F,
+    ) -> Result<()> where F: FnMut(StreamEvent) -> Fut, Fut: Future<Output=Result<()>> {
+        let trace = self.store.diagnostics.trace(&request.request_id,&request.session_id,&request.agent_id);
+        let fields = json!({"messageBytes":request.message.len(),"attachmentCount":request.attachments.len(),"entry":"desktop","executionEnabled":execution_enabled});
+        trace.request(fields,self.chat_desktop_inner(request,target,execution_enabled,cancel,send)).await
+    }
+    async fn chat_desktop_inner<F, Fut>(
         &self,
         request: Request,
         target: Option<Target>,

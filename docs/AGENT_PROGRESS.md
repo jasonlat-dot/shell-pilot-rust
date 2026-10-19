@@ -1,5 +1,14 @@
 # Rust SSH Agent 实施清单与续接入口
 
+### 请求全链路本地诊断日志（2026-10-19）
+
+- [x] Rust main：新增 `src/diagnostics.rs` 统一结构化日志与 task-local Trace，复用 requestId，按本地年月日 / traceId.jsonl 追加落盘。默认 INFO；支持 DEBUG / INFO / WARN / ERROR 原子级别切换。请求开始、正常完成、失败、取消和 future 中断分别记录，不把取消记成成功；并发请求隔离，统一阻塞任务入口传播 Trace。
+- [x] `src/agent/chat.rs`、`chat/execution.rs`、`tool_loop.rs`、`approvals.rs`、`approvals/reviewer.rs`、`extensions/approval.rs`、`context_status.rs`、`compact.rs`、`compact/auto.rs`、`steering.rs` 接入发送、引导输入、模型轮次、自动/人工审批、工具执行/结果入库、上下文整理及请求结束。独立人工审批通过 `repository.rs` 的工具事件 / user_event_id 找回原请求 Trace，覆盖异步 IPC 决策；不逐 token 或逐轮询刷日志。
+- [x] `src/agent/provider/diagnostics.rs` 统一模型计时、用量、结构与 modelCallId；`transport.rs`、`dispatch.rs`、`responses.rs` 在读取上游错误正文前保留 HTTP 状态与安全供应商请求 ID，随后仅保存限定错误类型/代码及分类。DEBUG 不保存原始消息、提示词、思考、命令参数、输出或密钥；原始聊天证据仍由既有会话历史查询。本项补齐后续排查信息，未声称已复现/修复此前 DeepSeek 报错根因。
+- [x] 前端 master：`src-tauri/src/embedded_backend.rs` 持久化日志级别并实时更新运行实例；`backend_ipc.rs` 从桌面请求预检开始包裹同一 Trace。`src/components/RustBackendSettingsDialog.tsx` / `WorkspaceSettings.css` 在“本地工作区”新增诊断日志级别及目录入口；修改级别自动保存，不重启 SSH，不覆盖其他未保存草稿。`src/App.tsx` 失败 Toast 附带 Trace ID。`src-tauri/capabilities/default.json` 仅为专用日志目录增加打开权限。
+- [x] 定向集成测试通过 **3 项**：`tests/agent_chat.rs` 模拟 HTTP 400 保留状态与分类、不泄露原文；`tests/agent_tool_loop.rs` 工具执行和后续模型调用共用 Trace；`tests/agent_approvals.rs` 独立人工批准回连原 Trace。均使用本地模拟服务/测试 SSH，无真实模型 API 或用户服务器请求。前端 `tests/diagnostic-settings-ui.test.mjs` **4 项通过**，覆盖即时保存/失败恢复/目录操作/权限；TypeScript、Vite 资源构建及 Rust library Clippy (`-D warnings`) 通过。核心日志单测此前 **3 项通过**；原生库类型检查此前通过。按用户最新要求仅更新文档并提供 commit note，停止尚未完成的核心单测重复复核和桌面配置定向单测编译，不计为通过；未影响用户开发进程。
+- [x] 新增 `docs/REQUEST_DIAGNOSTICS.md`，同步客户端 `docs/operation-feedback.md` / `docs/agent-model-settings.md`。桌面日志位于应用本地目录 `logs/agent/YYYY-MM-DD/<traceId>.jsonl`，独立服务位于数据库目录下的同名子目录；跨午夜 Trace ID 不变。不自动上传或清理。未全量回归、未实际视觉验收、未提交推送或打包；保留已有改动（含非本项的图标文件）。新 Rust 代码首次使用需重新启动开发应用，此后仅切换级别即时生效。
+
 ### DeepSeek 最新服务器对话失败排查（2026-10-19，仅定位阶段，未修复）
 
 - [x] 只读核对本地会话 `e83f53f1-a10e-4446-acd1-66c06480b4c0`：项目“凯平哥”、模型 `deepseek-flash`、Chat Completions。北京时间 17:10:47 开始，17:11:03 失败，保存错误为 `MODEL_HTTP_ERROR`；`ssh_execute` 已完成且退出码为 0，工具结果事件先于失败事件，失败发生于工具结果返回后的模型继续请求。

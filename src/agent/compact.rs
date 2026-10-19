@@ -180,7 +180,7 @@ impl Summarizer {
         let session = session.to_owned();
         let user = user.to_owned();
         let preparing =
-            tokio::task::spawn_blocking(move || prepare(store, &session, &user, prefix.as_ref()));
+            crate::diagnostics::spawn_blocking(move || prepare(store, &session, &user, prefix.as_ref()));
         let (snapshot, through, evidence, required, inherited, runtime, request, limit) = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(ModelError::Cancelled.into()),
@@ -210,7 +210,7 @@ impl Summarizer {
             .ok_or_else(|| rejected("missing_content"))?;
         let validating_repo = repository.clone();
         let validating_snapshot = snapshot.clone();
-        let validating = tokio::task::spawn_blocking(move || {
+        let validating = crate::diagnostics::spawn_blocking(move || {
             validate(
                 &raw,
                 &validating_snapshot,
@@ -234,7 +234,7 @@ impl Summarizer {
             return Err(rejected("summary_byte_limit"));
         }
         let expected = snapshot.clone();
-        let checking = tokio::task::spawn_blocking(move || {
+        let checking = crate::diagnostics::spawn_blocking(move || {
             repository.snapshot(&expected.session.id, &expected.session.user_id)
         });
         let current = tokio::select! {
