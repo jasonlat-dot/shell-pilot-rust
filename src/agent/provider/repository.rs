@@ -2,6 +2,7 @@ use super::*;
 use crate::{agent::model::identifier, secrets, store::Store};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::Arc;
+mod channels;
 
 #[derive(Clone)]
 pub struct ModelRepository {
@@ -58,7 +59,18 @@ fn view(id: &str, row: Row, display_name: String) -> Result<ModelProfile> {
         ready: !config.require_api_key || key.is_some(),
         config,
         api_key_configured: key.is_some(),
+        channel_id: None,
+        channel_name: None,
     })
+}
+fn profile_view(db: &Connection, id: &str, user: &str, row: Row) -> Result<ModelProfile> {
+    let mut profile = view(id, row, display_name(db,id,user)?)?;
+    let channel: Option<(String,String,bool)> = db.query_row("SELECT c.id,c.display_name,m.active FROM agent_model_channel_members m JOIN agent_model_channels c ON c.user_id=m.user_id AND c.id=m.channel_id WHERE m.user_id=?1 AND m.profile_id=?2",params![user,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    if let Some((id,name,active)) = channel { profile.channel_id=Some(id);profile.channel_name=Some(name);profile.ready &= active; }
+    Ok(profile)
+}
+fn channel_count(db: &Connection, user: &str) -> Result<usize> {
+    Ok(db.query_row("SELECT (SELECT COUNT(*) FROM agent_model_channels WHERE user_id=?1)+COUNT(*) FROM agent_model_profiles p WHERE p.user_id=?1 AND NOT EXISTS(SELECT 1 FROM agent_model_channel_members m WHERE m.user_id=p.user_id AND m.profile_id=p.id)",[user],|r|r.get(0))?)
 }
 impl ModelRepository {
     pub fn new(store: Arc<Store>) -> Self {
@@ -72,10 +84,9 @@ impl ModelRepository {
             .database
             .lock()
             .map_err(|_| ModelError::Database)?;
-        view(
-            id,
+        profile_view(
+            &db, id, user,
             row(&db, id, user)?.ok_or(ModelError::NotFound)?,
-            display_name(&db, id, user)?,
         )
     }
     pub fn list(&self, user: &str) -> Result<Vec<ModelProfile>> {
@@ -85,14 +96,13 @@ impl ModelRepository {
             .database
             .lock()
             .map_err(|_| ModelError::Database)?;
-        let mut statement = db.prepare("SELECT id,revision,config_json,api_key FROM agent_model_profiles WHERE user_id=?1 ORDER BY id LIMIT 32")?;
+        let mut statement = db.prepare("SELECT id,revision,config_json,api_key FROM agent_model_profiles p WHERE user_id=?1 AND NOT EXISTS(SELECT 1 FROM agent_model_channel_members m WHERE m.user_id=p.user_id AND m.profile_id=p.id AND m.active=0) ORDER BY id LIMIT 2048")?;
         let rows = statement.query_map([user], |r| {
             Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?)))
         })?;
         rows.map(|r| {
             let (id, row) = r?;
-            let name = display_name(&db, &id, user)?;
-            view(&id, row, name)
+            profile_view(&db, &id, user, row)
         })
         .collect()
     }
@@ -141,12 +151,20 @@ impl ModelRepository {
         if revision != expected_revision {
             return Err(ModelError::Stale);
         }
+        let channel: Option<(String,bool)> = tx.query_row("SELECT channel_id,active FROM agent_model_channel_members WHERE user_id=?1 AND profile_id=?2",params![user,id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        if let Some((channel,active)) = channel {
+            if !active || update.api_key != KeyChange::Keep { return Err(ModelError::Invalid("edit shared channel settings through the channel editor")); }
+            let mut before:ModelConfig=serde_json::from_str(&previous.as_ref().ok_or(ModelError::NotFound)?.1).map_err(|_|ModelError::Database)?;
+            before=before.normalized()?;
+            let mut after=config.clone();
+            for value in [&mut before,&mut after] {value.reasoning_effort=None;value.capabilities.reasoning_effort=false;}
+            if serde_json::to_value(before).ok()!=serde_json::to_value(after).ok() || name.is_some_and(|name| display_name(&tx,id,user).ok().as_deref()!=Some(name)) {
+                return Err(ModelError::Invalid("only per-model reasoning can be changed outside the channel editor"));
+            }
+            if tx.execute("UPDATE agent_model_channels SET revision=revision+1 WHERE user_id=?1 AND id=?2 AND revision<9223372036854775807",params![user,channel])?!=1 {return Err(ModelError::Stale);}
+        }
         if previous.is_none()
-            && tx.query_row(
-                "SELECT COUNT(*) FROM agent_model_profiles WHERE user_id=?1",
-                [user],
-                |r| r.get::<_, usize>(0),
-            )? >= 32
+            && channel_count(&tx,user)? >= 32
         {
             return Err(ModelError::Invalid("at most 32 model profiles per user"));
         }
@@ -170,10 +188,9 @@ impl ModelRepository {
         if let Some(name) = name {
             tx.execute("INSERT INTO agent_model_names(user_id,profile_id,display_name) VALUES(?1,?2,?3) ON CONFLICT(user_id,profile_id) DO UPDATE SET display_name=excluded.display_name", params![user,id,name])?;
         }
-        let result = view(
-            id,
+        let result = profile_view(
+            &tx, id, user,
             row(&tx, id, user)?.ok_or(ModelError::Database)?,
-            display_name(&tx, id, user)?,
         )?;
         tx.commit()?;
         Ok(result)
@@ -187,6 +204,7 @@ impl ModelRepository {
             .lock()
             .map_err(|_| ModelError::Database)?;
         let tx = db.transaction()?;
+        if tx.query_row("SELECT EXISTS(SELECT 1 FROM agent_model_channel_members WHERE user_id=?1 AND profile_id=?2)",params![user,id],|r|r.get::<_,bool>(0))? {return Err(ModelError::Invalid("delete the channel through the channel editor"));}
         let previous = row(&tx, id, user)?.ok_or(ModelError::NotFound)?;
         if previous.0 != expected_revision {
             return Err(ModelError::Stale);
@@ -211,7 +229,8 @@ impl ModelRepository {
             .lock()
             .map_err(|_| ModelError::Database)?;
         let (revision, json, key) = row(&db, id, user)?.ok_or(ModelError::NotFound)?;
-        let profile = view(id, (revision, json, None), id.to_owned())?;
+        let profile = profile_view(&db, id, user, (revision, json, key.clone()))?;
+        if !profile.ready { return Err(ModelError::KeyMissing); }
         // Disabling authentication preserves the encrypted credential but never
         // decrypts or sends it. Re-enabling can reuse the saved key.
         let api_key = if profile.config.require_api_key {

@@ -26,6 +26,7 @@ pub enum ReasoningEffort {
     Medium,
     High,
     Xhigh,
+    Max,
 }
 
 fn enabled_by_default() -> bool {
@@ -263,6 +264,24 @@ pub struct ModelProfile {
     pub config: ModelConfig,
     pub api_key_configured: bool,
     pub ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelModel {
+    pub id: String,
+    pub model: String,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelChannel {
+    #[serde(flatten)]
+    pub profile: ModelProfile,
+    pub models: Vec<ChannelModel>,
 }
 
 #[cfg(test)]

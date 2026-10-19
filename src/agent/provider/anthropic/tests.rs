@@ -143,8 +143,42 @@ fn authentication_and_capabilities_are_strategy_owned() {
     assert!(invalid.normalized().is_err());
     let mut invalid = config();
     invalid.capabilities.reasoning_effort = true;
-    invalid.reasoning_effort = Some(ReasoningEffort::High);
+    invalid.reasoning_effort = Some(ReasoningEffort::None);
     assert!(invalid.normalized().is_err());
+}
+#[test]
+fn native_effort_is_validated_and_encoded_by_protocol_without_model_name_rules() {
+    let request = ChatRequest { messages: vec![ChatMessage::User { content: "inspect".into() }], tools: vec![] };
+    for effort in [ReasoningEffort::Low, ReasoningEffort::Medium, ReasoningEffort::High, ReasoningEffort::Xhigh, ReasoningEffort::Max] {
+        let mut config = config();
+        config.model = "custom-proxy-model-alias".into();
+        config.capabilities.reasoning_effort = true;
+        config.reasoning_effort = Some(effort.clone());
+        let normalized = config.normalized().unwrap();
+        let prepared = prepare_request(&normalized, &request).unwrap();
+        let body: Value = serde_json::from_str(&prepared.body).unwrap();
+        assert_eq!(body["output_config"]["effort"], json!(effort));
+        for forbidden in ["reasoning_effort", "reasoning", "thinking"] { assert!(body.get(forbidden).is_none()); }
+        assert_eq!(body["max_tokens"], normalized.output_reserve);
+        let mut disabled = normalized;
+        disabled.capabilities.reasoning_effort = false;
+        assert!(disabled.normalized().is_err());
+    }
+    let body = encode(&config(), &request).unwrap();
+    assert!(body.get("output_config").is_none());
+    for effort in [ReasoningEffort::None, ReasoningEffort::Minimal] {
+        let mut config = config();
+        config.capabilities.reasoning_effort = true;
+        config.reasoning_effort = Some(effort);
+        assert!(config.normalized().is_err());
+    }
+    for provider in [ProviderKind::OpenAiCompatible, ProviderKind::OpenAiResponses] {
+        let mut config = config();
+        config.provider = provider;
+        config.capabilities.reasoning_effort = true;
+        config.reasoning_effort = Some(ReasoningEffort::Max);
+        assert!(config.normalized().is_err());
+    }
 }
 #[test]
 fn replies_map_usage_refusal_and_strict_finish_reasons() {

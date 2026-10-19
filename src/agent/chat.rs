@@ -172,6 +172,8 @@ pub struct AgentConfig {
     pub model_name: String,
     pub agent_desc: String,
     pub tools_available: bool,
+    pub channel_id: String,
+    pub provider: super::provider::ProviderKind,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -421,8 +423,10 @@ impl Manager {
                 .into_iter()
                 .filter(|p| p.ready)
                 .map(|p| AgentConfig {
+                    channel_id: p.channel_id.clone().unwrap_or_else(||p.id.clone()),
+                    provider: p.config.provider.clone(),
                     agent_id: p.id,
-                    agent_name: p.display_name,
+                    agent_name: p.channel_name.unwrap_or(p.display_name),
                     model_name: p.config.model.clone(),
                     agent_desc: format!(
                         "{} · {}",

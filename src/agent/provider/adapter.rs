@@ -12,7 +12,10 @@ pub(super) trait ResponseStream: Send {
     fn finish(self: Box<Self>, allowed: &HashSet<String>) -> Result<Completion>;
 }
 pub(super) trait ProviderAdapter: Sync {
-    fn normalize_config(&self, _config: &mut ModelConfig) -> Result<()> {
+    fn normalize_config(&self, config: &mut ModelConfig) -> Result<()> {
+        if config.reasoning_effort == Some(ReasoningEffort::Max) {
+            return Err(ModelError::Invalid("max effort requires Messages"));
+        }
         Ok(())
     }
     fn supports_tools(&self) -> bool {

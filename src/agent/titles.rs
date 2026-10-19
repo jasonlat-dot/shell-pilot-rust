@@ -99,7 +99,7 @@ mod tests {
             repo.db(|db| {
                 assert_eq!(
                     db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?,
-                    23
+                    24
                 );
                 Ok(())
             })

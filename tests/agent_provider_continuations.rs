@@ -229,6 +229,9 @@ impl LoopContext for StreamContext {
     }
 }
 async fn contract(protocol: ProviderKind, stream: bool, signature: bool) {
+    effort_contract(protocol, stream, signature, None).await;
+}
+async fn effort_contract(protocol: ProviderKind, stream: bool, signature: bool, effort: Option<ReasoningEffort>) {
     let first = reply(&protocol, true, signature);
     let w = Wire {
         replies: Arc::new(Mutex::new(
@@ -243,7 +246,7 @@ async fn contract(protocol: ProviderKind, stream: bool, signature: bool) {
         ProviderKind::OpenAiResponses => "responses",
         _ => "chat/completions",
     };
-    let config: ModelConfig = serde_json::from_value(json!({"provider":protocol,"baseUrl":format!("http://{}/v1/",listener.local_addr().unwrap()),"completionsPath":path,"model":"arbitrary-model-name","outputTokenParameter":"maxTokens","capabilities":{"developerRole":false,"temperature":false,"reasoningEffort":false},"requireApiKey":false})).unwrap();
+    let config: ModelConfig = serde_json::from_value(json!({"provider":protocol,"baseUrl":format!("http://{}/v1/",listener.local_addr().unwrap()),"completionsPath":path,"model":"arbitrary-model-name","outputTokenParameter":"maxTokens","reasoningEffort":effort,"capabilities":{"developerRole":false,"temperature":false,"reasoningEffort":effort.is_some()},"requireApiKey":false})).unwrap();
     let store = Arc::new(Store::in_memory().unwrap());
     let models = ModelRepository::new(store.clone());
     models
@@ -319,6 +322,17 @@ async fn contract(protocol: ProviderKind, stream: bool, signature: bool) {
     );
     let requests = w.requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
+    if protocol == ProviderKind::AnthropicMessages {
+        for request in requests.iter() {
+            if let Some(effort) = &effort {
+                assert_eq!(request["output_config"]["effort"], json!(effort));
+            } else {
+                assert!(request.get("output_config").is_none());
+            }
+            assert!(request.get("reasoning_effort").is_none());
+            assert!(request.get("thinking").is_none());
+        }
+    }
     let next = &requests[1];
     match protocol {
         ProviderKind::OpenAiCompatible => {
@@ -359,6 +373,14 @@ async fn gemini_signature_roundtrip_json_and_stream() {
 async fn anthropic_signed_thinking_roundtrip_json_and_stream() {
     for stream in [false, true] {
         contract(ProviderKind::AnthropicMessages, stream, false).await;
+    }
+}
+#[tokio::test]
+async fn anthropic_effort_survives_saved_profile_and_signed_tool_continuation() {
+    for effort in [ReasoningEffort::Low, ReasoningEffort::Medium, ReasoningEffort::High, ReasoningEffort::Xhigh, ReasoningEffort::Max] {
+        for stream in [false, true] {
+            effort_contract(ProviderKind::AnthropicMessages, stream, false, Some(effort.clone())).await;
+        }
     }
 }
 #[tokio::test]

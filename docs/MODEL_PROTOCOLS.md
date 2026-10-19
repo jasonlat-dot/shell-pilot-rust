@@ -23,7 +23,7 @@
 - 工具输入保留原始 JSON，包括重复键，使现有严格工具 schema 校验仍能拒绝歧义参数；不把部分 JSON 或思考片段当作可执行调用。
 - 接近窗口时沿用本地模型摘要，支持自动和手动整理；不会调用 Responses 的计数或 compact API。
 
-思考模式沿用供应商默认，不再固定发送 `thinking: disabled`。收到 `thinking` / `redacted_thinking` 时按原顺序保留文本、签名和密文，并与文本/工具块一起回传；SSE 拼接 thinking/signature 片段，校验结束后才交给工具循环。前端不会把 OpenAI 的推理档位映射到所有 Claude 版本，也不新增手动 thinking budget 配置。Bedrock / Vertex 专用认证、供应商服务端工具和 Claude 原生远端整理不在此范围内。
+思考模式沿用供应商默认，不再固定发送 `thinking: disabled`。收到 `thinking` / `redacted_thinking` 时按原顺序保留文本、签名和密文，并与文本/工具块一起回传；SSE 拼接 thinking/signature 片段，校验结束后才交给工具循环。原生推理强度通过 output_config.effort 配置，不发送 OpenAI reasoning_effort，也不新增手动 thinking budget 配置。Bedrock / Vertex 专用认证、供应商服务端工具和 Claude 原生远端整理不在此范围内。
 
 协议依据：[认证与版本](https://platform.claude.com/docs/en/api/overview)、[流事件与累计 usage](https://platform.claude.com/docs/en/build-with-claude/streaming)、[工具定义](https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools)、[工具结果](https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls)。
 
@@ -64,3 +64,25 @@ schema 23 的 agent_model_transitions 保存切换前事件边界。边界前的
 Responses 加密压缩窗口不能跨模型转发，切换时解除当前窗口引用，并恢复完整原始事件前缀；旧窗口作为历史记录保留。新请求仍受目标模型的上下文容量限制，不承诺较小窗口能容纳任意长历史。直接编辑同一模型的端点或凭据仍执行绑定隔离。
 
 回环测试覆盖三种协议间全部六种切换方向，分别验证文字和工具模式共 12 个场景：重开数据库后继续原 session、新请求包含旧历史、不携带旧协议状态、历史证据不会成为待执行工具。另有权限、CAS、忙碌拒绝、服务器目标、文本及远端检查点单测。未使用真实供应商凭据。
+
+
+## Messages 原生 effort
+
+ModelConfig.reasoningEffort 复用已保存的可选强度配置。Messages 策略接受 low / medium / high / xhigh / max 并写入 output_config.effort；不伪造 thinking、budget_tokens 或 OpenAI reasoning 字段。默认 null 省略 output_config，旧配置行为不变。协议层拒绝 none / minimal，且仍要求 capabilities.reasoningEffort；非 Messages 策略继续拒绝新增的 max 档位。
+
+前端协议目录共用选项和提示，模型设置与输入框均可保存。具体模型或代理的支持范围由供应商校验，不按模型 ID 子串猜测，也不自动重试、切换模型或降低档位。强度不会改变续接状态的归属与签名保存；JSON 和分块 SSE 工具轮次都使用同一策略编码。最大输出仍是思考和可见回复的总预算。
+
+依据：[Claude Effort](https://platform.claude.com/docs/en/build-with-claude/effort)。本次不增加迁移、不改变默认强度、不新增关闭思考或手动预算配置。
+
+验证：Messages 单测 9 项、协议续聊集成 6 项通过，包括全部五档的配置保存后读取、JSON / 分块 SSE 两轮工具调用、原样签名回传，以及三种协议间同会话切换。沙箱权限阻止初次集成测试的回环网络和 Windows 凭据访问，授权环境重跑通过；未使用真实供应商，未做打包或提交。
+
+
+## 多模型渠道与配置身份
+
+schema 24 增加 agent_model_channels 和 agent_model_channel_members，旧配置无需批量重写。渠道编辑在同一事务内验证版本、保存公共参数/密钥和模型成员；最多 32 个渠道、每渠道 64 个启用模型，总配置（含移除后保留的身份）上限 4096。相同模型 ID 可属于不同渠道，运行时始终使用用户范围内独立的稳定 profile ID。
+
+原有单模型 ID 在升级后保持不变；排序和移除/重加不产生新身份。移除模型设为 inactive，模型目录及新请求排除它，历史不删除。删除渠道会原子删除全部成员配置和名称，不删除对话记录。密钥始终使用原 profile ID 的 DPAPI 熵加密，渠道保存时统一应用；HTTP 请求选择的实际模型名仍是单个 config.model。
+
+独立的输入框强度更新只允许改变成员的 reasoningEffort 和对应能力位，禁止绕过渠道编辑器修改公共端点、名称或密钥；它同时推进渠道修订版本，防止过期渠道编辑覆盖新设置。跨模型切换继续沿用会话锁、revision 校验和历史模型边界，签名和密文仍不会跨模型转发。
+
+验证：Rust 全量 453 项通过、6 项既有忽略，生产库严格 Clippy 通过；客户端原生库 59 项和前端 530 项通过。渠道集成测试使用临时数据库、测试密钥和回环模型，验证两个实际模型名、共享密钥的请求头、轮换/清除、同会话历史续聊和旧配置重开。未调用真实供应商、未打包或提交。

@@ -14,10 +14,9 @@ pub(super) struct AnthropicMessages;
 impl ProviderAdapter for AnthropicMessages {
     fn normalize_config(&self, config: &mut ModelConfig) -> Result<()> {
         config.output_token_parameter = OutputTokenParameter::MaxTokens;
-        if config.reasoning_effort.is_some() {
-            return Err(ModelError::Invalid("Messages does not accept OpenAI reasoning_effort"));
+        if matches!(config.reasoning_effort, Some(ReasoningEffort::None | ReasoningEffort::Minimal)) {
+            return Err(ModelError::Invalid("Messages effort must be low, medium, high, xhigh or max"));
         }
-        config.capabilities.reasoning_effort = false;
         if config.temperature.is_some_and(|value| value > 1.0) {
             return Err(ModelError::Invalid(
                 "Messages temperature must be between 0 and 1",
@@ -152,6 +151,9 @@ fn encode(config: &ModelConfig, request: &ChatRequest) -> Result<Value> {
         return Err(ModelError::Invalid("Messages requires conversation input"));
     }
     let mut body = json!({"model":config.model,"max_tokens":config.output_reserve,"messages":messages,"stream":false});
+    if let Some(effort) = &config.reasoning_effort {
+        body["output_config"] = json!({"effort":effort});
+    }
     if !system.is_empty() {
         body["system"] = system.join("\n\n").into();
     }
