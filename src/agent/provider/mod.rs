@@ -2,6 +2,7 @@
 mod adapter;
 mod anthropic;
 mod config;
+pub(crate) mod continuation;
 mod dispatch;
 mod diagnostics;
 mod protocol;
@@ -11,6 +12,7 @@ mod stream;
 mod tool_stream;
 mod transport;
 pub use config::*;
+pub use continuation::Continuation;
 pub use protocol::*;
 pub use repository::{ModelRepository, RuntimeConfig};
 pub use transport::ModelClient;

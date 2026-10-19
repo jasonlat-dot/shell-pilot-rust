@@ -1,6 +1,6 @@
 # 模型协议策略
 
-本次在原生模型层增加 `anthropicMessages`，保留 `openAiCompatible` 与 `openAiResponses`。数据库继续使用 schema 21；模型配置仍是 JSON，旧配置和加密 Key 不需要迁移。
+原生模型层通过策略工厂支持 `openAiCompatible`、`openAiResponses` 和 `anthropicMessages`。schema 22 新增原生续接状态表；旧模型配置和加密 Key 保持原值，已有数据库启动时自动升级。
 
 ## 分层与扩展
 
@@ -8,7 +8,8 @@
 - `transport.rs` / `dispatch.rs`：共享 HTTP 生命周期，负责超时、取消、禁止重定向/自动重试、响应大小及 MIME 检查；不解释 Claude 的字段或工具片段。密钥头标记为 sensitive，供应商错误正文不回传。
 - `protocol.rs`：共享内部消息、工具历史配对、工具名称/参数/结束原因校验及预算硬限制。`ResponseStream` 将供应商 SSE 归一为可见文本和最终 `Completion`；工具 JSON 片段只在完整响应校验后交给现有工具循环。
 - `anthropic.rs` / `anthropic/stream.rs`：Anthropic Messages 编解码与事件状态机。`stream.rs` / `tool_stream.rs` 保留 Chat Completions 的文本/工具解析器。
-- `responses.rs`：继续拥有 Responses 完整窗口、token 计数与远端整理。工厂通过窗口能力保留此专属路径，不能将供应商加密窗口摊平成普通聊天消息。
+- `continuation.rs`：按协议选择续接策略，只保留供应商实际返回的推理内容或签名，封装为不可从 IPC 构造的原生消息。`continuation_store.rs` 在原始事件范围旁保存状态，工具批次、最终回复和追加输入的中间回复与对应事件原子提交。
+- `responses.rs`：拥有 Responses 完整窗口、工具调用、token 计数与远端整理。工厂通过窗口能力保留此专属路径，不能将供应商加密窗口摊平成普通聊天消息。
 - 前端 `src/api/modelProtocols.ts`：穷尽协议目录驱动协议选项、路径、输出参数、Temperature 上限及推理控件；设置页只消费目录，不自行组装网络请求。
 
 新增另一种无状态聊天协议时：新增配置枚举及独立策略/流解析器，在工厂注册，补齐前端目录和协议契约测试。Agent 主循环通过 `supports_tools()` 决定工具准入，无需再添加供应商判断；协议适配不赋予工具执行权限，所有调用仍经过原有 schema 校验、审批、目标核验与执行回执链路。具有独立持久上下文的协议还需要设计自己的上下文契约，不能只注册聊天策略便声称支持。
@@ -22,7 +23,7 @@
 - 工具输入保留原始 JSON，包括重复键，使现有严格工具 schema 校验仍能拒绝歧义参数；不把部分 JSON 或思考片段当作可执行调用。
 - 接近窗口时沿用本地模型摘要，支持自动和手动整理；不会调用 Responses 的计数或 compact API。
 
-当前范围为**常规 Messages 模式**，显式禁用 thinking。扩展/自适应思考需要持久保存并回传签名内容块，本次未实现；不支持只能以思考模式工作的端点。若代理仍返回 thinking 与工具调用组合，会拒绝该轮工具，避免丢失签名继续执行。Bedrock / Vertex 专用认证、供应商服务端工具和 Claude 原生远端整理也不在本次范围内。
+思考模式沿用供应商默认，不再固定发送 `thinking: disabled`。收到 `thinking` / `redacted_thinking` 时按原顺序保留文本、签名和密文，并与文本/工具块一起回传；SSE 拼接 thinking/signature 片段，校验结束后才交给工具循环。前端不会把 OpenAI 的推理档位映射到所有 Claude 版本，也不新增手动 thinking budget 配置。Bedrock / Vertex 专用认证、供应商服务端工具和 Claude 原生远端整理不在此范围内。
 
 协议依据：[认证与版本](https://platform.claude.com/docs/en/api/overview)、[流事件与累计 usage](https://platform.claude.com/docs/en/build-with-claude/streaming)、[工具定义](https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools)、[工具结果](https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls)。
 
@@ -31,3 +32,35 @@
 新增 `src/agent/provider/anthropic/tests.rs` 覆盖原生请求、图片估算、认证头、参数边界、usage、原始工具 JSON、工具片段隔离与不完整流；`tests/agent_anthropic.rs` 使用回环模型验证实际 HTTP、逐字节 UTF-8 SSE、工具授权/执行/回传以及断流不重试。前端新增协议切换及设置保存测试。
 
 实际运行结果记录在 [AGENT_PROGRESS.md](AGENT_PROGRESS.md) 本次条目。回环测试不等同于真实 Claude Key、供应商兼容性或桌面视觉验收；不生成安装包。
+
+## 推理与工具续接
+
+| 配置的协议 | 自动保存/回传的供应商状态 | 适用入口 |
+| --- | --- | --- |
+| Chat Completions | assistant 的 `reasoning_content` | DeepSeek，以及返回同一字段的兼容模型 |
+| Chat Completions | 原 tool call 的 `extra_content.google.thought_signature` | Gemini 的 OpenAI 兼容入口 |
+| Messages | 完整 `thinking` / `redacted_thinking`、signature 与同轮文本和工具块 | Anthropic Messages 兼容入口 |
+| Responses | 原顺序的 reasoning/encrypted_content、message、function_call 等完整输出项 | 支持 Responses 和 input_tokens 的端点 |
+
+使用已保存的接口协议选择策略，解析实际返回的数据，不按 `deepseek`、`claude`、`gemini` 等模型名子串分支。普通响应没有这些字段时不补字段；不伪造签名或空思考。Gemini 原生 generateContent 不在本次协议范围内，代理必须完整保留其 OpenAI 兼容扩展字段。
+
+Responses 工具使用原生 function 定义及 `call_id` / `function_call_output` 配对；工具定义也纳入发送前供应商 token 计数。工具片段只在 response.completed、完整输出、调用名称与参数校验后执行。任何错误、断流或取消都不自动重放工具。
+
+原生状态绑定协议、完整端点、模型和凭据摘要，不向其他端点/凭据转发。恢复对话会从原始事件范围重建整条 assistant 回复，避免把正文和工具调用拆开；整理只移除已归入完整检查点的前缀，保留尾部状态。宿主生成的工具检查点作为明确标注的数据传入，不伪装成带签名的 assistant 响应。可见历史和诊断日志不包含思考原文、签名或密文；状态仅在本地 SQLite 原生表中保存，删除对话时一并删除。
+
+旧版本已经丢弃的推理字段无法从正文恢复；本次升级不会编造这部分历史。如果供应商拒绝旧轮次，可新建对话，或先整理旧历史。模型/协议自身能力、显式思考参数支持范围仍以所用端点为准。
+
+新增 `tests/agent_provider_continuations.rs` 覆盖四种状态的 JSON / 分块 SSE 两轮工具续聊、原始字段回传与日志隔离；原生单测覆盖普通模型不加字段、IPC 拒绝状态注入、端点/模型/凭据隔离、数据库重开、历史重建与整理后的尾部状态。均使用回环模型、临时数据库和模拟工具，没有调用真实供应商或 SSH。
+
+协议依据：[DeepSeek 思考模式](https://api-docs.deepseek.com/guides/thinking_mode/)、[Claude 思考块与工具续接](https://platform.claude.com/docs/en/build-with-claude/thinking)、[Gemini thought signatures](https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures)、[OpenAI reasoning](https://developers.openai.com/api/docs/guides/reasoning)。
+
+
+## 同一会话切换模型
+
+Manager.change_model 在会话执行锁内检查新模型可用性、用户归属和 revision；原子更换 agent_id，保留 session/task/scope、SSH 身份、项目关系及审批策略。运行中的 turn、准入的执行或扩展调用、写入中的输出和悬挂工具调用会阻止切换。
+
+schema 23 的 agent_model_transitions 保存切换前事件边界。边界前的 assistant 和工具事件以明确标注的 JSON 历史数据传入，不形成新模型的可执行调用；原始事件、工具证据与对话界面不被重写。边界后的回复按新模型协议正常保存和回传原生状态。上下文用量清零待下次实际测量，普通文本检查点继续使用。
+
+Responses 加密压缩窗口不能跨模型转发，切换时解除当前窗口引用，并恢复完整原始事件前缀；旧窗口作为历史记录保留。新请求仍受目标模型的上下文容量限制，不承诺较小窗口能容纳任意长历史。直接编辑同一模型的端点或凭据仍执行绑定隔离。
+
+回环测试覆盖三种协议间全部六种切换方向，分别验证文字和工具模式共 12 个场景：重开数据库后继续原 session、新请求包含旧历史、不携带旧协议状态、历史证据不会成为待执行工具。另有权限、CAS、忙碌拒绝、服务器目标、文本及远端检查点单测。未使用真实供应商凭据。

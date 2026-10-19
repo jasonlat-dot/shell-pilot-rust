@@ -86,6 +86,7 @@ struct Pending {
     announced: bool,
 }
 struct Data {
+    replay: Option<provider::Continuation>,
     intermediate: String,
     snapshot: Snapshot,
     latest_user: u64,
@@ -373,7 +374,7 @@ impl ToolSession {
                 (snapshot,appended.event.id)
             };
             *data.lock().map_err(|_|tool_loop::Error::Context)? = Some(Data {
-                snapshot,latest_user,message,runtime:runtime.clone(),pending:vec![],intermediate:String::new(),
+                snapshot,latest_user,message,runtime:runtime.clone(),pending:vec![],intermediate:String::new(), replay:None,
             });
             Ok(runtime)
         }).await?;
@@ -416,23 +417,15 @@ impl ToolSession {
         let repository = self.repository.clone();
         let data = self.data.clone();
         let text = reply.content.clone().or_else(|| reply.refusal.clone());
+        let replay = reply.continuation.clone();
         if let Some(text) = text.filter(|t| !t.trim().is_empty() && self.managed.is_none()) {
             worker(move || {
                 let mut guard = data.lock().map_err(|_| tool_loop::Error::Context)?;
                 let data = guard.as_mut().ok_or(tool_loop::Error::Context)?;
                 ensure_current(&repository, data)?;
-                let s = &data.snapshot.session;
-                let result = repository
-                    .append(
-                        &s.id,
-                        &s.user_id,
-                        s.revision,
-                        &uuid::Uuid::new_v4().to_string(),
-                        Payload::AssistantMessage { text },
-                    )
-                    .map_err(context_error)?;
+                let event_id = repository.append_runtime_message(&data.snapshot, text, replay.as_ref()).map_err(context_error)?;
                 data.snapshot.session.revision += 1;
-                data.snapshot.through_event_id = result.event.id;
+                data.snapshot.through_event_id = event_id;
                 Ok(())
             })
             .await?;
@@ -451,6 +444,14 @@ fn ensure_current(repository: &Repository, data: &Data) -> tool_loop::Result<()>
     Ok(())
 }
 impl LoopContext for ToolSession {
+    fn remember_reply<'a>(&'a self, reply: &'a AssistantReply) -> BoxFuture<'a, tool_loop::Result<()>> {
+        Box::pin(async move {
+            let mut guard = self.data.lock().map_err(|_| tool_loop::Error::Context)?;
+            let data = guard.as_mut().ok_or(tool_loop::Error::Context)?;
+            data.replay = reply.continuation.clone();
+            Ok(())
+        })
+    }
     fn streams_replies(&self) -> bool {
         self.events.is_some()
     }
@@ -530,7 +531,8 @@ impl LoopContext for ToolSession {
                     arguments:json!({"modelArguments":serde_json::from_str::<Value>(&call.function.arguments)
                         .unwrap_or_else(|_|Value::String(call.function.arguments.clone()))}),
                 }).collect();
-                repository.append_runtime_batch(&data.snapshot,binding.as_ref(),payloads,text,None).map_err(context_error)?;
+                repository.append_runtime_reply(&data.snapshot,binding.as_ref(),payloads,text,None,data.replay.as_ref()).map_err(context_error)?;
+                data.replay = None;
                 data.snapshot=repository.snapshot(&data.snapshot.session.id,&data.snapshot.session.user_id).map_err(context_error)?;
                 data.pending=calls.into_iter().map(|call|Pending{id:call.id.clone(),tool:call,announced:false,agent:None,started:false,capture:None}).collect();
                 Ok(())

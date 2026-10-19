@@ -268,6 +268,7 @@ impl Repository {
                 (frontier,serde_json::from_str::<CheckpointContent>(&json)?.retained_user_facts)
             } else { (0,vec![]) };
             if through<old_through { return Err(Error::Invalid("checkpoint frontier cannot move backwards".into())); }
+            super::continuation_store::require_frontier(&tx,&current.session.id,through)?;
             super::facts::validate(&tx,&current.session.id,through,&content.retained_user_facts)?;
             if old_facts.iter().any(|fact| !content.retained_user_facts.contains(fact))
                 || content.retained_user_facts.iter().any(|fact| !content.evidence_event_ids.contains(&fact.event_id)) {
@@ -357,7 +358,7 @@ pub(super) fn read_session(db: &Connection, id: &str, user_id: &str) -> Result<S
         scope: super::scopes::read(db, id)?,
     })
 }
-fn read_snapshot(db: &Connection, id: &str, user_id: &str) -> Result<Snapshot> {
+pub(super) fn read_snapshot(db: &Connection, id: &str, user_id: &str) -> Result<Snapshot> {
     let session = read_session(db, id, user_id)?;
     let through_event_id = db.query_row(
         "SELECT COALESCE(MAX(id),0) FROM agent_events WHERE session_id=?1",

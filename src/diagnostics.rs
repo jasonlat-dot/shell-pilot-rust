@@ -1,4 +1,4 @@
-//! Local request diagnostics. Only structured metadata is accepted at call sites.
+//! Local request diagnostics and explicit user/assistant conversation records.
 use chrono::{Local, SecondsFormat};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -9,7 +9,7 @@ use std::{
     io::{self, Write},
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
         Arc, Mutex,
     },
     time::Instant,
@@ -50,6 +50,7 @@ pub struct Diagnostics {
     level: AtomicU8,
     sequence: AtomicU64,
     write_failed: AtomicBool,
+    retention_days: AtomicU32,
 }
 impl Default for Diagnostics {
     fn default() -> Self {
@@ -58,6 +59,7 @@ impl Default for Diagnostics {
             level: AtomicU8::new(Level::Info as u8),
             sequence: AtomicU64::new(0),
             write_failed: AtomicBool::new(false),
+            retention_days: AtomicU32::new(7),
         }
     }
 }
@@ -73,6 +75,52 @@ impl Diagnostics {
     }
     pub fn set_level(&self, level: Level) {
         self.level.store(level as u8, Ordering::Relaxed);
+    }
+    pub fn set_retention_days(&self, days: u32) -> io::Result<()> {
+        if !(1..=3650).contains(&days) {
+            return Err(io::Error::other("日志保留天数必须为 1 到 3650"));
+        }
+        self.retention_days.store(days, Ordering::Relaxed);
+        Ok(())
+    }
+    /// Only trace files in expired ISO-date directories are eligible. Never follow
+    /// symlinks/junctions or recursively remove unrelated content.
+    pub fn cleanup_expired(&self) -> io::Result<usize> {
+        self.cleanup_before(Local::now().date_naive())
+    }
+    fn cleanup_before(&self, today: chrono::NaiveDate) -> io::Result<usize> {
+        let directory = self.directory.lock().map_err(|_| io::Error::other("diagnostic writer unavailable"))?;
+        let Some(directory) = directory.as_ref() else { return Ok(0); };
+        let root = fs::canonicalize(directory)?;
+        let mut removed = 0;
+        for entry in fs::read_dir(&root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue; };
+            let Ok(date) = chrono::NaiveDate::parse_from_str(name, "%Y-%m-%d") else { continue; };
+            if date.format("%Y-%m-%d").to_string() != name
+                || today.signed_duration_since(date).num_days() < i64::from(self.retention_days.load(Ordering::Relaxed)) {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if !metadata.is_dir() || is_redirect(&metadata) { continue; }
+            let day = fs::canonicalize(entry.path())?;
+            if day.parent() != Some(root.as_path()) { continue; }
+            for file in fs::read_dir(&day)? {
+                let file = file?;
+                let metadata = fs::symlink_metadata(file.path())?;
+                if !metadata.is_file() || is_redirect(&metadata) { continue; }
+                let path = file.path();
+                if !matches!(path.extension().and_then(|v| v.to_str()), Some("log" | "json" | "jsonl")) { continue; }
+                let Some(stem) = path.file_stem().and_then(|v| v.to_str()) else { continue; };
+                if stem.is_empty() || stem.len() > 128 || !stem.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')) { continue; }
+                fs::remove_file(path)?;
+                removed += 1;
+            }
+            // An unexpected file or subdirectory keeps its date directory intact.
+            if fs::read_dir(&day)?.next().is_none() { fs::remove_dir(&day)?; }
+        }
+        Ok(removed)
     }
     pub fn trace(self: &Arc<Self>, request: &str, session: &str, agent: &str) -> Trace {
         let id = if !request.is_empty()
@@ -96,7 +144,7 @@ impl Diagnostics {
             id,
         }
     }
-    fn write(&self, trace: &Trace, level: Level, event: &str, fields: Value) {
+    fn write(&self, trace: &Trace, level: Level, event: &str, fields: Value, message: Option<&str>) {
         if (level as u8) < self.level.load(Ordering::Relaxed) {
             return;
         }
@@ -112,13 +160,17 @@ impl Diagnostics {
             let now = Local::now();
             let day = directory.join(now.format("%Y-%m-%d").to_string());
             fs::create_dir_all(&day)?;
-            let record = json!({"timestamp":now.to_rfc3339_opts(SecondsFormat::Millis,false),"level":level.text(),"traceId":trace.id,"requestId":trace.request,"sessionId":trace.session,"agentId":trace.agent,"sequence":self.sequence.fetch_add(1,Ordering::Relaxed)+1,"event":event,"fields":clean(fields)});
+            let mut fields = clean(fields);
+            // Only the explicit conversation API can persist display text. Generic
+            // diagnostics still redact content/commands/credentials and cap fields.
+            if let Some(message) = message { fields["message"] = Value::String(message.to_owned()); }
+            let record = json!({"timestamp":now.to_rfc3339_opts(SecondsFormat::Millis,false),"level":level.text(),"traceId":trace.id,"requestId":trace.request,"sessionId":trace.session,"agentId":trace.agent,"sequence":self.sequence.fetch_add(1,Ordering::Relaxed)+1,"event":event,"fields":fields});
             let mut bytes = serde_json::to_vec(&record)?;
             bytes.push(b'\n');
             let mut file = OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(day.join(format!("{}.jsonl", trace.id)))?;
+                .open(day.join(format!("{}.log", trace.id)))?;
             file.write_all(&bytes)?;
             file.flush()
         })();
@@ -130,6 +182,15 @@ impl Diagnostics {
             self.write_failed.store(false, Ordering::Relaxed);
         }
     }
+}
+fn is_redirect(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    { metadata.file_type().is_symlink() }
 }
 fn log_identifier(value: &str) -> String {
     if value.len() <= 128
@@ -214,7 +275,12 @@ impl Trace {
         &self.id
     }
     pub fn event(&self, level: Level, name: &str, fields: Value) {
-        self.sink.write(self, level, name, fields);
+        self.sink.write(self, level, name, fields, None);
+    }
+    /// Explicit display-message logging; never pass model prompts or credential objects.
+    pub fn conversation_message(&self, role: &str, connection: Option<&str>, model: &str, state: &str, message: &str) {
+        self.sink.write(self, Level::Info, "conversation.message",
+            json!({"role":role,"connectionName":connection,"modelId":model,"state":state}), Some(message));
     }
     pub async fn scope<F: Future>(&self, future: F) -> F::Output {
         CURRENT.scope(self.clone(), future).await

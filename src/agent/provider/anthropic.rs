@@ -6,7 +6,7 @@ use super::{
 };
 use crate::agent::attachments::Part;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, value::RawValue, Value};
 use std::collections::HashSet;
 
@@ -15,9 +15,7 @@ impl ProviderAdapter for AnthropicMessages {
     fn normalize_config(&self, config: &mut ModelConfig) -> Result<()> {
         config.output_token_parameter = OutputTokenParameter::MaxTokens;
         if config.reasoning_effort.is_some() {
-            return Err(ModelError::Invalid(
-                "Messages does not accept OpenAI reasoning_effort",
-            ));
+            return Err(ModelError::Invalid("Messages does not accept OpenAI reasoning_effort"));
         }
         config.capabilities.reasoning_effort = false;
         if config.temperature.is_some_and(|value| value > 1.0) {
@@ -101,6 +99,10 @@ fn encode(config: &ModelConfig, request: &ChatRequest) -> Result<Value> {
     let mut messages = Vec::new();
     for message in &request.messages {
         match message {
+            ChatMessage::Replay { state } => {
+                let blocks = state.wire(config)?.as_array().ok_or(ModelError::ContextMismatch)?.clone();
+                push(&mut messages, "assistant", blocks)?;
+            }
             ChatMessage::System { content } | ChatMessage::Developer { content } => {
                 system.push(content.as_str())
             }
@@ -149,8 +151,7 @@ fn encode(config: &ModelConfig, request: &ChatRequest) -> Result<Value> {
     if messages.is_empty() {
         return Err(ModelError::Invalid("Messages requires conversation input"));
     }
-    // Extended thinking is deliberately not requested: its signed blocks require a separate persisted history contract.
-    let mut body = json!({"model":config.model,"max_tokens":config.output_reserve,"messages":messages,"stream":false,"thinking":{"type":"disabled"}});
+    let mut body = json!({"model":config.model,"max_tokens":config.output_reserve,"messages":messages,"stream":false});
     if !system.is_empty() {
         body["system"] = system.join("\n\n").into();
     }
@@ -173,18 +174,24 @@ struct Message {
     #[serde(default)]
     stop_reason: Option<String>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub(super) struct ContentBlock {
     #[serde(rename = "type")]
     pub kind: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<Box<RawValue>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
 }
 fn usage(value: Option<Value>) -> Result<Option<Usage>> {
     let Some(value) = value else { return Ok(None) };
@@ -223,6 +230,7 @@ pub(super) fn assemble(
     let mut content = String::new();
     let mut calls = Vec::new();
     let mut thinking = false;
+    let wire = serde_json::to_value(&blocks).map_err(|_| ModelError::Response)?;
     for block in blocks {
         match block.kind.as_str() {
             "text" => {
@@ -240,13 +248,16 @@ pub(super) fn assemble(
                     arguments: block.input.ok_or(ModelError::ToolProtocol)?.get().into(),
                 },
             }),
-            "thinking" | "redacted_thinking" => thinking = true,
+            "thinking" => {
+                if block.thinking.is_none() || block.signature.as_deref().is_none_or(str::is_empty) { return Err(ModelError::ToolProtocol); }
+                thinking = true;
+            }
+            "redacted_thinking" => {
+                if block.data.as_deref().is_none_or(str::is_empty) { return Err(ModelError::ToolProtocol); }
+                thinking = true;
+            }
             _ => return Err(ModelError::Response),
         }
-    }
-    // Never execute calls if a gateway ignored thinking=disabled and continuation would lose required signatures.
-    if thinking && !calls.is_empty() {
-        return Err(ModelError::ToolProtocol);
     }
     if content.trim().is_empty() && calls.is_empty() {
         return Err(ModelError::Incomplete);
@@ -256,8 +267,9 @@ pub(super) fn assemble(
     } else {
         ((!content.is_empty()).then_some(content), None)
     };
-    super::protocol::validate_completion(
+    let mut completion = super::protocol::validate_completion(
         AssistantReply {
+            continuation: None,
             role: "assistant".into(),
             content: text,
             refusal,
@@ -266,7 +278,9 @@ pub(super) fn assemble(
         usage(tokens)?,
         finish.into(),
         allowed,
-    )
+    )?;
+    if thinking { completion.message.continuation = Some(Continuation::new(ProviderKind::AnthropicMessages, wire, &completion.message)?); }
+    Ok(completion)
 }
 
 #[cfg(test)]

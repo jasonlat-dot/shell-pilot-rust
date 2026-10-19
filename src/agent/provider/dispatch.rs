@@ -7,7 +7,9 @@ use tokio_util::sync::CancellationToken;
 impl ModelClient {
     pub async fn stream<F,Fut>(&self, request: &ChatRequest, cancel: &CancellationToken, on_text: F) -> Result<Completion>
     where F: FnMut(String)->Fut, Fut: Future<Output=Result<()>> {
-        super::diagnostics::observe(&self.config,request,"stream",self.stream_inner(request,cancel,on_text)).await
+        self.validate_continuations(request)?;
+        let completion = super::diagnostics::observe(&self.config,request,"stream",Box::pin(self.stream_inner(request,cancel,on_text))).await?;
+        Ok(self.seal_completion(completion))
     }
     async fn stream_inner<F, Fut>(
         &self,
@@ -29,7 +31,9 @@ impl ModelClient {
     }
     pub async fn stream_tools<F,Fut>(&self, request: &ChatRequest, cancel: &CancellationToken, on_text: F) -> Result<Completion>
     where F: FnMut(String)->Fut, Fut: Future<Output=Result<()>> {
-        super::diagnostics::observe(&self.config,request,"stream_tools",self.stream_tools_inner(request,cancel,on_text)).await
+        self.validate_continuations(request)?;
+        let completion = super::diagnostics::observe(&self.config,request,"stream_tools",Box::pin(self.stream_tools_inner(request,cancel,on_text))).await?;
+        Ok(self.seal_completion(completion))
     }
     async fn stream_tools_inner<F, Fut>(
         &self,
@@ -46,6 +50,7 @@ impl ModelClient {
                 "provider does not support tool streaming",
             ));
         }
+        if self.adapter.response_windows() { return self.stream_responses(request, cancel, on_text).await; }
         self.stream_protocol(request, cancel, on_text, true).await
     }
     async fn stream_protocol<F, Fut>(

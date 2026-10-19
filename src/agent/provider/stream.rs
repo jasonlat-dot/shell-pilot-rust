@@ -42,6 +42,7 @@ impl Sse {
 struct Delta {
     role: Option<String>,
     content: Option<String>,
+    reasoning_content: Option<String>,
     refusal: Option<String>,
     tool_calls: Option<Value>,
     function_call: Option<Value>,
@@ -65,6 +66,7 @@ struct TextReply {
     usage: Option<Usage>,
     finished: bool,
     terminal: bool,
+    reasoning: Option<String>,
 }
 pub(super) fn decoder() -> Box<dyn super::adapter::ResponseStream> {
     Box::new(TextReply {
@@ -124,6 +126,11 @@ impl super::adapter::ResponseStream for TextReply {
             return Err(ModelError::ToolProtocol);
         }
         let text = delta.content.clone().unwrap_or_default();
+        if let Some(reasoning) = &delta.reasoning_content {
+            let stored = self.reasoning.get_or_insert_with(String::new);
+            if stored.len().saturating_add(reasoning.len()) > 1024 * 1024 { return Err(ModelError::ResponseTooLarge); }
+            stored.push_str(reasoning);
+        }
         self.encoded_text = self.encoded_text.saturating_add(
             serde_json::to_string(&text)
                 .map_err(|_| ModelError::Response)?
@@ -146,6 +153,8 @@ impl super::adapter::ResponseStream for TextReply {
         if !self.terminal {
             return Err(ModelError::Incomplete);
         }
-        decode_response(&serde_json::to_vec(&json!({"choices":[{"index":0,"message":{"role":"assistant","content":self.text},"finish_reason":"stop"}],"usage":self.usage})).map_err(|_|ModelError::Response)?,allowed)
+        let mut value = json!({"choices":[{"index":0,"message":{"role":"assistant","content":self.text},"finish_reason":"stop"}],"usage":self.usage});
+        if let Some(reasoning) = self.reasoning { value["choices"][0]["message"]["reasoning_content"] = reasoning.into(); }
+        decode_response(&serde_json::to_vec(&value).map_err(|_|ModelError::Response)?,allowed)
     }
 }

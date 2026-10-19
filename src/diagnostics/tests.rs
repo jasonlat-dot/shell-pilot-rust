@@ -2,7 +2,7 @@ use super::*;
 fn records(root: &std::path::Path, id: &str) -> Vec<Value> {
     let path = root
         .join(Local::now().format("%Y-%m-%d").to_string())
-        .join(format!("{id}.jsonl"));
+        .join(format!("{id}.log"));
     fs::read_to_string(path)
         .unwrap()
         .lines()
@@ -11,6 +11,70 @@ fn records(root: &std::path::Path, id: &str) -> Vec<Value> {
 }
 #[derive(Debug)]
 struct FailureFixture;
+
+#[test]
+fn retention_removes_expired_trace_files_only_and_updates_live() {
+    let root = tempfile::tempdir().unwrap();
+    let sink = Diagnostics::default();
+    sink.configure(root.path().join("agent"), Level::Info).unwrap();
+    assert_eq!(sink.retention_days.load(Ordering::Relaxed), 7);
+    let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+    let add = |name: &str, file: &str| {
+        let path = root.path().join("agent").join(name);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join(file), b"fixture").unwrap();
+        path.join(file)
+    };
+    let current = add("2026-10-19", "today.log");
+    let retained = add("2026-10-13", "six-days.log");
+    let expired = add("2026-10-12", "old.log");
+    let legacy = add("2026-10-12", "old-format.jsonl");
+    let legacy_json = add("2026-10-12", "previous.json");
+    let unrelated = add("2026-10-12", "notes.txt");
+    let invalid_date = add("not-a-date", "keep.log");
+    let future = add("2026-10-20", "future.log");
+    let nested = add("2026-10-11/nested", "keep.log");
+    let lifecycle = root.path().join("backend.log");
+    fs::write(&lifecycle, b"keep").unwrap();
+    assert_eq!(sink.cleanup_before(today).unwrap(), 3);
+    assert!(!expired.exists());
+    assert!(!legacy.exists());
+    assert!(!legacy_json.exists());
+    for path in [&current, &retained, &unrelated, &invalid_date, &future, &nested, &lifecycle] {
+        assert!(path.exists(), "unexpectedly removed {}", path.display());
+    }
+    sink.set_retention_days(3).unwrap();
+    assert_eq!(sink.cleanup_before(today).unwrap(), 1);
+    assert!(!retained.exists());
+    assert!(!retained.parent().unwrap().exists());
+    for invalid in [0, 3651, u32::MAX] { assert!(sink.set_retention_days(invalid).is_err()); }
+    assert_eq!(sink.retention_days.load(Ordering::Relaxed), 3);
+}
+
+#[test]
+fn explicit_conversation_records_preserve_display_text_and_share_trace_without_a_scope() {
+    let root = tempfile::tempdir().unwrap();
+    let sink = Arc::new(Diagnostics::default());
+    sink.configure(root.path().into(), Level::Info).unwrap();
+    let trace = sink.trace("dialogue", "chat", "profile");
+    let message = "你好\n\"完整正文\" ".repeat(100);
+    trace.conversation_message("user", Some("我的服务器"), "model-id", "accepted", &message);
+    trace.conversation_message("assistant", Some("我的服务器"), "model-id", "completed", "你好，有什么可以帮你？");
+    trace.event(Level::Info, "metadata", json!({"content":"hidden","apiKey":"hidden","password":"hidden"}));
+    let rows = records(root.path(), "dialogue");
+    assert_eq!(rows[0]["fields"]["message"], message);
+    assert_eq!(rows[0]["fields"]["connectionName"], "我的服务器");
+    assert_eq!(rows[0]["fields"]["modelId"], "model-id");
+    assert_eq!(rows[1]["fields"]["role"], "assistant");
+    assert_eq!(rows[1]["fields"]["message"], "你好，有什么可以帮你？");
+    assert!(rows.iter().all(|row| row["traceId"] == "dialogue"));
+    assert_eq!(rows[2]["fields"]["content"], "[REDACTED]");
+    assert_eq!(rows[2]["fields"]["apiKey"], "[REDACTED]");
+    assert_eq!(rows[2]["fields"]["password"], "[REDACTED]");
+    sink.set_level(Level::Warn);
+    trace.conversation_message("user", None, "model-id", "accepted", "filtered");
+    assert_eq!(records(root.path(), "dialogue").len(), 3);
+}
 impl Failure for FailureFixture {
     fn diagnostic_code(&self) -> &str {
         "TEST_ERROR"

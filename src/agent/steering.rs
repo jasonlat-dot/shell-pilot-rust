@@ -157,6 +157,9 @@ pub(crate) fn drain(
                 &format!("{}:step:{}", request.request_id, inputs[0].id),
                 &Payload::AssistantMessage { text: text.clone() },
             )?;
+            if let Some(state) = &completion.message.continuation {
+                super::continuation_store::save(&tx, &s.id, event.id - 1, event.id, state)?;
+            }
             if let Some(window) = &completion.response_output {
                 super::responses_store::save_turn(&tx, event.id, window)?;
             }

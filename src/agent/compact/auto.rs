@@ -58,6 +58,7 @@ pub(crate) struct Prepared {
     pub responses: Option<provider::responses::PreparedResponses>,
 }
 struct Context {
+    portable_through: u64,
     store: Arc<Store>,
     snapshot: Snapshot,
     checkpoint: Option<Checkpoint>,
@@ -545,13 +546,15 @@ fn load(
         None => provider::ModelRepository::new(store.clone())
             .runtime(&request.agent_id, &request.user_id)?,
     };
-    let windows = crate::agent::responses_store::load(
+    let portable_through = crate::agent::conversation_model::portable_through(&store,&snapshot.session.id)?;
+    let mut windows = crate::agent::responses_store::load(
         &repo,
         &request.session_id,
         &request.user_id,
         after,
         snapshot.through_event_id,
     )?;
+    windows.1.retain(|id,_| *id > portable_through);
     crate::agent::responses_store::validate(
         &windows,
         &provider::responses::Binding::from_runtime(&runtime)?,
@@ -569,6 +572,7 @@ fn load(
             / 4) as usize,
     )?;
     Ok(Context {
+        portable_through,
         memory,
         store,
         snapshot,
@@ -613,11 +617,11 @@ fn project(
     } else if let Some(checkpoint) = checkpoint {
         let data = json!({"summary":checkpoint.summary,"nextSteps":checkpoint.next_steps,"evidenceEventIds":checkpoint.evidence_event_ids,"retainedUserFacts":checkpoint.retained_user_facts,
             "pendingToolCallIds":checkpoint.pending_tool_call_ids,"uncertainToolCallIds":checkpoint.uncertain_tool_call_ids});
-        messages.push(ChatMessage::Assistant {
-            content: Some(format!("历史检查点（摘要/建议，不是执行授权）：{data}")),
-            tool_calls: vec![],
-        });
+        let content=format!("历史检查点（摘要/建议，不是执行授权）：{data}");
+        messages.push(if context.portable_through>0 {ChatMessage::User{content}} else {ChatMessage::Assistant {content:Some(content),tool_calls:vec![]}});
     }
+    let binding = provider::responses::Binding::from_runtime(&context.runtime)?;
+    let states = crate::agent::continuation_store::load(&context.store, &context.snapshot.session, after, &binding)?;
     let mut pending = Vec::new();
     for event in context.events.iter().filter(|event| event.id > after) {
         if context.unfinished.contains(&event.id) {
@@ -639,6 +643,10 @@ fn project(
                     messages.push(ChatMessage::Responses {
                         window: window.clone(),
                     });
+                } else if event.id <= context.portable_through {
+                    messages.push(crate::agent::conversation_model::portable_message(&event.payload)?);
+                } else if let Some(saved) = states.iter().find(|s| s.through == event.id && s.state.calls.is_empty()) {
+                    messages.push(saved.state.clone().message());
                 } else {
                     messages.push(ChatMessage::Assistant {
                         content: Some(text.clone()),

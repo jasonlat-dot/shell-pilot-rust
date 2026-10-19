@@ -215,6 +215,9 @@ pub trait ToolExecutor: Send + Sync {
 }
 /// Trusted native persistence and context hooks; model payloads cannot install them.
 pub trait LoopContext: Send + Sync {
+    fn remember_reply<'a>(&'a self, _reply: &'a AssistantReply) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
     fn streams_replies(&self) -> bool {
         false
     }
@@ -380,8 +383,8 @@ impl<'a> ToolLoop<'a> {
         executor: &impl ToolExecutor,
         cancel: &CancellationToken,
     ) -> Result<AssistantReply> {
-        // Responses currently owns opaque text-only windows. Never flatten them or
-        // silently enter the normalized tool loop with an unsupported protocol.
+        // Protocol strategies own their opaque continuation state.
+        // Reject unsupported protocols before any tool can be admitted.
         if !client.config().supports_tools() {
             return Err(ModelError::Invalid("model protocol does not support tool calls").into());
         }
@@ -415,10 +418,7 @@ impl<'a> ToolLoop<'a> {
                         continue;
                     }
                 }
-                self.request.messages.push(ChatMessage::Assistant {
-                    content: reply.content.clone().or_else(|| reply.refusal.clone()),
-                    tool_calls: vec![],
-                });
+                self.request.messages.push(reply.history_message());
                 return Ok(reply);
             }
 
@@ -426,10 +426,7 @@ impl<'a> ToolLoop<'a> {
             // provider validate cross-round duplicate IDs and full protocol ordering.
             let assistant_text = reply.content.clone();
             let mut batch = self.request.clone();
-            batch.messages.push(ChatMessage::Assistant {
-                content: reply.content,
-                tool_calls: reply.tool_calls.clone(),
-            });
+            batch.messages.push(reply.history_message());
             let result_start = batch.messages.len();
             let validated: Vec<_> = reply
                 .tool_calls
@@ -495,6 +492,7 @@ impl<'a> ToolLoop<'a> {
                 return Err(Error::ToolCallLimit);
             }
             if let Some(context) = self.context {
+                context.remember_reply(&reply).await?;
                 context
                     .begin_batch(&reply.tool_calls, assistant_text.as_deref(), cancel)
                     .await?;

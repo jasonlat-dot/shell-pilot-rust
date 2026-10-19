@@ -42,6 +42,15 @@ impl Drop for Slot<'_> {
     }
 }
 impl Manager {
+    pub async fn change_model(&self, user: String, session: String, previous: String, next: String, revision: u64) -> Result<super::super::Session> {
+        if self.stop.is_cancelled() {return Err(Error::Stopped);}
+        let _slot=self.slot(&user,&session)?;
+        let store=self.store.clone();
+        worker(move || {
+            if !ModelRepository::new(store.clone()).get(&next,&user)?.ready {return Err(ModelError::KeyMissing.into());}
+            Repository::new(store).change_model(&user,&session,&previous,&next,revision).map_err(Error::from)
+        }).await
+    }
     pub async fn delete_project(&self, user: String, project: String) -> Result<()> {
         if self.stop.is_cancelled() {
             return Err(Error::Stopped);
@@ -245,7 +254,8 @@ impl Manager {
     ) -> Result<()> where F: FnMut(StreamEvent) -> Fut, Fut: Future<Output=Result<()>> {
         let trace = self.store.diagnostics.trace(&request.request_id,&request.session_id,&request.agent_id);
         let fields = json!({"messageBytes":request.message.len(),"attachmentCount":request.attachments.len(),"entry":"desktop","executionEnabled":execution_enabled});
-        trace.request(fields,self.chat_desktop_inner(request,target,execution_enabled,cancel,send)).await
+        // Bound the caller's stack even with nested request diagnostics enabled.
+        trace.request(fields,Box::pin(self.chat_desktop_inner(request,target,execution_enabled,cancel,send))).await
     }
     async fn chat_desktop_inner<F, Fut>(
         &self,
@@ -444,6 +454,7 @@ impl Manager {
         if !admission.1 {
             return Err(recorded(&admission.0));
         }
+        let conversation = super::conversation::Conversation::accepted(&self.store, &request, admission.0.target.as_ref(), &runtime.config.model);
         running.finished = false;
         started.store(true, std::sync::atomic::Ordering::Release);
         use crate::agent::context_status::{Observation, Reporter, Update};
@@ -514,6 +525,10 @@ impl Manager {
         } else {
             TurnState::Failed
         };
+        let failure_message = result.as_ref().err().map(ToString::to_string);
+        let completion = result.as_ref().ok().map(|reply| super::super::provider::Completion {
+            message: reply.clone(), usage: None, finish_reason: "stop".into(), response_output: None,
+        });
         let expected = session.revision().unwrap_or(initial_revision + 1);
         let turns = Turns::new(self.store.clone());
         let r = request.clone();
@@ -527,10 +542,11 @@ impl Manager {
             } else {
                 (state, code)
             };
-            turns.finish_tools(&r, &who, state, &text, code.as_deref(), expected)
+            turns.finish_tools_reply(&r, &who, state, &text, code.as_deref(), expected, completion.as_ref(), failure_message.as_deref())
         })
         .await?;
         running.finished = true;
+        conversation.finished(&turn);
         if turn.state == TurnState::Completed {
             send(StreamEvent::Done {
                 content: turn.result_text.ok_or(Error::Storage)?,

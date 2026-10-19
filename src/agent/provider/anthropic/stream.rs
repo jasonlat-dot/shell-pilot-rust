@@ -132,7 +132,15 @@ impl ResponseStream for MessagesStream {
                         block.json.push_str(part);
                         String::new()
                     }
-                    ("thinking", Some("thinking_delta" | "signature_delta")) => String::new(),
+                    ("thinking", Some("thinking_delta" | "signature_delta")) => {
+                        let signature = delta["type"] == "signature_delta";
+                        let fragment = delta[if signature {"signature"} else {"thinking"}].as_str().ok_or(ModelError::Response)?;
+                        let target = if signature {&mut block.content.signature} else {&mut block.content.thinking};
+                        let value = target.get_or_insert_with(String::new);
+                        if value.len().saturating_add(fragment.len()) > 1024 * 1024 { return Err(ModelError::ResponseTooLarge); }
+                        value.push_str(fragment);
+                        String::new()
+                    }
                     _ => return Err(ModelError::Response),
                 };
                 self.visible(text)

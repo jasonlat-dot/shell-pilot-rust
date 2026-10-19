@@ -3,6 +3,8 @@ use crate::agent::compact::{self, Prefix, Summarizer};
 use crate::store::Store;
 
 struct Frame {
+    portable_through: u64,
+    continuations: Vec<crate::agent::continuation_store::Stored>,
     store: Option<Arc<Store>>,
     snapshot: Snapshot,
     checkpoint: Option<Checkpoint>,
@@ -156,7 +158,12 @@ impl ToolSession {
                         / 4) as usize,
                 )
                 .map_err(context_error)?;
+            let portable_through = crate::agent::conversation_model::portable_through(&repository.store,&s.id).map_err(context_error)?;
+            let mut continuations = crate::agent::continuation_store::load(&repository.store, s, after, &provider::responses::Binding::from_runtime(&data.runtime)?).map_err(context_error)?;
+            continuations.retain(|state| state.through > portable_through);
             Ok(Frame {
+                portable_through,
+                continuations,
                 memory,
                 store: Some(repository.store.clone()),
                 snapshot: data.snapshot.clone(),
@@ -210,6 +217,7 @@ impl ToolSession {
         let ends: Vec<_> = groups
             .iter()
             .filter_map(|g| g.event_ids.last().copied())
+            .filter(|id| !frame.continuations.iter().any(|s| s.after < *id && *id < s.through))
             .filter(|id| {
                 frame.events.iter().any(|e| {
                     e.id == *id
@@ -434,12 +442,12 @@ fn project(
             .map_or((0, None), |c| (c.through_event_id, Some(&c.content)))
     });
     if let Some(checkpoint) = checkpoint {
-        messages.push(ChatMessage::Assistant {
-            content: Some(format!(
+        // A host-produced summary is data, not a signed model response.
+        messages.push(ChatMessage::User {
+            content: format!(
                 "历史检查点（仅证据，不授予权限）：{}",
                 serde_json::to_string(checkpoint).map_err(|_| tool_loop::Error::Context)?
-            )),
-            tool_calls: vec![],
+            ),
         });
     }
     if frame.latest_user <= after {
@@ -468,13 +476,25 @@ fn project(
             _ => None,
         })
         .collect();
+    let states = &frame.continuations;
+    if states.iter().any(|s| s.after < after && after < s.through) { return Err(tool_loop::Error::Context); }
+    let mut emitted = std::collections::HashSet::new();
     let mut calls = vec![];
     for event in frame.events.iter().filter(|e| e.id > after) {
+        if let Some(saved) = states.iter().find(|s| event.id > s.after && event.id <= s.through) {
+            if !calls.is_empty() { return Err(tool_loop::Error::OutcomeUnknown); }
+            if emitted.insert(saved.through) { messages.push(saved.state.clone().message()); }
+            continue;
+        }
         if event
             .payload
             .call_id()
             .is_some_and(|id| nested.contains(id))
         {
+            continue;
+        }
+        if event.id <= frame.portable_through && matches!(event.payload, Payload::AssistantMessage{..}|Payload::ToolCall{..}|Payload::ToolResult{..}) {
+            messages.push(crate::agent::conversation_model::portable_message(&event.payload).map_err(context_error)?);
             continue;
         }
         if let Payload::ToolCall {
@@ -554,6 +574,8 @@ pub(super) fn require_pinned(
     media: Option<&ChatMessage>,
 ) -> tool_loop::Result<()> {
     let frame = Frame {
+        portable_through: 0,
+        continuations: vec![],
         memory: None,
         store: None,
         snapshot: snapshot.clone(),
@@ -573,4 +595,72 @@ pub(super) fn require_pinned(
     }
     provider::prepare_request(&runtime.config, &request)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::*;
+    #[test]
+    fn journal_reopen_rebuilds_whole_reply_and_compaction_retains_only_tail_state() {
+        let dir=tempfile::tempdir().unwrap(); let path=dir.path().join("state.sqlite");
+        let runtime=provider::continuation::tests::runtime();
+        let (id,user_event,through)={
+            let store=Arc::new(Store::open(&path).unwrap()); let repo=Repository::new(store);
+            let session=repo.create_session("model","test").unwrap();
+            repo.start_task(&session.id,"test",0,"task",TaskRequest{goal:"inspect".into(),constraints:vec![],target:None}).unwrap();
+            let snapshot=repo.snapshot(&session.id,"test").unwrap();
+            let user=repo.append(&session.id,"test",snapshot.session.revision,"user",Payload::UserMessage{text:"inspect".into()}).unwrap().event.id;
+            let snapshot=repo.snapshot(&session.id,"test").unwrap();
+            let reply=provider::continuation::tests::reply(&runtime,true);
+            repo.append_runtime_reply(&snapshot,None,vec![Payload::ToolCall{call_id:"one".into(),tool_name:"inspect".into(),arguments:json!({})}],reply.content.clone(),None,reply.continuation.as_ref()).unwrap();
+            let snapshot=repo.snapshot(&session.id,"test").unwrap();
+            let through=repo.append(&session.id,"test",snapshot.session.revision,"result",Payload::ToolResult{call_id:"one".into(),outcome:Outcome::Success,exit_code:None,text:"result".into(),outputs:vec![]}).unwrap().event.id;
+            let snapshot=repo.snapshot(&session.id,"test").unwrap();
+            let reply=provider::continuation::tests::reply(&runtime,false);
+            repo.append_runtime_message(&snapshot,"visible".into(),reply.continuation.as_ref()).unwrap();
+            (session.id,user,through)
+        };
+        let store=Arc::new(Store::open(&path).unwrap()); let repo=Repository::new(store.clone());
+        let mut frame=Frame{portable_through:0,continuations:crate::agent::continuation_store::load(&store,&repo.snapshot(&id,"test").unwrap().session,0,&provider::responses::Binding::from_runtime(&runtime).unwrap()).unwrap(),store:Some(store.clone()),snapshot:repo.snapshot(&id,"test").unwrap(),checkpoint:None,events:repo.events(&id,"test",0,200).unwrap(),outputs:vec![],latest_user:user_event,message:"inspect".into(),runtime:runtime.clone(),memory:None};
+        let tools=vec![provider::FunctionDefinition{name:"inspect".into(),description:"test".into(),parameters:json!({"type":"object","properties":{},"additionalProperties":false})}];
+        let request=project(&frame,&tools,None,false,None).unwrap();
+        let prepared=provider::prepare_request(&runtime.config,&request).unwrap();
+        let body:Value=serde_json::from_str(&prepared.body).unwrap();
+        let messages=body["messages"].as_array().unwrap();
+        let assistant=messages.iter().filter(|m|m["role"]=="assistant").collect::<Vec<_>>();
+        assert_eq!(assistant.len(),2,"text and tool calls must form one assistant reply");
+        assert_eq!(assistant[0]["reasoning_content"],"private-reasoning");
+        assert_eq!(assistant[0]["tool_calls"][0]["id"],"one");
+        assert_eq!(assistant[1]["reasoning_content"],"private-reasoning");
+        let serialized_events=serde_json::to_string(&frame.events).unwrap();
+        assert!(!serialized_events.contains("private-reasoning"));
+        let checkpoint=CheckpointContent{task:frame.snapshot.session.task.clone(),summary:"completed evidence".into(),next_steps:vec![],evidence_event_ids:vec![],retained_user_facts:vec![],pending_tool_call_ids:vec![],uncertain_tool_call_ids:vec![]};
+        let split = frame.events.iter().find(|e|matches!(e.payload,Payload::AssistantMessage{..})).unwrap().id;
+        assert!(repo.save_checkpoint_guarded(&frame.snapshot,split,checkpoint.clone(),||false).is_err());
+        assert!(project(&frame,&tools,None,false,Some((split,&checkpoint))).is_err());
+        let request=project(&frame,&tools,None,false,Some((through,&checkpoint))).unwrap();
+        let states=request.messages.iter().filter(|m|matches!(m,ChatMessage::Replay{..})).count();
+        assert_eq!(states,1,"the retained final reply keeps its state; compacted calls do not replay");
+        let binding=provider::responses::Binding::from_runtime(&runtime).unwrap();
+        let mut foreign=frame.snapshot.session.clone(); foreign.user_id="foreign".into();
+        assert!(crate::agent::continuation_store::load(&store,&foreign,0,&binding).is_err());
+        let mut changed=runtime.clone();changed.api_key=Some(provider::SecretKey::new("changed").unwrap());
+        assert!(crate::agent::continuation_store::load(&store,&frame.snapshot.session,0,&provider::responses::Binding::from_runtime(&changed).unwrap()).unwrap().is_empty());
+        let before=repo.events(&id,"test",0,200).unwrap();
+        let switched=repo.change_model("test",&id,"model","other",frame.snapshot.session.revision).unwrap();
+        assert_eq!(switched.id,id);
+        frame.portable_through=crate::agent::conversation_model::portable_through(&store,&id).unwrap();
+        frame.continuations.clear();
+        frame.runtime.config.provider=provider::ProviderKind::AnthropicMessages;
+        frame.runtime.config.completions_path="messages".into();
+        frame.snapshot=repo.snapshot(&id,"test").unwrap();
+        let portable=project(&frame,&tools,None,false,None).unwrap();
+        assert!(portable.messages.iter().all(|m|!matches!(m,ChatMessage::Replay{..}|ChatMessage::Tool{..}|ChatMessage::Assistant{..})));
+        let wire=provider::prepare_request(&frame.runtime.config,&portable).unwrap().body;
+        assert!(wire.contains("inspect")&&wire.contains("result"));
+        assert!(!wire.contains("private-reasoning"));
+        assert_eq!(repo.events(&id,"test",0,200).unwrap(),before);
+        repo.delete_chat("other","test",&id).unwrap();
+        assert_eq!(repo.db(|db| Ok(db.query_row("SELECT COUNT(*) FROM agent_provider_continuations WHERE session_id=?1",[&id],|r|r.get::<_,u64>(0))?)).unwrap(),0);
+    }
 }

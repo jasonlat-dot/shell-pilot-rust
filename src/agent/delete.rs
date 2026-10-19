@@ -23,6 +23,9 @@ fn delete_chat_data(db: &Connection, user: &str, id: &str) -> Result<()> {
         [id],
     )?;
     for sql in [
+        "DELETE FROM agent_turn_errors WHERE session_id=?1",
+        "DELETE FROM agent_model_transitions WHERE session_id=?1",
+        "DELETE FROM agent_provider_continuations WHERE session_id=?1",
         "DELETE FROM agent_execution_grants WHERE session_id=?1",
         "DELETE FROM agent_execution_policy_reviews WHERE request_id IN (SELECT id FROM agent_execution_requests WHERE session_id=?1)",
         "DELETE FROM agent_execution_requests WHERE session_id=?1",

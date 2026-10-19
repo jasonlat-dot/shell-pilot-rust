@@ -37,7 +37,7 @@ impl Binding {
             ),
         })
     }
-    fn matches_config(&self, config: &ModelConfig) -> Result<()> {
+    pub(crate) fn matches_config(&self, config: &ModelConfig) -> Result<()> {
         if self.provider != config.provider
             || self.endpoint != config.endpoint()?.as_str()
             || self.model != config.model
@@ -142,6 +142,10 @@ fn validate_items(items: &[Value], compact: bool) -> Result<()> {
                     }
                 }
             }
+            Some("function_call") if !compact && item["call_id"].as_str().is_some_and(|v| !v.is_empty())
+                && item["name"].is_string() && item["arguments"].is_string()
+                && item.get("status").is_none_or(|v| v == "completed") => {}
+            Some("function_call_output") if !compact && item["call_id"].is_string() && item["output"].is_string() => {}
             _ => return Err(ModelError::ToolProtocol),
         }
     }
@@ -154,9 +158,12 @@ pub(crate) fn body(config: &ModelConfig, request: &ChatRequest) -> Result<Value>
     if config.provider != ProviderKind::OpenAiResponses {
         return Err(ModelError::ContextMismatch);
     }
-    if request.messages.is_empty() || request.messages.len() > 1024 || !request.tools.is_empty() {
+    if request.messages.is_empty() || request.messages.len() > 1024 {
         return Err(ModelError::ToolProtocol);
     }
+    let mut validation = ChatRequest { messages: request.messages.iter().filter(|m| !matches!(m, ChatMessage::Responses {..})).cloned().collect(), tools: request.tools.clone() };
+    if validation.messages.is_empty() { validation.messages.push(ChatMessage::System {content:String::new()}); }
+    super::protocol::validate_request(config, &validation)?;
     let mut input = Vec::new();
     let mut instructions = Vec::new();
     for message in &request.messages {
@@ -180,10 +187,12 @@ pub(crate) fn body(config: &ModelConfig, request: &ChatRequest) -> Result<Value>
                 }
                 input.push(json!({"role":"user","content":parts}));
             }
-            ChatMessage::Assistant {
-                content: Some(content),
-                tool_calls,
-            } if tool_calls.is_empty() => input.push(json!({"role":"assistant","content":content})),
+            ChatMessage::Assistant { content, tool_calls } => {
+                if let Some(content) = content { input.push(json!({"role":"assistant","content":content})); }
+                for call in tool_calls { input.push(json!({"type":"function_call","call_id":call.id,"name":call.function.name,"arguments":call.function.arguments})); }
+            }
+            ChatMessage::Replay { state } => input.extend(state.wire(config)?.as_array().ok_or(ModelError::ContextMismatch)?.clone()),
+            ChatMessage::Tool { tool_call_id, content } => input.push(json!({"type":"function_call_output","call_id":tool_call_id,"output":content})),
             ChatMessage::Responses { window } => {
                 window.binding.matches_config(config)?;
                 validate_items(&window.items, false)?;
@@ -198,6 +207,9 @@ pub(crate) fn body(config: &ModelConfig, request: &ChatRequest) -> Result<Value>
     let mut result = json!({"model":config.model,"input":input,"instructions":instructions.join("\n"),
         "max_output_tokens":config.output_reserve,"stream":false,"store":false,
         "truncation":"disabled","include":["reasoning.encrypted_content"]});
+    if !request.tools.is_empty() {
+        result["tools"] = Value::Array(request.tools.iter().map(|t| json!({"type":"function","name":t.name,"description":t.description,"parameters":t.parameters})).collect());
+    }
     if let Some(temperature) = config.temperature {
         result["temperature"] = temperature.into();
     }
@@ -227,13 +239,14 @@ pub(crate) fn measure(config: &ModelConfig, request: &ChatRequest) -> Result<Pre
         estimated_input_tokens: cost,
         should_compact: u128::from(cost) * 100
             >= u128::from(available) * u128::from(config.compact_percent),
-        allowed_tools: HashSet::new(),
+        allowed_tools: request.tools.iter().map(|t| t.name.clone()).collect(),
     })
 }
 pub(crate) struct PreparedResponses {
     body: Value,
     pub(crate) input_tokens: u64,
     binding: Binding,
+    allowed: HashSet<String>,
 }
 impl ModelClient {
     fn validate_windows(&self, request: &ChatRequest) -> Result<()> {
@@ -305,7 +318,9 @@ impl ModelClient {
         value: &Value,
         cancel: &CancellationToken,
     ) -> Result<u64> {
-        let value = json!({"model":self.config.model,"input":value["input"],"instructions":value["instructions"]});
+        let mut counted = json!({"model":self.config.model,"input":value["input"],"instructions":value["instructions"]});
+        if let Some(tools) = value.get("tools") { counted["tools"] = tools.clone(); }
+        let value = counted;
         let result = self.json_call("input_tokens", &value, cancel).await?;
         if result["object"] != "response.input_tokens" {
             return Err(ModelError::Response);
@@ -318,6 +333,7 @@ impl ModelClient {
         cancel: &CancellationToken,
     ) -> Result<(PreparedResponses, u64)> {
         self.validate_windows(request)?;
+        self.validate_continuations(request)?;
         let value = body(&self.config, request)?;
         if serde_json::to_vec(&value)
             .map_err(|_| ModelError::Response)?
@@ -332,6 +348,7 @@ impl ModelClient {
                 body: value,
                 input_tokens: count,
                 binding: self.binding.clone(),
+                allowed: request.tools.iter().map(|t| t.name.clone()).collect(),
             },
             count,
         ))
@@ -382,7 +399,7 @@ impl ModelClient {
         let (prepared, tokens) = self.prepare_responses(request, cancel).await?;
         self.require_fit(tokens)?;
         let response = self.json_call("", &prepared.body, cancel).await?;
-        decode(&response, &self.binding)
+        decode(&response, &self.binding, &prepared.allowed)
     }
     pub(super) async fn stream_responses<F, Fut>(
         &self,
@@ -472,6 +489,7 @@ impl ModelClient {
             let mut output_items: HashMap<u64, (String, String)> = HashMap::new();
             let mut completed_items: HashMap<u64, Value> = HashMap::new();
             let mut text_parts: HashMap<(u64, u64), String> = HashMap::new();
+            let mut arguments: HashMap<u64,String> = HashMap::new();
             while let Some(bytes) = response.chunk().await.map_err(network)? {
                 size = size.saturating_add(bytes.len());
                 if size > self.config.max_response_bytes {
@@ -539,6 +557,21 @@ impl ModelClient {
                                 on_text(delta.to_owned()).await?;
                             }
                         }
+                        Some("response.function_call_arguments.delta" | "response.function_call_arguments.done") => {
+                            let index = event["output_index"].as_u64().ok_or(ModelError::Response)?;
+                            let id = event["item_id"].as_str().ok_or(ModelError::Response)?;
+                            if output_items.get(&index).is_none_or(|(old,kind)| old != id || kind != "function_call") || completed_items.contains_key(&index) {
+                                return Err(ModelError::ToolProtocol);
+                            }
+                            if event["type"] == "response.function_call_arguments.delta" {
+                                let delta = event["delta"].as_str().ok_or(ModelError::ToolProtocol)?;
+                                let args = arguments.entry(index).or_default();
+                                if args.len().saturating_add(delta.len()) > 65536 { return Err(ModelError::ResponseTooLarge); }
+                                args.push_str(delta);
+                            } else if arguments.get(&index).map(String::as_str).unwrap_or("") != event["arguments"].as_str().ok_or(ModelError::ToolProtocol)? {
+                                return Err(ModelError::ToolProtocol);
+                            }
+                        }
                         Some("response.completed") => {
                             if response_id.as_deref() != event["response"]["id"].as_str() {
                                 return Err(ModelError::Response);
@@ -556,6 +589,7 @@ impl ModelClient {
                             }
                             let mut expected_parts = 0;
                             for (i, item) in final_items.iter().enumerate() {
+                                if item["type"] == "function_call" && arguments.get(&(i as u64)).is_some_and(|args| Some(args.as_str()) != item["arguments"].as_str()) { return Err(ModelError::ToolProtocol); }
                                 if item["type"] == "message" {
                                     for (j, part) in item["content"]
                                         .as_array()
@@ -581,8 +615,8 @@ impl ModelClient {
                             if text_parts.len() != expected_parts {
                                 return Err(ModelError::Response);
                             }
-                            let completion = decode(&event["response"], &self.binding)?;
-                            if completion.message.content.as_deref() != Some(text.as_str()) {
+                            let completion = decode(&event["response"], &self.binding, &prepared.allowed)?;
+                            if completion.message.content.as_deref().unwrap_or("") != text.as_str() {
                                 return Err(ModelError::Response);
                             }
                             return Ok(completion);
@@ -625,7 +659,7 @@ impl ModelClient {
                             }
                             if !matches!(
                                 event["item"]["type"].as_str(),
-                                Some("message" | "reasoning")
+                                Some("message" | "reasoning" | "function_call")
                             ) {
                                 return Err(ModelError::ToolProtocol);
                             }
@@ -661,7 +695,7 @@ impl ModelClient {
         }
     }
 }
-fn decode(response: &Value, binding: &Binding) -> Result<Completion> {
+fn decode(response: &Value, binding: &Binding, allowed: &HashSet<String>) -> Result<Completion> {
     if response["id"]
         .as_str()
         .is_none_or(|id| id.is_empty() || id.len() > 256)
@@ -680,10 +714,16 @@ fn decode(response: &Value, binding: &Binding) -> Result<Completion> {
         .clone();
     validate_items(&items, false)?;
     let mut text = String::new();
+    let mut calls = vec![];
     for item in &items {
         if item["type"] == "compaction" {
             return Err(ModelError::Response);
         }
+        if item["type"] == "function_call" {
+            calls.push(ToolCall { id: item["call_id"].as_str().ok_or(ModelError::ToolProtocol)?.into(), kind: "function".into(), function: FunctionCall {
+                name: item["name"].as_str().ok_or(ModelError::ToolProtocol)?.into(), arguments: item["arguments"].as_str().ok_or(ModelError::ToolProtocol)?.into(),
+            }});
+        } else if !matches!(item["type"].as_str(), Some("message" | "reasoning")) { return Err(ModelError::Response); }
         if item["type"] == "message" {
             if item["role"] != "assistant" {
                 return Err(ModelError::Response);
@@ -696,7 +736,7 @@ fn decode(response: &Value, binding: &Binding) -> Result<Completion> {
             }
         }
     }
-    if text.trim().is_empty() {
+    if text.trim().is_empty() && calls.is_empty() {
         return Err(ModelError::Incomplete);
     }
     if text.len() > 16000
@@ -725,18 +765,13 @@ fn decode(response: &Value, binding: &Binding) -> Result<Completion> {
     } else {
         None
     };
-    Ok(Completion {
-        message: AssistantReply {
-            role: "assistant".into(),
-            content: Some(text),
-            tool_calls: vec![],
-            refusal: None,
-        },
-        usage,
-        finish_reason: "stop".into(),
-        response_output: Some(ResponseWindow {
-            items,
-            binding: binding.clone(),
-        }),
-    })
+    let reason = if calls.is_empty() { "stop" } else { "tool_calls" };
+    let mut completion = super::protocol::validate_completion(AssistantReply {
+        continuation: None, role: "assistant".into(), content: (!text.is_empty()).then_some(text), tool_calls: calls, refusal: None,
+    }, usage, reason.into(), allowed)?;
+    let mut state = Continuation::new(ProviderKind::OpenAiResponses, Value::Array(items.clone()), &completion.message)?;
+    state.seal(binding);
+    completion.message.continuation = Some(state);
+    completion.response_output = Some(ResponseWindow { items, binding: binding.clone() });
+    Ok(completion)
 }

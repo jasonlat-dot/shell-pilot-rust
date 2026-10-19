@@ -1,6 +1,8 @@
 # ShellPilot Rust 业务库
 
 内置 IPC 交互说明见兄弟客户端 [docs/ipc-transport.md](../ai-ssh-terminal-client/docs/ipc-transport.md)。桌面业务仅使用 invoke/Channel，应用不提供远程后端配置；本项目仅提供 Rust 库，没有独立 HTTP 程序入口。
+当前模型协议支持 Chat Completions、Anthropic Messages 和 Responses 的文字、图片与工具续聊，按协议保存推理字段、思考签名和原生输出项。续接状态与 schema 22 的持久化说明见 [MODEL_PROTOCOLS.md](docs/MODEL_PROTOCOLS.md)。
+
 
 Agent 重构当前进度与新窗口续接：见 [docs/AGENT_PROGRESS.md](docs/AGENT_PROGRESS.md)。
 

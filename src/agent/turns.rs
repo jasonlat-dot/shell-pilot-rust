@@ -39,6 +39,7 @@ pub struct Turn {
     pub partial_text: String,
     pub result_text: Option<String>,
     pub error_code: Option<String>,
+    pub error_message: Option<String>,
     pub usage: Option<Usage>,
     pub cursor: u64,
     pub created_at: i64,
@@ -101,6 +102,7 @@ fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
             partial_text: r.get("partial_text")?,
             result_text: r.get("result_text")?,
             error_code: r.get("error_code")?,
+            error_message: None,
             usage,
             cursor: r.get("user_event_id")?,
             created_at: r.get("created_at")?,
@@ -118,6 +120,9 @@ fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         lease: r.get("lease_until")?,
     })
 }
+fn failure_message(db: &Connection, session: &str, request: &str) -> Result<Option<String>> {
+    storage(db.query_row("SELECT message FROM agent_turn_errors WHERE session_id=?1 AND request_id=?2",params![session,request],|row|row.get(0)).optional())
+}
 fn row(db: &Connection, session: &str, request: &str) -> Result<Option<Row>> {
     let mut result = storage(
         db.query_row(
@@ -134,6 +139,7 @@ fn row(db: &Connection, session: &str, request: &str) -> Result<Option<Row>> {
             |r| r.get(0),
         ))?;
         row.turn.attachments = super::attachments::references(db, session, &user, row.turn.cursor)?;
+        row.turn.error_message = failure_message(db, session, request)?;
     }
     Ok(result)
 }
@@ -153,6 +159,7 @@ fn input(request: &Request, target: Option<Target>) -> Input {
     }
 }
 struct Finalization<'a> {
+    error: Option<&'a str>,
     state: TurnState,
     text: &'a str,
     code: Option<&'a str>,
@@ -166,6 +173,7 @@ fn finish_row(
     finish: Finalization<'_>,
 ) -> Result<Turn> {
     let Finalization {
+        error,
         state,
         text,
         code,
@@ -241,11 +249,20 @@ fn finish_row(
         ))?;
     }
     if completed {
+        if let (Some(event), Some(state)) = (assistant_event_id, completion.and_then(|c| c.message.continuation.as_ref())) {
+            super::continuation_store::save(db, session, event - 1, event, state)?;
+        }
         if let (Some(event), Some(output)) = (
             assistant_event_id,
             completion.and_then(|c| c.response_output.as_ref()),
         ) {
             super::responses_store::save_turn(db, event, output).map_err(Error::from)?;
+        }
+    }
+    if state == TurnState::Failed {
+        if let Some(error) = error {
+            let message: String=error.chars().take(2048).collect();
+            storage(db.execute("INSERT INTO agent_turn_errors(session_id,request_id,message) VALUES(?1,?2,?3)",params![session,old.turn.request_id,message]))?;
         }
     }
     let state = match state {
@@ -322,6 +339,7 @@ fn recover(db: &Connection, session: &str) -> Result<()> {
             old,
             None,
             Finalization {
+                error: None,
                 state: TurnState::Interrupted,
                 text: &partial,
                 code: Some("AGENT_INTERRUPTED"),
@@ -466,6 +484,10 @@ impl Turns {
         code: Option<&str>,
         completion: Option<&Completion>,
     ) -> Result<Turn> {
+        self.finish_detailed(request, owner, state, partial, code, completion, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn finish_detailed(&self, request: &Request, owner: &str, state: TurnState, partial: &str, code: Option<&str>, completion: Option<&Completion>, error: Option<&str>) -> Result<Turn> {
         self.db(|db| {
             let tx = storage(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
             verify(
@@ -479,6 +501,7 @@ impl Turns {
                 old,
                 Some(owner),
                 Finalization {
+                    error,
                     state,
                     text: partial,
                     code,
@@ -489,15 +512,8 @@ impl Turns {
             Ok(turn)
         })
     }
-    pub fn finish_tools(
-        &self,
-        request: &Request,
-        owner: &str,
-        state: TurnState,
-        text: &str,
-        code: Option<&str>,
-        expected: u64,
-    ) -> Result<Turn> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn finish_tools_reply(&self, request: &Request, owner: &str, state: TurnState, text: &str, code: Option<&str>, expected: u64, completion: Option<&Completion>, error: Option<&str>) -> Result<Turn> {
         self.db(|db| {
             let tx=storage(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
             verify(&read_session(&tx,&request.session_id,&request.user_id)?,&request.agent_id)?;
@@ -505,7 +521,7 @@ impl Turns {
             let is_tool:bool=storage(tx.query_row("SELECT EXISTS(SELECT 1 FROM agent_tool_turns WHERE session_id=?1 AND request_id=?2)",params![request.session_id,request.request_id],|r|r.get(0)))?;
             if !is_tool {return Err(Error::Conflict);}
             old.revision=expected;
-            let turn=finish_row(&tx,&request.session_id,old,Some(owner),Finalization{state,text,code,completion:None})?;
+            let turn=finish_row(&tx,&request.session_id,old,Some(owner),Finalization{state,text,code,completion,error})?;
             storage(tx.commit())?;Ok(turn)
         })
     }
@@ -530,6 +546,7 @@ impl Turns {
             let has_more=turns.len()>limit;turns.truncate(limit);
             let next_after=turns.last().map(|t|t.cursor).unwrap_or(after);drop(stmt);
             for turn in &mut turns {
+                turn.error_message=failure_message(&tx,&session.id,&turn.request_id)?;
                 turn.attachments=super::attachments::references(&tx,&session.id,user,turn.cursor)?;
                 turn.inputs=super::steering::list(&tx,&session.id,&turn.request_id)?;
                 let end:Option<u64>=storage(tx.query_row("SELECT MIN(user_event_id) FROM agent_chat_turns WHERE session_id=?1 AND user_event_id>?2",params![session.id,turn.cursor],|r|r.get(0)))?;
@@ -565,7 +582,8 @@ mod tests {
     fn completion() -> Completion {
         Completion {
             message: AssistantReply {
-                role: "assistant".into(),
+                continuation: None,
+            role: "assistant".into(),
                 content: Some("success".into()),
                 tool_calls: vec![],
                 refusal: None,
@@ -578,6 +596,27 @@ mod tests {
             finish_reason: "stop".into(),
             response_output: None,
         }
+    }
+    #[test]
+    fn failure_detail_is_durable_separate_from_prose_and_terminal_receipt_is_immutable() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("failure.sqlite");
+        let request={
+            let store=Arc::new(Store::open(&path).unwrap());let turns=Turns::new(store.clone());let r=request(store.clone());
+            turns.begin(&r,None,"owner",0).unwrap();
+            let t=turns.finish_detailed(&r,"owner",TurnState::Failed,"partial reply",Some("MODEL_HTTP_ERROR"),None,Some("Model provider returned HTTP 400")).unwrap();
+            assert_eq!(t.partial_text,"partial reply");assert_eq!(t.error_message.as_deref(),Some("Model provider returned HTTP 400"));
+            let replay=turns.finish_detailed(&r,"owner",TurnState::Failed,"late",Some("MODEL_TIMEOUT"),None,Some("late error")).unwrap();
+            assert_eq!(replay.error_message,t.error_message);
+            assert!(turns.history("model","other",&r.session_id,0,20).is_err());
+            r
+        };
+        let store=Arc::new(Store::open(&path).unwrap());let turns=Turns::new(store.clone());
+        let history=turns.history("model","default",&request.session_id,0,20).unwrap();
+        assert_eq!(history.turns[0].error_message.as_deref(),Some("Model provider returned HTTP 400"));
+        assert_eq!(history.turns[0].partial_text,"partial reply");
+        assert_eq!(history.turns[0].request_id,request.request_id);
+        Repository::new(store.clone()).delete_chat("model","default",&request.session_id).unwrap();
+        assert_eq!(store.database.lock().unwrap().query_row("SELECT COUNT(*) FROM agent_turn_errors",[],|r|r.get::<_,u64>(0)).unwrap(),0);
     }
     #[test]
     fn stop_and_completion_commit_are_ordered_and_terminal_receipts_are_immutable() {

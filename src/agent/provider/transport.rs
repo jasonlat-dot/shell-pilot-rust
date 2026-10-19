@@ -59,7 +59,19 @@ impl ModelClient {
 
     /// Non-streaming request through the selected wire strategy.
     pub async fn complete(&self, request: &ChatRequest, cancel: &CancellationToken) -> Result<Completion> {
-        super::diagnostics::observe(&self.config,request,"complete",self.complete_inner(request,cancel)).await
+        self.validate_continuations(request)?;
+        let completion = super::diagnostics::observe(&self.config,request,"complete",Box::pin(self.complete_inner(request,cancel))).await?;
+        Ok(self.seal_completion(completion))
+    }
+    pub(super) fn validate_continuations(&self, request: &ChatRequest) -> Result<()> {
+        for message in &request.messages {
+            if let ChatMessage::Replay { state } = message { state.validate_binding(&self.binding)?; }
+        }
+        Ok(())
+    }
+    pub(super) fn seal_completion(&self, mut completion: Completion) -> Completion {
+        if let Some(state) = &mut completion.message.continuation { state.seal(&self.binding); }
+        completion
     }
     async fn complete_inner(
         &self,

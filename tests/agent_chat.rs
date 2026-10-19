@@ -1130,7 +1130,7 @@ async fn confirmed_memory_is_rebuilt_per_turn_without_becoming_conversation_hist
 }
 
 #[tokio::test]
-async fn diagnostic_trace_keeps_http_status_and_provider_error_without_credentials_or_body() {
+async fn diagnostic_trace_keeps_status_and_explicit_user_text_without_credentials_or_error_body() {
     use shellpilot_server::diagnostics::Level;
     let body=json!({"error":{"type":"invalid_request_error","code":"invalid_request_error","message":"The reasoning_content must be passed back. Bearer sk-private-fixture"}}).to_string();
     let f=Fixture::response(body,Duration::ZERO,axum::http::StatusCode::BAD_REQUEST,"application/json").await;
@@ -1138,11 +1138,12 @@ async fn diagnostic_trace_keeps_http_status_and_provider_error_without_credentia
     let request=f.request().await;let trace=request.request_id.clone();
     let result=f.manager.chat(request,None,&CancellationToken::new(),|_|async{Ok(())}).await;
     assert!(matches!(result,Err(Error::Model(ModelError::Http(400)))));
-    let path=logs.path().join(chrono::Local::now().format("%Y-%m-%d").to_string()).join(format!("{trace}.jsonl"));
+    let path=logs.path().join(chrono::Local::now().format("%Y-%m-%d").to_string()).join(format!("{trace}.log"));
     let raw=std::fs::read_to_string(path).unwrap();
-    assert!(!raw.contains("sk-private-fixture"));assert!(!raw.contains("只返回文字"));
+    assert!(!raw.contains("sk-private-fixture"));assert!(!raw.contains("The reasoning_content must be passed back"));
     let rows:Vec<Value>=raw.lines().map(|line|serde_json::from_str(line).unwrap()).collect();
     assert!(rows.iter().all(|row|row["traceId"]==trace));
+    assert!(rows.iter().any(|row|row["event"]=="conversation.message"&&row["fields"]["role"]=="user"&&row["fields"]["message"]=="只返回文字，不要执行命令"));
     assert!(rows.iter().any(|row|row["event"]=="model.http_error"&&row["fields"]["httpStatus"]==400));
     assert!(rows.iter().any(|row|row["event"]=="model.http_error_detail"&&row["fields"]["reason"]=="reasoning_content_required"));
     assert_eq!(rows.last().unwrap()["event"],"request.failed");

@@ -4,7 +4,25 @@ use super::*;
 use rusqlite::params;
 
 impl Repository {
+    pub(crate) fn append_runtime_message(&self, snapshot: &Snapshot, text: String, replay: Option<&provider::Continuation>) -> Result<u64> {
+        let payload = Payload::AssistantMessage { text };
+        payload.validate()?;
+        self.db(|db| {
+            let tx = db.transaction()?;
+            let session = read_session(&tx, &snapshot.session.id, &snapshot.session.user_id)?;
+            if session.revision != snapshot.session.revision || session.task != snapshot.session.task { return Err(Error::Stale); }
+            let event = insert_event(&tx, &session.id, session.task.as_ref().map(|t| t.id.as_str()), &uuid::Uuid::new_v4().to_string(), &payload)?;
+            if let Some(state) = replay { super::continuation_store::save(&tx, &session.id, event.id - 1, event.id, state)?; }
+            tx.execute("UPDATE agent_sessions SET revision=?2 WHERE id=?1", params![session.id,next_revision(session.revision)?])?;
+            tx.commit()?;
+            Ok(event.id)
+        })
+    }
+
     pub(crate) fn append_runtime_batch(&self, snapshot: &Snapshot, binding: Option<&ToolBinding>, calls: Vec<Payload>, text: Option<String>, parent: Option<&str>) -> Result<()> {
+        self.append_runtime_reply(snapshot,binding,calls,text,parent,None)
+    }
+    pub(crate) fn append_runtime_reply(&self, snapshot: &Snapshot, binding: Option<&ToolBinding>, calls: Vec<Payload>, text: Option<String>, parent: Option<&str>, replay: Option<&provider::Continuation>) -> Result<()> {
         let task = snapshot.session.task.as_ref().filter(|t| t.status == TaskStatus::Active).ok_or(Error::TargetMismatch)?;
         if calls.is_empty() || calls.len() > 64 {
             return Err(Error::ToolProtocol);
@@ -56,6 +74,10 @@ impl Repository {
                 revision = next_revision(revision)?;
             }
             tx.execute("UPDATE agent_sessions SET revision=?2 WHERE id=?1", params![id,revision])?;
+            if let Some(replay) = replay {
+                let through: u64 = tx.query_row("SELECT MAX(id) FROM agent_events WHERE session_id=?1",[id],|row|row.get(0))?;
+                super::continuation_store::save(&tx,id,snapshot.through_event_id,through,replay)?;
+            }
             tx.commit()?;
             Ok(())
         })

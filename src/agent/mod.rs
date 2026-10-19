@@ -16,6 +16,8 @@ mod projects;
 mod titles;
 pub mod provider;
 mod repository;
+mod continuation_store;
+mod conversation_model;
 mod scopes;
 pub mod ssh_tools;
 pub mod steering;

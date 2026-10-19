@@ -999,7 +999,7 @@ fn schema_7_reopen_preserves_existing_raw_history_and_adds_only_native_window_ta
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |r| r.get::<_, u64>(0))
             .unwrap(),
-        21
+        23
     );
     assert_eq!(
         db.query_row("SELECT COUNT(*) FROM agent_responses_outputs", [], |r| r

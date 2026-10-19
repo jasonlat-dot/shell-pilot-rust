@@ -700,7 +700,7 @@ async fn diagnostic_trace_links_out_of_band_human_decision_to_original_turn() {
     // This independent future has no inherited task-local Trace.
     b.decide(&pending,Decision::ApproveOnce).await;
     job.await.unwrap().unwrap();
-    let path=logs.path().join(chrono::Local::now().format("%Y-%m-%d").to_string()).join(format!("{trace_id}.jsonl"));
+    let path=logs.path().join(chrono::Local::now().format("%Y-%m-%d").to_string()).join(format!("{trace_id}.log"));
     let raw=std::fs::read_to_string(path).unwrap();let rows:Vec<serde_json::Value>=raw.lines().map(|line|serde_json::from_str(line).unwrap()).collect();
     assert!(rows.iter().all(|row|row["traceId"]==trace_id));
     assert!(rows.iter().any(|row|row["event"]=="approval.decision_recorded"&&row["fields"]["approvalId"]==pending.id&&row["fields"]["accepted"]==true));

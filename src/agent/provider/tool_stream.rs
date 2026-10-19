@@ -11,6 +11,7 @@ struct Fragment {
     #[serde(rename = "type")]
     kind: Option<String>,
     function: Option<FunctionFragment>,
+    extra_content: Option<Value>,
 }
 #[derive(Deserialize)]
 struct FunctionFragment {
@@ -21,6 +22,7 @@ struct FunctionFragment {
 struct Delta {
     role: Option<String>,
     content: Option<String>,
+    reasoning_content: Option<String>,
     refusal: Option<String>,
     tool_calls: Option<Vec<Fragment>>,
     function_call: Option<Value>,
@@ -44,6 +46,8 @@ struct Reply {
     calls: BTreeMap<usize, ToolCall>,
     finish: Option<String>,
     usage: Option<Usage>,
+    reasoning: Option<String>,
+    signatures: BTreeMap<usize, Value>,
 }
 
 fn append(target: &mut String, fragment: &str, limit: usize) -> Result<()> {
@@ -84,6 +88,9 @@ impl Reply {
             return Err(ModelError::ToolProtocol);
         }
         let mut visible = String::new();
+        if let Some(reasoning) = delta.reasoning_content {
+            append(self.reasoning.get_or_insert_with(String::new), &reasoning, 1024 * 1024)?;
+        }
         if let Some(text) = delta.content {
             append(&mut self.text, &text, 16000)?;
             visible.push_str(&text);
@@ -95,6 +102,10 @@ impl Reply {
         for fragment in delta.tool_calls.unwrap_or_default() {
             if fragment.index >= 64 {
                 return Err(ModelError::ToolProtocol);
+            }
+            if let Some(signature) = fragment.extra_content.as_ref().and_then(|extra| extra.pointer("/google/thought_signature")) {
+                if !signature.is_string() || self.signatures.get(&fragment.index).is_some_and(|old| old != signature) { return Err(ModelError::ToolProtocol); }
+                self.signatures.insert(fragment.index, signature.clone());
             }
             let call = self
                 .calls
@@ -141,9 +152,12 @@ impl Reply {
         if self.calls.is_empty() && self.text.trim().is_empty() && self.refusal.trim().is_empty() {
             return Err(ModelError::Incomplete);
         }
-        decode_response(&serde_json::to_vec(&json!({"choices":[{"index":0,"message":{"role":"assistant",
+        let mut raw = json!({"choices":[{"index":0,"message":{"role":"assistant",
             "content":(!self.text.is_empty()).then_some(self.text),"refusal":(!self.refusal.is_empty()).then_some(self.refusal),
-            "tool_calls":self.calls.into_values().collect::<Vec<_>>()},"finish_reason":reason}],"usage":self.usage}))
+            "tool_calls":self.calls.into_values().collect::<Vec<_>>()},"finish_reason":reason}],"usage":self.usage});
+        if let Some(reasoning) = self.reasoning { raw["choices"][0]["message"]["reasoning_content"] = reasoning.into(); }
+        for (index, signature) in self.signatures { raw["choices"][0]["message"]["tool_calls"][index]["extra_content"] = json!({"google":{"thought_signature":signature}}); }
+        decode_response(&serde_json::to_vec(&raw)
             .map_err(|_|ModelError::Response)?,allowed)
     }
 }
@@ -172,6 +186,14 @@ impl super::adapter::ResponseStream for Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn google_signature_is_attached_to_the_original_tool_call() {
+        let mut reply = Reply::default();
+        reply.push(&delta(json!({"role":"assistant","content":"checking","tool_calls":[{"index":0,"id":"one","type":"function","function":{"name":"inspect","arguments":"{}"},"extra_content":{"google":{"thought_signature":"original-signature"}}}]}),Some("tool_calls"))).unwrap();
+        let completion = reply.complete(&allowed()).unwrap();
+        assert!(completion.message.continuation.is_some());
+        assert!(!serde_json::to_string(&completion).unwrap().contains("original-signature"));
+    }
     fn delta(value: Value, finish: Option<&str>) -> String {
         json!({"choices":[{"index":0,"delta":value,"finish_reason":finish}]}).to_string()
     }

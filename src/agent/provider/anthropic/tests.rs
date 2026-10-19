@@ -86,7 +86,7 @@ fn native_request_merges_results_and_keeps_protocol_parameters_separate() {
     assert_eq!(body["max_tokens"], 2048);
     assert!(body.get("max_completion_tokens").is_none());
     assert!(body.get("reasoning_effort").is_none());
-    assert_eq!(body["thinking"]["type"], "disabled");
+    assert!(body.get("thinking").is_none());
     assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
     assert_eq!(body["messages"].as_array().unwrap().len(), 3);
     assert_eq!(body["messages"][1]["content"][0]["type"], "tool_use");

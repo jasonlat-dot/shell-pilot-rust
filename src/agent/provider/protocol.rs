@@ -22,6 +22,8 @@ pub struct ToolCall {
 #[serde(tag = "role", rename_all = "lowercase", deny_unknown_fields)]
 pub enum ChatMessage {
     #[serde(skip)]
+    Replay { state: super::Continuation },
+    #[serde(skip)]
     Responses {
         window: super::responses::ResponseWindow,
     },
@@ -166,6 +168,11 @@ pub(super) fn validate_request(
     let mut pending = HashSet::new();
     for message in &request.messages {
         match message {
+            ChatMessage::Replay { state } => {
+                state.wire(config)?;
+                if !pending.is_empty() || state.content.is_none() && state.calls.is_empty() { return Err(ModelError::ToolProtocol); }
+                validate_calls(&state.calls, &allowed, &mut seen, &mut pending)?;
+            }
             ChatMessage::Assistant {
                 content,
                 tool_calls,
@@ -198,6 +205,7 @@ pub(super) fn measure_chat(config: &ModelConfig, request: &ChatRequest) -> Resul
         .messages
         .iter()
         .map(|m| match m {
+            ChatMessage::Replay { state } => state.wire(config),
             ChatMessage::UserMedia { content } => Ok(json!({"role":"user","content":content})),
             _ => serde_json::to_value(m).map_err(|_| ModelError::ToolProtocol),
         })
@@ -252,6 +260,8 @@ pub struct Usage {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AssistantReply {
+    #[serde(skip)]
+    pub continuation: Option<super::Continuation>,
     pub role: String,
     pub content: Option<String>,
     #[serde(default)]
@@ -279,7 +289,19 @@ struct Response {
     usage: Option<Usage>,
 }
 pub(crate) fn decode_response(bytes: &[u8], allowed: &HashSet<String>) -> Result<Completion> {
-    let mut response: Response = serde_json::from_slice(bytes).map_err(|_| ModelError::Response)?;
+    let raw: Value = serde_json::from_slice(bytes).map_err(|_| ModelError::Response)?;
+    // Wire-only vendor metadata never loosens the strict native ToolCall DTO.
+    let mut normalized = raw.clone();
+    if let Some(choices) = normalized["choices"].as_array_mut() {
+        for choice in choices {
+            if let Some(calls) = choice.get_mut("message").and_then(|m| m.get_mut("tool_calls")).and_then(Value::as_array_mut) {
+                for call in calls {
+                    if let Some(object) = call.as_object_mut() { object.remove("extra_content"); }
+                }
+            }
+        }
+    }
+    let mut response: Response = serde_json::from_value(normalized).map_err(|_| ModelError::Response)?;
     if response.choices.len() != 1 {
         return Err(ModelError::Response);
     }
@@ -287,12 +309,14 @@ pub(crate) fn decode_response(bytes: &[u8], allowed: &HashSet<String>) -> Result
     if choice.index != 0 || choice.message.role != "assistant" {
         return Err(ModelError::Response);
     }
-    validate_completion(
+    let mut completion = validate_completion(
         choice.message,
         response.usage,
         choice.finish_reason,
         allowed,
-    )
+    )?;
+    completion.message.continuation = super::Continuation::chat(&raw["choices"][0]["message"], &completion.message)?;
+    Ok(completion)
 }
 pub(super) fn validate_completion(
     message: AssistantReply,

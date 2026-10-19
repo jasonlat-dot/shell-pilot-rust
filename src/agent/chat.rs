@@ -1,5 +1,6 @@
 //! Desktop text and explicitly enabled SSH tool turns share durable lifecycle and cancellation.
 mod execution;
+mod conversation;
 mod manual_compact;
 pub use super::turns::{History, Turn, TurnState};
 use super::{
@@ -787,7 +788,7 @@ impl Manager {
     ) -> Result<()> where F: FnMut(StreamEvent) -> Fut, Fut: Future<Output=Result<()>> {
         let trace = self.store.diagnostics.trace(&request.request_id,&request.session_id,&request.agent_id);
         let fields = serde_json::json!({"messageBytes":request.message.len(),"attachmentCount":request.attachments.len(),"entry":"text"});
-        trace.request(fields,self.chat_inner(request,target,cancel,send)).await
+        trace.request(fields,Box::pin(self.chat_inner(request,target,cancel,send))).await
     }
     async fn chat_inner<F, Fut>(
         &self,
@@ -937,6 +938,7 @@ impl Manager {
             }
             return Err(recorded(&turn));
         }
+        let conversation = conversation::Conversation::accepted(&self.store, &request, admission.0.target.as_ref(), &runtime.config.model);
         running.finished = false;
         started.store(true, std::sync::atomic::Ordering::Release);
         let turns = Turns::new(self.store.clone());
@@ -1052,6 +1054,7 @@ impl Manager {
         let external_cancel = cancel.clone();
         let internal_cancel = token.clone();
         let completion = result.as_ref().ok().cloned();
+        let failure_message = result.as_ref().err().map(ToString::to_string);
         let turn = worker(move || {
             let cancelled = external_cancel.is_cancelled() || internal_cancel.is_cancelled();
             let (state, code) = if cancelled && state == TurnState::Completed {
@@ -1059,11 +1062,12 @@ impl Manager {
             } else {
                 (state, code)
             };
-            turns.finish(&r, &who, state, &text, code.as_deref(), completion.as_ref())
+            turns.finish_detailed(&r, &who, state, &text, code.as_deref(), completion.as_ref(), failure_message.as_deref())
         })
         .await?;
         running.finished = true;
         heartbeat.cancel();
+        conversation.finished(&turn);
         if turn.state == TurnState::Completed {
             send(StreamEvent::Done {
                 content: turn.result_text.ok_or(Error::Storage)?,

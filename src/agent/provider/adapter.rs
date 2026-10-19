@@ -79,9 +79,6 @@ impl ProviderAdapter for ChatCompletions {
     }
 }
 impl ProviderAdapter for Responses {
-    fn supports_tools(&self) -> bool {
-        false
-    }
     fn response_windows(&self) -> bool {
         true
     }

@@ -638,34 +638,10 @@ async fn execution_failure_and_oversized_output_are_bounded_model_visible_result
 }
 
 #[tokio::test]
-async fn legacy_tool_capability_is_enabled_and_responses_stay_unsupported() {
-    for responses in [false, true] {
-        let model = Model::new(vec![], |c| {
-            if responses {
-                c.provider = ProviderKind::OpenAiResponses;
-                c.completions_path = "responses".into();
-            } else {
-                c.capabilities.tool_calls = false;
-            }
-        })
-        .await;
-        if !responses {
-            assert!(model.client.config().capabilities.tool_calls);
-            assert!(model.requests().is_empty());
-            continue;
-        }
-        let r = registry();
-        let host = Host::new(Behavior::Success(json!(true)));
-        let mut loop_ = ToolLoop::new(&r, input(), Limits::default()).unwrap();
-        assert!(matches!(
-            loop_
-                .run(&model.client, &host, &CancellationToken::new())
-                .await,
-            Err(tool_loop::Error::Model(ModelError::Invalid(_)))
-        ));
-        assert!(model.requests().is_empty());
-        assert!(host.ids.lock().unwrap().is_empty());
-    }
+async fn legacy_tool_capability_is_enabled_by_product_policy() {
+    let model = Model::new(vec![], |c| c.capabilities.tool_calls = false).await;
+    assert!(model.client.config().capabilities.tool_calls);
+    assert!(model.requests().is_empty());
 }
 
 #[tokio::test]
@@ -676,7 +652,7 @@ async fn diagnostic_trace_covers_tools_and_model_followup_without_raw_arguments(
     let trace=sink.trace("tool-trace","chat","model");let r=registry();let host=Host::new(Behavior::Success(json!({"exitCode":0,"status":"healthy"})));
     let mut loop_=ToolLoop::new(&r,input(),Limits::default()).unwrap();
     trace.scope(loop_.run(&model.client,&host,&CancellationToken::new())).await.unwrap();
-    let path=logs.path().join(chrono::Local::now().format("%Y-%m-%d").to_string()).join("tool-trace.jsonl");
+    let path=logs.path().join(chrono::Local::now().format("%Y-%m-%d").to_string()).join("tool-trace.log");
     let raw=std::fs::read_to_string(path).unwrap();let rows:Vec<Value>=raw.lines().map(|line|serde_json::from_str(line).unwrap()).collect();
     for name in ["tool.proposed","tool.authorization_started","tool.execution_started","tool.execution_finished","tool.result_recorded"] {assert!(rows.iter().any(|row|row["event"]==name),"missing {name}");}
     assert_eq!(rows.iter().filter(|row|row["event"]=="model.request_started").count(),2);
