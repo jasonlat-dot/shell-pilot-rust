@@ -8,6 +8,27 @@ fn update(config:ModelConfig)->ModelConfigUpdate {ModelConfigUpdate{config,api_k
 fn ids(values:&[&str])->Vec<String>{values.iter().map(|v|(*v).into()).collect()}
 
 #[test]
+fn channels_keep_creation_order_across_edits_legacy_conversion_and_reopening() {
+    let dir=tempfile::tempdir().unwrap();let path=dir.path().join("order.sqlite");
+    let store=Arc::new(Store::open(&path).unwrap());let repo=ModelRepository::new(store);
+    let first=repo.save_named("z-first","u",0,update(config()),Some("Z first")).unwrap();
+    let second=repo.save_channel("a-second","u",0,update(config()),"A second",ids(&["one","two"])).unwrap();
+    repo.save_channel("other","other",0,update(config()),"Other user",ids(&["one"])).unwrap();
+    let third=repo.save_named("m-third","u",0,update(config()),Some("M third")).unwrap();
+    let order=|repo:&ModelRepository|repo.channels("u").unwrap().into_iter().map(|channel|channel.profile.id).collect::<Vec<_>>();
+    assert_eq!(order(&repo),ids(&["z-first","a-second","m-third"]));
+    repo.save_channel("z-first","u",first.revision,update(config()),"ZZ renamed",ids(&["one","two"])).unwrap();
+    // Removing the initial model must not make the channel as new as its remaining member.
+    repo.save_channel("a-second","u",second.profile.revision,update(config()),"0 renamed",ids(&["two"])).unwrap();
+    repo.save_named("m-third","u",third.revision,update(config()),Some("A renamed")).unwrap();
+    repo.save_channel("0-last","u",0,update(config()),"0 last",ids(&["one"])).unwrap();
+    assert_eq!(order(&repo),ids(&["z-first","a-second","m-third","0-last"]));
+    drop(repo);
+    let repo=ModelRepository::new(Arc::new(Store::open(&path).unwrap()));
+    assert_eq!(order(&repo),ids(&["z-first","a-second","m-third","0-last"]));
+}
+
+#[test]
 fn legacy_profile_upgrades_without_changing_model_identity_and_members_survive_reorder_reopen_and_removal() {
     let dir=tempfile::tempdir().unwrap();let path=dir.path().join("channels.sqlite");
     let store=Arc::new(Store::open(&path).unwrap());let repo=ModelRepository::new(store.clone());

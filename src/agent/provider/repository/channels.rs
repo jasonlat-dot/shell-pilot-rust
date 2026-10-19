@@ -22,7 +22,10 @@ impl ModelRepository {
     pub fn channels(&self,user:&str)->Result<Vec<ModelChannel>> {
         checked_id(user)?;
         let db=self.store.database.lock().map_err(|_|ModelError::Database)?;
-        let mut query=db.prepare("SELECT id FROM agent_model_channels WHERE user_id=?1 UNION ALL SELECT p.id FROM agent_model_profiles p WHERE p.user_id=?1 AND NOT EXISTS(SELECT 1 FROM agent_model_channel_members m WHERE m.user_id=p.user_id AND m.profile_id=p.id) ORDER BY id LIMIT 32")?;
+        // The original profile row is retained when a legacy profile becomes a
+        // channel, is renamed, or its first model is removed. Use its insertion
+        // order for both channel types; updated_at changes on every edit.
+        let mut query=db.prepare("SELECT c.id,p.rowid AS creation_order FROM agent_model_channels c JOIN agent_model_profiles p ON p.user_id=c.user_id AND p.id=c.id WHERE c.user_id=?1 UNION ALL SELECT p.id,p.rowid AS creation_order FROM agent_model_profiles p WHERE p.user_id=?1 AND NOT EXISTS(SELECT 1 FROM agent_model_channel_members m WHERE m.user_id=p.user_id AND m.profile_id=p.id) ORDER BY creation_order,id LIMIT 32")?;
         let ids=query.query_map([user],|r|r.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
         ids.into_iter().map(|id|channel_view(&db,&id,user)).collect()
     }
