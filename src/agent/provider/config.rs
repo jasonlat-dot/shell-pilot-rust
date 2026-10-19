@@ -9,6 +9,7 @@ use url::Url;
 pub enum ProviderKind {
     OpenAiCompatible,
     OpenAiResponses,
+    AnthropicMessages,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -103,6 +104,13 @@ pub struct ModelConfig {
     pub require_api_key: bool,
 }
 impl ModelConfig {
+    pub fn supports_tools(&self) -> bool {
+        super::adapter::select(&self.provider).supports_tools() && self.capabilities.tool_calls
+    }
+    pub(crate) fn uses_response_windows(&self) -> bool {
+        super::adapter::select(&self.provider).response_windows()
+    }
+
     pub fn budget(&self) -> ModelBudget {
         ModelBudget {
             context_window: self.context_window,
@@ -123,7 +131,7 @@ impl ModelConfig {
             return Err(ModelError::Invalid("model name is empty or too long"));
         }
         self.model = self.model.trim().into();
-        if self.remote_compaction && self.provider != ProviderKind::OpenAiResponses {
+        if self.remote_compaction && !self.uses_response_windows() {
             return Err(ModelError::Invalid("remote compaction requires Responses"));
         }
         if !(256..=16_777_216).contains(&self.context_window)
@@ -147,6 +155,7 @@ impl ModelConfig {
                 "parameter is invalid or disabled by model capabilities",
             ));
         }
+        super::adapter::select(&self.provider).normalize_config(&mut self)?;
         if self.base_url.len() > 4096 {
             return Err(ModelError::Invalid("API URL too long"));
         }

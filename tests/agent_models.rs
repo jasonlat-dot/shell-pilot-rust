@@ -486,8 +486,7 @@ fn renaming_profile_keeps_encrypted_key_usable() {
 }
 #[cfg(windows)]
 #[test]
-fn encrypted_keys_survive_restart_without_becoming_public_and_require_explicit_destination_change()
-{
+fn encrypted_keys_survive_restart_and_explicit_url_edits_keep_credentials() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("keys.sqlite");
     let repo = ModelRepository::new(Arc::new(Store::open(&path).unwrap()));
@@ -528,13 +527,24 @@ fn encrypted_keys_survive_restart_without_becoming_public_and_require_explicit_d
     repo.save("model", "alice", 1, update(c.clone(), KeyChange::Keep))
         .unwrap();
     c.base_url = "https://different.example/v1".into();
-    assert!(matches!(
-        repo.save("model", "alice", 2, update(c.clone(), KeyChange::Keep)),
-        Err(ModelError::Invalid(_))
-    ));
-    assert_eq!(repo.get("model", "alice").unwrap().revision, 2);
+    let changed = repo
+        .save("model", "alice", 2, update(c.clone(), KeyChange::Keep))
+        .unwrap();
+    assert!(changed.api_key_configured && changed.ready);
+    assert_eq!(changed.revision, 3);
+    assert_eq!(changed.config.base_url, "https://different.example/v1/");
+    assert!(ModelClient::new(repo.runtime("model", "alice").unwrap()).is_ok());
+    let retained: Vec<u8> = db
+        .query_row(
+            "SELECT api_key FROM agent_model_profiles WHERE id='model'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained, key);
+    assert!(!serde_json::to_string(&changed).unwrap().contains(TEST_KEY));
     let p = repo
-        .save("model", "alice", 2, update(c, KeyChange::Clear))
+        .save("model", "alice", 3, update(c, KeyChange::Clear))
         .unwrap();
     assert!(!p.api_key_configured && !p.ready);
     assert!(matches!(

@@ -1,7 +1,6 @@
 //! Desktop text and explicitly enabled SSH tool turns share durable lifecycle and cancellation.
 mod execution;
 mod manual_compact;
-pub use manual_compact::CompactionResult;
 pub use super::turns::{History, Turn, TurnState};
 use super::{
     provider::{ModelClient, ModelError, ModelRepository},
@@ -9,6 +8,7 @@ use super::{
     Payload, Repository, Target,
 };
 use crate::store::Store;
+pub use manual_compact::CompactionResult;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -31,7 +31,7 @@ pub enum Error {
     ModelRoundLimit,
     #[error("本次处理达到工具调用次数上限，输出回查不占此额度，可在工具与 Skills 设置中调整")]
     ToolCallLimit,
-    #[error("当前工具执行链需要支持 Chat Completions 函数工具的模型")]
+    #[error("当前模型协议不支持工具调用")]
     ToolsUnsupported,
     #[error("Agent 会话或配置不存在")]
     NotFound,
@@ -425,18 +425,14 @@ impl Manager {
                     model_name: p.config.model.clone(),
                     agent_desc: format!(
                         "{} · {}",
-                        if p.config.provider == super::provider::ProviderKind::OpenAiCompatible
-                            && p.config.capabilities.tool_calls
-                        {
+                        if p.config.supports_tools() {
                             "工具默认可用"
                         } else {
                             "文字对话"
                         },
                         p.config.model
                     ),
-                    tools_available: p.config.provider
-                        == super::provider::ProviderKind::OpenAiCompatible
-                        && p.config.capabilities.tool_calls,
+                    tools_available: p.config.supports_tools(),
                 })
                 .collect())
         })

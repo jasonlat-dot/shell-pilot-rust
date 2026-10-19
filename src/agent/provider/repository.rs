@@ -151,18 +151,7 @@ impl ModelRepository {
             return Err(ModelError::Invalid("at most 32 model profiles per user"));
         }
         let key = match update.api_key {
-            KeyChange::Keep => {
-                if let Some((_, old_json, Some(_))) = &previous {
-                    let old: ModelConfig =
-                        serde_json::from_str(old_json).map_err(|_| ModelError::Database)?;
-                    if old.base_url != config.base_url {
-                        return Err(ModelError::Invalid(
-                            "changing API base URL requires an explicit key set/clear",
-                        ));
-                    }
-                }
-                previous.and_then(|r| r.2)
-            }
+            KeyChange::Keep => previous.and_then(|r| r.2),
             KeyChange::Set { value } => {
                 let value = SecretKey::new(value.0)?;
                 Some(

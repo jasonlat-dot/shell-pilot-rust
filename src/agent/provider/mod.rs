@@ -1,5 +1,8 @@
-//! Model configuration and protocol adapter. No Agent tool loop or UI is enabled here.
+//! Provider strategies normalize wire protocols; HTTP and Agent execution remain separate.
+mod adapter;
+mod anthropic;
 mod config;
+mod dispatch;
 mod protocol;
 mod repository;
 pub mod responses;

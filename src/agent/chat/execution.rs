@@ -2,7 +2,6 @@
 use super::*;
 use crate::agent::{
     approvals::{self, Decision},
-    provider::ProviderKind,
     ssh_tools::SshExecutor,
     tool_loop,
     tool_session::ToolSession,
@@ -270,8 +269,7 @@ impl Manager {
             let user = request.user_id.clone();
             worker(move || {
                 let config = models.get(&agent, &user)?.config;
-                Ok(config.provider == ProviderKind::OpenAiCompatible
-                    && config.capabilities.tool_calls)
+                Ok(config.supports_tools())
             })
             .await?
         } else {
@@ -395,9 +393,7 @@ impl Manager {
         let models = ModelRepository::new(self.store.clone());
         let r = request.clone();
         let runtime = worker(move || Ok(models.runtime(&r.agent_id, &r.user_id)?)).await?;
-        if runtime.config.provider != ProviderKind::OpenAiCompatible
-            || !runtime.config.capabilities.tool_calls
-        {
+        if !runtime.config.supports_tools() {
             return Err(Error::ToolsUnsupported);
         }
         tokio::select! {biased; _=cancel.cancelled()=>return Err(ModelError::Cancelled.into()), _=token.cancelled()=>return Err(ModelError::Cancelled.into()), result=self.prepare_attachments(&request,&token)=>result?};

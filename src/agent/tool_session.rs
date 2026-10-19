@@ -359,8 +359,7 @@ impl ToolSession {
             let runtime = ModelRepository::new(repository.store.clone())
                 .runtime(&snapshot.session.agent_id,&binding.user_id)
                 .map_err(|_|tool_loop::Error::Context)?;
-            if runtime.config.provider != provider::ProviderKind::OpenAiCompatible
-                || !runtime.config.capabilities.tool_calls {
+            if !runtime.config.supports_tools() {
                 return Err(tool_loop::Error::Context);
             }
             context::require_pinned(&snapshot,None,&message,&runtime,&tools,None)?;

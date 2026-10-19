@@ -265,15 +265,13 @@ impl ModelClient {
             return Err(ModelError::ResponseTooLarge);
         }
         let operation = async {
-            let mut request = self
+            let request = self
                 .client
                 .post(endpoint)
+                .headers(self.headers.clone())
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::ACCEPT, "application/json")
                 .body(bytes);
-            if let Some(auth) = &self.authorization {
-                request = request.header(header::AUTHORIZATION, auth.clone());
-            }
             let mut response = request.send().await.map_err(network)?;
             if !response.status().is_success() {
                 return Err(
@@ -441,14 +439,12 @@ impl ModelClient {
         self.require_fit(prepared.input_tokens)?;
         prepared.body["stream"] = true.into();
         let operation = async {
-            let mut request = self
+            let request = self
                 .client
                 .post(self.config.endpoint()?)
+                .headers(self.headers.clone())
                 .header(header::ACCEPT, "text/event-stream")
                 .json(&prepared.body);
-            if let Some(auth) = &self.authorization {
-                request = request.header(header::AUTHORIZATION, auth.clone());
-            }
             let mut response = request.send().await.map_err(network)?;
             if !response.status().is_success() {
                 return Err(ModelError::Http(response.status().as_u16()));

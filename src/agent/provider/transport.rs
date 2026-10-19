@@ -1,4 +1,4 @@
-use super::{protocol::decode_response, *};
+use super::*;
 use reqwest::{header, redirect::Policy, Client};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -9,7 +9,8 @@ pub struct ModelClient {
     pub(super) config: ModelConfig,
     pub(super) binding: super::responses::Binding,
     pub(super) client: Client,
-    pub(super) authorization: Option<header::HeaderValue>,
+    pub(super) headers: header::HeaderMap,
+    pub(super) adapter: &'static dyn super::adapter::ProviderAdapter,
 }
 pub(super) fn network(error: reqwest::Error) -> ModelError {
     if error.is_timeout() {
@@ -30,16 +31,8 @@ impl ModelClient {
         if config.require_api_key && runtime.api_key.is_none() {
             return Err(ModelError::KeyMissing);
         }
-        let authorization = runtime
-            .api_key
-            .map(|key| {
-                let key = SecretKey::new(key.0)?;
-                let mut value = header::HeaderValue::from_str(&format!("Bearer {}", key.0))
-                    .map_err(|_| ModelError::Credentials)?;
-                value.set_sensitive(true);
-                Ok::<_, ModelError>(value)
-            })
-            .transpose()?;
+        let adapter = super::adapter::select(&config.provider);
+        let headers = adapter.headers(runtime.api_key.as_ref())?;
         let endpoint = config.endpoint()?;
         let mut builder = Client::builder()
             .redirect(Policy::none())
@@ -58,11 +51,12 @@ impl ModelClient {
             binding,
             config,
             client,
-            authorization,
+            headers,
+            adapter,
         })
     }
 
-    /// B1 non-streaming adapter. Streaming and persisted Agent turns are B2/B3.
+    /// Non-streaming request through the selected wire strategy.
     pub async fn complete(
         &self,
         request: &ChatRequest,
@@ -71,20 +65,18 @@ impl ModelClient {
         if cancel.is_cancelled() {
             return Err(ModelError::Cancelled);
         }
-        if self.config.provider == ProviderKind::OpenAiResponses {
+        if self.adapter.response_windows() {
             return self.complete_responses(request, cancel).await;
         }
         let prepared = prepare_request(&self.config, request)?;
         let operation = async {
-            let mut request = self
+            let request = self
                 .client
                 .post(prepared.endpoint)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::ACCEPT, "application/json")
+                .headers(self.headers.clone())
                 .body(prepared.body);
-            if let Some(auth) = &self.authorization {
-                request = request.header(header::AUTHORIZATION, auth.clone());
-            }
             let mut response = request.send().await.map_err(network)?;
             if !response.status().is_success() {
                 // Do not return provider error bodies: providers may echo secrets or prompts.
@@ -103,7 +95,7 @@ impl ModelClient {
                 }
                 bytes.extend_from_slice(&chunk);
             }
-            decode_response(&bytes, &prepared.allowed_tools)
+            self.adapter.decode(&bytes, &prepared.allowed_tools)
         };
         tokio::select! {
             biased;

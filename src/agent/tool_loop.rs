@@ -7,7 +7,7 @@ mod schema;
 use super::approvals::{Approvals, Policy};
 use super::provider::{
     prepare_request, AssistantReply, ChatMessage, ChatRequest, FunctionDefinition, ModelClient,
-    ModelError, ProviderKind, ToolCall,
+    ModelError, ToolCall,
 };
 use futures_util::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use schema::Schema;
@@ -381,9 +381,9 @@ impl<'a> ToolLoop<'a> {
         cancel: &CancellationToken,
     ) -> Result<AssistantReply> {
         // Responses currently owns opaque text-only windows. Never flatten them or
-        // silently use a Chat Completions tool loop with a different protocol.
-        if client.config().provider != ProviderKind::OpenAiCompatible {
-            return Err(ModelError::Invalid("tool loop requires Chat Completions").into());
+        // silently enter the normalized tool loop with an unsupported protocol.
+        if !client.config().supports_tools() {
+            return Err(ModelError::Invalid("model protocol does not support tool calls").into());
         }
         loop {
             if cancel.is_cancelled() {

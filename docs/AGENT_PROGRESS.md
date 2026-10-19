@@ -1,5 +1,85 @@
 # Rust SSH Agent 实施清单与续接入口
 
+### DeepSeek 最新服务器对话失败排查（2026-10-19，仅定位阶段，未修复）
+
+- [x] 只读核对本地会话 `e83f53f1-a10e-4446-acd1-66c06480b4c0`：项目“凯平哥”、模型 `deepseek-flash`、Chat Completions。北京时间 17:10:47 开始，17:11:03 失败，保存错误为 `MODEL_HTTP_ERROR`；`ssh_execute` 已完成且退出码为 0，工具结果事件先于失败事件，失败发生于工具结果返回后的模型继续请求。
+- [x] 核对 `src/agent/provider/dispatch.rs` / `transport.rs` 和 `src/agent/chat.rs`：非成功 HTTP 返回仅临时保留状态码，持久会话归并为 `MODEL_HTTP_ERROR`，原始响应状态码与错误正文未持久保存，现有日志不能进一步区分 400 / 429 / 5xx。最新模型配置修订为 5、更新时间 17:18:52，晚于报错；本地留存信息不能完整恢复当时配置。
+- [x] 经用户分两次明确授权，使用当前已存 DeepSeek 凭据向原官方地址发起 3 次非流式及 3 次流式合成请求，均 HTTP 200；仅合成工具回合，不执行 SSH、不发送真实命令输出、不修改应用数据、不输出密钥。首个合成响应没有非空 `reasoning_content`，遗漏该字段仍成功，故不能将本次真实失败断定为缺少思考回传。官方文档虽要求思考工具回合回传该字段，但当前探测未复现这个错误。
+- [ ] 原始 HTTP 失败的具体状态/上游原因仍未证实。后续需补充安全的 HTTP 状态持久记录与界面提示，再对实际失败请求进行定位；`reasoning_content` 透传缺口仅为待验证兼容问题，不标为本次根因或已修复。
+- 本轮仅排查并记录进度，未改产品代码、未重发用户请求或远端命令，未运行全量或打包。
+
+### 模型地址编辑与全局 Toast 错误反馈（2026-10-19）
+
+- [x] 前端 master / Rust main：移除 `ModelSettings.tsx` 和 `src/agent/provider/repository.rs` 的“改地址必须重填/清除密钥”限制。修改地址并留空 API Key 使用 `KeyChange::Keep` 保留原加密密钥；显式替换/清除、版本校验、密钥不回显及 Responses 旧窗口失效机制保留。未改 MCP 服务凭据的目标绑定规则。
+- [x] 客户端 `src/state/useToastError.ts` 提供复用错误状态和外部错误通知桥接。模型、工作区、工具/MCP/Skills、SSH 表单/操作、记忆、项目/历史编辑删除、常用命令、下载、聊天输入、更新和外观字段校验统一使用现有全局 Toast，移除对应页内错误条。保留输入、无效字段标记及独立重试入口；主动操作重复失败可再提示，工具状态轮询抑制相同错误。终端断连/读取重试、附件资源失败、工具执行证据、队列及传输状态继续在原位展示。
+- [x] 验证仅覆盖改动与直接影响范围：前端相关组件/Toast **152 项通过**，TypeScript、Vite 资源构建、diff 格式检查通过。Rust 定向 **2 项通过**：`agent_models::encrypted_keys_survive_restart_and_explicit_url_edits_keep_credentials` 验证地址修改后密文保留与可解密、随后可清除；`agent_responses::endpoint_model_protocol_and_key_changes_never_reuse_an_opaque_window` 验证地址/模型/协议/密钥变化仍不复用旧压缩窗口。初轮部分前端断言仍检查旧内联错误，适配 Toast 后全部通过。Rustfmt 检查发现库文件此前已有无关排版差异，未扩散修改；本次测试代码按格式整理。
+- [x] 同步客户端 `docs/operation-feedback.md` / `docs/agent-model-settings.md`。未全量回归、未实际视觉验收、未提交推送或打包，保留已有未提交改动。含 Rust 库变更，桌面测试需重启 `npm run tauri dev` 重新编译，单独刷新前端不足以更新服务端校验。
+
+### 模型设置：容量缩写与紧凑卡片（2026-10-19）
+
+- [x] 客户端 master：`src/components/ModelSettings.tsx` 使用十进制 K/M 容量缩写，如 `200K tokens` / `256K tokens`，去除“上下文”前缀，完整数值保留于 title；协议和容量使用蓝/紫柔和标签高亮。`.css` 将卡片宽度限制为 360px 并收紧内边距、行距及底部操作区，保留窄屏适配。
+- [x] 定向展示/删除 **2 项通过**，TypeScript 检查通过；展示断言首次因 JSX 子节点额外空格失败，统一字符串后复测通过。未实际视觉验收，未运行全量或打包，保留已有改动。
+
+### 模型设置：卡片信息统一标签风格（2026-10-19）
+
+- [x] 客户端 master：`src/components/ModelSettings.tsx` / `.css` 去除配置卡片上重复的供应商兼容文字；协议、上下文及 URL 均复用中性 `Badge` 标签样式，移除原大块信息底色，协议与上下文一行可换行、URL 独立一行并支持长地址省略。供应商选择菜单名称保持不变。
+- [x] `tests/model-compaction-ui.test.mjs` 相关展示/删除 **2 项通过**，TypeScript 和相关文件 diff 格式检查通过；未实际视觉验收，未运行全量或打包，保留已有改动。
+
+### 模型设置：配置卡片层级与操作统一（2026-10-19）
+
+- [x] 客户端 master：`src/components/ModelSettings.tsx` / `.css` 调整配置卡片的名称、状态、协议及连接信息层级；名称 14px、状态与辅助信息 12px，状态圆点增至 7px，使用随主题变化的绿/琥珀色底。地址与上下文集中展示，操作区独立靠右，编辑/删除统一为图标加文字按钮；支持长名称、长地址与窄屏换行。
+- [x] 仅验证卡片供应商展示和删除确认/失败重试/成功刷新 **2 项通过**；TypeScript 与相关文件 diff 格式检查通过。未实际视觉验收，未运行全量或 Rust 测试，未打包，保留原有未提交改动。
+
+### 模型设置：Claude 品牌图标修正（2026-10-19）
+
+- [x] 客户端 master：`src/components/ModelSupplierIcon.tsx` 将 Anthropic 字母标志替换为用户指定的 Claude 放射图标，使用暖橙色 `#D97757`；下拉菜单、当前值、配置卡片和删除摘要共用组件同步生效。图标沿用 Lobe Icons 本地 SVG，更新 `public/licenses/lobe-icons.txt` 标注。
+- [x] 仅运行 `tests/model-supplier-icon.test.mjs`，SVG、菜单显示及文字选项键盘行为 **3 项通过**。未实际视觉验收，未运行全量、未打包，保留已有改动。
+
+### 模型设置：删除确认弹窗排版（2026-10-19）
+
+- [x] 客户端 master：`src/components/ModelSettings.tsx` / `.css` 为删除确认添加供应商品牌图标及名称/模型摘要卡片，统一标题、正文、底栏留白，调整圆角与阴影，去除弹窗容器默认轮廓；保留操作按钮键盘焦点提示、原确认及错误重试流程。
+- [x] 仅验证直接相关范围：`tests/model-compaction-ui.test.mjs` 中删除确认/失败重试/成功刷新 **1 项通过**；TypeScript 检查通过。未实际界面视觉验收，未运行全量或 Rust 测试，未打包。保留已有未提交改动。
+
+### 模型设置：供应商图标与精简排版（2026-10-19）
+
+- [x] 客户端 master：供应商下拉仅显示品牌图标＋“OpenAI 兼容 / Anthropic 兼容”，移除说明列；已配置卡片以对应品牌图标替代机器人头像。精简重复的页面/协议/密钥描述，调整头像、名称、标签及操作区间距，沿用设置主题。
+- [x] 代码：`src/components/ModelSupplierIcon.tsx` 内置 OpenAI / Anthropic SVG，随主题文字着色；`Select.tsx` / `.css` 新增通用可选图标渲染，原文字型选项行为不变；`ModelSettings.tsx` / `.css` 与 `src/api/modelProtocols.ts` 统一供应商展示。图标来自 Lobe Icons，MIT 许可证包含于 `public/licenses/lobe-icons.txt`，无额外运行时依赖或图标网络请求。
+- [x] 本次直接相关验证：`tests/model-supplier-icon.test.mjs`、`tests/model-compaction-ui.test.mjs`、`tests/model-protocols.test.ts` 共 **25 项通过**，覆盖实际 SVG、菜单选项和当前值、纯文字 Select 键盘操作、供应商/协议/地址/密钥/整理参数保存；TypeScript 与 Vite 资源构建通过。未进行实际界面视觉验收，未运行全量或 Rust 回归、未提交或打包，保留已有工作区改动。
+
+### 模型配置：基础地址改为占位提示（2026-10-19）
+
+- [x] 客户端 master：`src/components/ModelSettings.tsx` 新建配置的 API 基础地址保持空值；`src/api/modelProtocols.ts` 供应商目录仅提供 placeholder，不再在切换供应商/协议时自动填入网址。已有配置及用户输入地址保留，未填写真实地址时明确提示并阻止保存。
+- [x] 只验证相关范围：供应商/协议切换、新建地址提示与保存、已有配置恢复 **5 项定向测试通过**；TypeScript 检查通过。同步客户端 `docs/agent-model-settings.md`；未运行全量、未修改 Rust 产品代码、未打包。
+
+### 模型设置：配置概览与供应商弹窗（2026-10-19）
+
+- [x] 客户端 master：`src/components/ModelSettings.tsx` / `.css` 改为配置卡片列表；无配置时展示空状态，新建和编辑在独立弹窗完成。卡片展示名称、模型、供应商、协议、地址和状态，支持编辑、确认删除与刷新；保存成功关闭并更新列表，失败保留草稿，取消丢弃，保存时禁止关闭。
+- [x] `src/api/modelProtocols.ts` 以供应商目录组织协议：OpenAI / 兼容服务下选 Chat Completions 或 Responses，Anthropic / Claude 展示原生 Messages。旧配置按原协议恢复供应商，官网默认地址切换、自定义代理地址保留，沿用已有密钥保留/替换与稳定配置 ID；不改 Rust 代码或数据库。弹窗复用现有 Modal/Select/数字控件、设置主题和焦点管理，宽窄屏分栏、固定底栏与内部滚动。
+- [x] 按用户要求只验证本次及直接影响范围：`tests/model-compaction-ui.test.mjs` 与 `tests/model-protocols.test.ts` 共 **21 项通过**，覆盖新建/编辑/取消/删除、失败恢复、供应商、密钥、原有整理比例与远端整理参数保存；TypeScript、Vite 资源构建通过。实际界面视觉验收未完成，未运行全量或 Rust 回归、未提交或打包，保留已有未提交改动。使用说明见客户端 `docs/agent-model-settings.md`。
+
+### Tauri 开发启动：Cargo 路径发现修复（2026-10-19）
+
+- [x] 修复用户 `npm run tauri dev` 报 `cargo metadata ... program not found`：Rust 已安装但终端 PATH 缺失 Cargo。客户端 master 的 `scripts/node-runtime.mjs` 新增 Cargo 环境发现，Tauri dev/build 优先使用现有可运行 Cargo，再检查 `CARGO_HOME/bin` 与用户 `.cargo/bin`；只调整子进程 PATH，保留 Node、npm、Rustup 等环境，失败明确提示。未改系统 PATH、未安装工具链。
+- [x] 按用户最新要求只做相关验证：`tests/node-runtime.test.mjs` **10/10 通过**；模拟 PATH 不含 Cargo 后，实际 `cargo metadata --no-deps --format-version 1 --offline` 成功；系统旧 Node 启动 `node scripts/node-runtime.mjs tauri dev --help` 成功。未启动 GUI、未重新编译 Rust、未跑全量或打包。README 同步启动说明；保留两个仓库已有未提交改动。
+
+### Claude Messages 协议与供应商策略（2026-10-19，已接通并完成本地回归）
+
+- E4 已按用户明确要求取消，不再实施；保留历史记录，不把取消标成迁移完成。
+- Rust main / 前端 master：前端按用户最新明确要求直接在 master 修改，覆盖原 test-rust-ui 约定；保留未提交改动，未提交或推送。此前为续接快进过本地 test-rust-ui 到 148c11c，目前已切回 master。
+- [x] 已接通 Anthropic Messages：`src/agent/provider/adapter.rs` 为策略接口及单一工厂，`transport.rs` / `dispatch.rs` 共用 HTTP 生命周期，`anthropic.rs` / `anthropic/stream.rs` 实现原生认证、文字/图片、工具编解码和 SSE。`config.rs` / `protocol.rs` 提供共享预算/配对/完成校验；`tool_loop.rs`、`tool_session.rs`、`chat/execution.rs`、`compact/auto.rs` 按能力选择，不向 Agent 主循环堆供应商分支。
+- [x] 前端 `src/api/modelProtocols.ts` 统一协议目录，`ModelSettings.tsx` 新增 Claude 选项、messages 路径、max_tokens 与 0–1 Temperature；`ComposerReasoningControl.tsx` 显示常规模式。Key 仍由原生仓库加密保存，schema 21 无迁移。
+- 边界：当前仅常规 Messages，显式禁用 thinking；扩展/自适应思考签名历史、Bedrock/Vertex 专用认证与供应商服务端工具未实现。Responses 窗口/计数/远端整理保持专属路径；Claude 使用本地摘要整理。架构与扩展方法见 [MODEL_PROTOCOLS.md](MODEL_PROTOCOLS.md)。
+- [x] 用户最新要求测试，覆盖此前“不用验证”要求：Rust 全目标 **428 项通过、0 失败、6 项既有忽略**；原生库 **50 项**、前端 **439 项**通过；Rust 生产库严格 Clippy、TypeScript 与 Vite 构建通过。Rust 忽略项为 5 项需真实配置的 E6 测试及 1 项需 POSIX 的 Shell 测试，本次没有新增忽略项。新增 `provider/anthropic/tests.rs`（8 项）、`tests/agent_anthropic.rs`（3 项）及前端 `tests/model-protocols.test.ts` / `model-compaction-ui.test.mjs`（3 项）；覆盖认证、原生请求、图片估算、流片段、工具授权/执行/回传与断流不重试，旧 OpenAI / Responses 回归通过。
+- 验证记录：后端 `target/claude-regression.txt`（24 个测试目标汇总）；前端 `src-tauri/target/claude-ui-tests.txt`。最初工具集成用例未启用流式上下文却模拟 SSE，2/3 通过；补上与桌面一致的 `LoopContext` 后 3/3 通过，最终已包含在 428 项全量结果内。Windows 并行链接内存不足，停止过时构建并改为串行；不把中断构建算测试成功。原生计数采用前一次完整 50/50、exit 0 的结果；串行脚本后来重复启动的原生运行已停止，不将该次部分记录计作成功。原生首次缺失依赖和后端说明资源，按锁文件及现有资源脚本补齐后 50/50 通过。
+- 使用临时库、测试 Key 与本地回环模型，不调用真实 Claude 或用户 SSH；未做桌面视觉验收、未生成安装包。前端使用现有兼容 Node；真实 Claude 供应商与具体模型兼容性仍需配置后联调，历史 E6 验收不代表本次真实模型验收。
+
+### 最新仓库与任务状态同步（2026-10-19）
+
+- [x] 已 fetch Rust github 与客户端 origin，并核对跟踪分支：两边领先/落后均为 0/0，无需合并或拉取代码。Rust 当前 main/fd7e46a（github/main）；客户端当前 master/148c11c（origin/master），版本均为 v0.2.1。客户端旧 test-rust-ui 仍为 55d907e/v0.2.0；本次仅记录实际分支，没有切换分支或修改 AGENTS 约定。
+- [x] 对照实际源码、发布说明与现有验收记录：A/B/C、D1–D5、E1–E3、E5、E6 已完成，E4 继续暂缓，schema 21。E6 按 2026-10-18 验收记录完成，不将此前各历史段落里的“下一项 E3/E6”当作当前任务游标。
+- 最新 v0.2.1 已接入空闲对话主动压缩及取消（Rust chat/manual_compact.rs、客户端 AgentContextStatus/原生 compact_context）、托盘隐藏/单实例恢复、窗口边缘缩放、SSH 三步引导、正式名称和 com.jasonlat.shellpilot 数据目录迁移；细节见两端 docs/releases/v0.2.1.md。
+- 同步前两个工作区均干净，本次只更新本进度文件；未修改产品代码，未运行测试/类型检查/构建/真实请求，未提交、推送或打包。后续按用户需求继续产品优化，E4 不自动启动。
+
 ### E6：回归及真实环境验收完成（2026-10-18）
 
 - [x] 后端全目标 410 项、原生 57 项、前端 415 项通过，显式 POSIX Shell 隔离测试通过；两端严格 Clippy、TypeScript 与 Vite 构建通过。真实 SSH / 登录与 sudo SFTP / MCP / Skills 5 项重试通过，另完成 Baidu MCP 固定公开查询。
@@ -363,7 +443,7 @@
 - Rust ModelRepository::runtime 在 requireApiKey=false 时不解密、不返回运行密钥，确保关闭认证后 HTTP 请求不携带已保存的 Bearer token；加密凭据保留，重新启用时复用。未修改数据库结构。
 - 用户随后要求简单测试保存与认证：前端模型设置 9 项、Rust agent_models 21 项及 TypeScript 检查通过。使用虚拟密钥、临时数据库和本机 HTTP 服务确认留空保留、输入替换、关闭认证不发送 Authorization、重新启用恢复密钥、替换后重启仍使用新密钥；同时验证公开配置不回显密钥和变更地址必须显式处理原密钥。调整旧测试以匹配工具默认启用及禁用认证不解密的现行行为。未做构建或 GUI 验证；未提交。
 
-更新日期：2026-10-18。状态：A/B/C 当前文字阶段、D1–D5、E1–E3、E5 和 E6 已完成；schema 21。E4 按用户要求暂缓。E5 首次 A 17/18、B 18/18 的原始统计保留；E6 的回归、真实服务及压力复测结果和用户 GUI 确认见顶部验收记录。后续按用户需求优化产品，用户自行打包。
+更新日期：2026-10-19。状态：A/B/C 当前文字阶段、D1–D5、E1–E3、E5 和 E6 已完成；schema 21。E4 已按用户要求取消，不再实施。E5 首次 A 17/18、B 18/18 的原始统计保留；E6 的回归、真实服务及压力复测结果和用户 GUI 确认见顶部验收记录。后续按用户需求优化产品，用户自行打包。
 最新桌面执行模式：工具使用绑定终端的当前 POSIX Shell（继承已完成的 sudo 切换），工具输出走每次调用专属的描述符/SSH 收集通道；终端展示真实命令、结果和真实提示符，隐藏内部协议。下文早期“独立 exec 不继承终端”记录属于历史阶段，以末尾最新章节为准。
 用户要求：参考 Codex CLI 优化上下文和工具决策；先列清单，每完成一项更新标记，供换窗口后续接。当前不打包。需要修改前端的阶段同步修改 test-rust-ui。
 源码参考与设计依据：[CODEX_AGENT_REFERENCE.md](CODEX_AGENT_REFERENCE.md)。本文件是进度唯一入口，完成标记必须有代码与验证证据，不以“已设计”替代“已实现”。
@@ -445,7 +525,7 @@ Rust 重构交接、已完成工作与运行方式见 [WORK_HANDOFF_2026-10-14.m
 - [x] E1 图片/PDF/文本附件到模型的转换、能力/预算/所有权检查。schema 17 的不可变会话快照、原生模型媒体输入、历史/整理/回查与前端系统选择器已接通；专项 11、前端 69、native 完整链路单项及相关兼容回归通过。PDF 仅提取文字，OCR/Office/拖入尚未支持；剪贴板图片和 Windows 复制文件已在 E1 补充接通。实际 WebView/模型/远端仍待 E6。
 - [x] E2 长期记忆与短期任务上下文分离，来源/更新时间/适用目标。schema 18 独立持久保存用户确认的偏好/经验，全局/精确服务器范围、有界模型注入、编辑/停用/删除及前端原生入口已接通；Rust 194、前端 48、原生派发 1 项通过，既有 POSIX 1 项忽略，详见顶部 E2 记录。
 - [x] E3 子 Agent 与工作流、MCP、Skills，继承目标和授权边界。单层有界子任务、MCP 两种传输、Skills 渐进读取及桌面入口已接通并完成本地验证，详见顶部记录及 E3_EXTENSIONS.md。
-- [ ] E4 旧数据导入设计与迁移验证（连接、聊天、附件、记忆）。**按用户要求暂缓（2026-10-18）**。
+- ~~E4 旧数据导入设计与迁移验证（连接、聊天、附件、记忆）~~。**用户明确取消，不再实施（2026-10-19），并非已完成迁移。**
 - [x] E5 同模型固定任务 A/B 评测：完成全新 36 场景及完成率、约束/事实/目标、token、延迟、额外调用、重复执行统计。首次 A 17/18、B 18/18；唯一失败项独立补测通过，原始统计和风险保留。完整报告见 evals/e5/results/full-ab-2026-10-18/REPORT.md。
 - [x] E6 全部前后端回归、真实模型/GUI/远端验收；自动结果与用户确认边界见顶部记录及 evals/e6/results/2026-10-18/REPORT.md。用户要求时再生成安装包。
 
@@ -455,7 +535,7 @@ A/B/C 当前文字阶段、D1–D5、E1 附件及 E2 长期记忆已完成本地
 
 E2 已接通用户确认保存、跨会话/模型的全局偏好、精确服务器范围的经验、来源/更新时间及前台管理。记忆独立于原始事件和任务检查点，按范围和预算重新注入，不能产生执行权限或冒充实时状态。Rust 194 项通过、既有 POSIX 1 项忽略，前端 48、原生 IPC 专项 1 项通过；首轮旧夹具失败及复测过程见顶部 E2 记录，不冒充一次全项目或真实服务验收。
 
-E5 与 E6 已完成并勾选，报告保留 E5 首次 35/36 通过及唯一失败项的独立补测证据；E6 记录完整回归、真实服务、10/10 长历史压力复测和用户 GUI 确认。E4 继续暂缓，后续按用户需求处理产品优化。E3 的单层子任务、MCP 与 Skills 已接通；Responses 工具协议、本机通用命令及后台/递归协作仍未开放；扫描 PDF/OCR/Office 和拖入上传尚未接通，剪贴板图片及 Windows 复制文件已在 E1 补充中实现。用户自行打包。
+E5 与 E6 已完成并勾选，报告保留 E5 首次 35/36 通过及唯一失败项的独立补测证据；E6 记录完整回归、真实服务、10/10 长历史压力复测和用户 GUI 确认。E4 已取消，后续按用户需求处理产品优化。E3 的单层子任务、MCP 与 Skills 已接通；Responses 工具协议、本机通用命令及后台/递归协作仍未开放；扫描 PDF/OCR/Office 和拖入上传尚未接通，剪贴板图片及 Windows 复制文件已在 E1 补充中实现。用户自行打包。
 
 ## 验证与完成记录
 

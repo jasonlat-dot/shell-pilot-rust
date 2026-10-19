@@ -1,6 +1,6 @@
 # B1：Rust 模型配置与适配器
 
-本阶段完成模型配置、安全保存 API Key、请求预算与 OpenAI 兼容 Chat Completions 协议适配。它是桌面应用内部的 Rust 库，不启动后端监听端口。这里的 API 地址是模型服务地址。
+本阶段完成模型配置、安全保存 API Key、请求预算与模型协议适配（OpenAI Chat Completions / Responses、Anthropic Messages）。它是桌面应用内部的 Rust 库，不启动后端监听端口。这里的 API 地址是模型服务地址。
 
 B4 已接通前端“设置 → 模型设置”和基础文本 AI 面板，使用本适配器的加密配置；使用说明见 [模型设置教程](../../ai-ssh-terminal-client/docs/agent-model-settings.md)。B2 基础文本 IPC/Channel 见 [AGENT_CHAT.md](AGENT_CHAT.md)，B3 持久轮次与恢复见 [AGENT_TURNS.md](AGENT_TURNS.md)。C2 已在文字请求前接入普通模型自动整理，C3 已补 Responses 与明确启用的远端整理；D5 已接通 SSH 工具；E1 附件输入的当前实现与边界见 AGENT_CHAT.md。
 
@@ -60,13 +60,13 @@ C5 已在 AI 面板展示最近输入占用、估算/供应商计数来源和真
 | 参数 | 效果与边界 |
 | --- | --- |
 | `baseUrl`、`completionsPath` | 基础 URL 与相对路径拼接；保留代理前缀，如 `/proxy/v1/`。路径允许一个开头 `/`，仍相对基础前缀拼接。拒绝跨站 URL、`..`、查询串、片段及编码路径；基础 URL 不接受用户名/密码或查询串。 |
-| provider、remoteCompaction | openAiCompatible 为普通 Chat Completions；openAiResponses 为 Responses，须支持输入 token 计数。remoteCompaction 默认为 false，仅允许 Responses 按供应商支持情况明确开启。 |
+| provider、remoteCompaction | openAiCompatible 为普通 Chat Completions；openAiResponses 为 Responses，须支持输入 token 计数；anthropicMessages 为原生 Claude Messages。remoteCompaction 默认为 false，仅允许 Responses 按供应商支持情况明确开启。 |
 | `model` | 供应商实际支持的模型 ID，去除两端空白；不是客户端显示名称。 |
 | `contextWindow` | 模型上下文窗口，范围 256–16777216 token。 |
 | `outputReserve`、`safetyReserve` | 输出与安全预留；输出必须大于 0，两者之和必须小于窗口。 |
 | `compactPercent` | 可用输入预算的整理触发比例，1–99；默认 75。C2 据此触发摘要，提交前须降至其 80% 的较低水位（默认 60%）。前端高级参数可编辑。 |
 | `outputTokenParameter` | `maxCompletionTokens` 发 `max_completion_tokens`；兼容供应商需要旧字段时用 `maxTokens`，一次只发送一种字段；Responses 固定使用 max_output_tokens。 |
-| `capabilities` | 函数工具默认启用，读取/保存旧配置时将 toolCalls 归一为 true，前台不再提供开关；实际工具协议仍仅支持 Chat Completions。其他字段声明 developer 角色、temperature、reasoning 参数等支持情况，不代表已通过真实服务探测；vision 与工具一样默认 true，读取/保存旧配置时将关闭值归一为 true，前台不再提供开关；支持 PNG/JPG/WEBP 图片输入，PDF 仍仅提取文字。 |
+| `capabilities` | 函数工具默认启用，读取/保存旧配置时将 toolCalls 归一为 true，前台不再提供开关；实际工具协议支持 Chat Completions 与 Claude Messages。其他字段声明 developer 角色、temperature、reasoning 参数等支持情况，不代表已通过真实服务探测；vision 与工具一样默认 true，读取/保存旧配置时将关闭值归一为 true，前台不再提供开关；支持 PNG/JPG/WEBP 图片输入，PDF 仍仅提取文字。 |
 | `temperature` | `null` 表示不发送；设置时必须支持该参数，值在 0–2 之间。 |
 | `reasoningEffort` | `null` 表示不发送；可配置 `none/minimal/low/medium/high/xhigh`，需要能力开关。具体模型接受哪些值需按供应商文档选择。 |
 | `timeoutSeconds` | 整次请求总时限，包含发请求和读取响应，1–600 秒；连接时限最多 30 秒。 |
@@ -95,7 +95,7 @@ Windows 复用现有 DPAPI，加密范围绑定当前 Windows 账户以及用户
 
 ## 协议与错误
 
-协议参考 [OpenAI Chat Completions 创建接口](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)。B1 的 complete 接口实现非流式请求；B2 新增基础文本 stream，见 [AGENT_CHAT.md](AGENT_CHAT.md)。C3 已新增 Responses 文字对话与 standalone compact 分支；没有 Anthropic 原生协议。
+协议参考 [OpenAI Chat Completions 创建接口](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)。B1 的 complete 接口实现非流式请求；B2 新增基础文本 stream，见 [AGENT_CHAT.md](AGENT_CHAT.md)。C3 已新增 Responses 文字对话与 standalone compact 分支；现已新增 Anthropic 原生 Messages 策略，常规文字/图片/工具模式及扩展边界见 [模型协议策略](MODEL_PROTOCOLS.md)。
 
 支持文本 system/developer/user/assistant/tool 消息与 function 工具定义。函数调用参数必须是 JSON 对象，调用 ID 唯一，历史中的每次调用必须有结果；未定义工具、重复/孤立结果、未完成工具组均在发请求前拒绝。这里只校验协议，不执行 SSH 工具、不授予工具权限；执行参数 schema、目标和确认策略仍属于 D1–D3。
 

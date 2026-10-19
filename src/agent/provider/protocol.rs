@@ -129,9 +129,12 @@ pub(crate) fn measure_request(
     request: &ChatRequest,
 ) -> Result<PreparedRequest> {
     let config = config.clone().normalized()?;
-    if config.provider == ProviderKind::OpenAiResponses {
-        return super::responses::measure(&config, request);
-    }
+    super::adapter::select(&config.provider).measure(&config, request)
+}
+pub(super) fn validate_request(
+    config: &ModelConfig,
+    request: &ChatRequest,
+) -> Result<HashSet<String>> {
     if request
         .messages
         .iter()
@@ -187,6 +190,10 @@ pub(crate) fn measure_request(
     if !pending.is_empty() {
         return Err(ModelError::ToolProtocol);
     }
+    Ok(allowed)
+}
+pub(super) fn measure_chat(config: &ModelConfig, request: &ChatRequest) -> Result<PreparedRequest> {
+    let allowed = validate_request(config, request)?;
     let messages: Vec<Value> = request
         .messages
         .iter()
@@ -280,22 +287,35 @@ pub(crate) fn decode_response(bytes: &[u8], allowed: &HashSet<String>) -> Result
     if choice.index != 0 || choice.message.role != "assistant" {
         return Err(ModelError::Response);
     }
-    let has_calls = !choice.message.tool_calls.is_empty();
-    if !matches!(choice.finish_reason.as_str(), "stop" | "tool_calls") {
+    validate_completion(
+        choice.message,
+        response.usage,
+        choice.finish_reason,
+        allowed,
+    )
+}
+pub(super) fn validate_completion(
+    message: AssistantReply,
+    usage: Option<Usage>,
+    finish_reason: String,
+    allowed: &HashSet<String>,
+) -> Result<Completion> {
+    let has_calls = !message.tool_calls.is_empty();
+    if !matches!(finish_reason.as_str(), "stop" | "tool_calls") {
         return Err(ModelError::Incomplete);
     }
-    if has_calls != (choice.finish_reason == "tool_calls")
-        || !has_calls && choice.message.content.is_none() && choice.message.refusal.is_none()
+    if has_calls != (finish_reason == "tool_calls")
+        || !has_calls && message.content.is_none() && message.refusal.is_none()
     {
         return Err(ModelError::Response);
     }
     validate_calls(
-        &choice.message.tool_calls,
+        &message.tool_calls,
         allowed,
         &mut HashSet::new(),
         &mut HashSet::new(),
     )?;
-    if let Some(usage) = &response.usage {
+    if let Some(usage) = &usage {
         if usage
             .prompt_tokens
             .checked_add(usage.completion_tokens)
@@ -305,9 +325,9 @@ pub(crate) fn decode_response(bytes: &[u8], allowed: &HashSet<String>) -> Result
         }
     }
     Ok(Completion {
-        message: choice.message,
-        usage: response.usage,
-        finish_reason: choice.finish_reason,
+        message,
+        usage,
+        finish_reason,
         response_output: None,
     })
 }
@@ -330,7 +350,7 @@ pub(crate) fn media_adjusted_cost(body: &str) -> Result<u64> {
             Value::Object(object)
                 if object
                     .get("type")
-                    .is_some_and(|t| t == "image_url" || t == "input_image") =>
+                    .is_some_and(|t| t == "image_url" || t == "input_image" || t == "image") =>
             {
                 *v = json!({"type":"image","detail":"high"});
                 crate::agent::attachments::IMAGE_TOKENS

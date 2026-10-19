@@ -140,20 +140,17 @@ impl Controller {
             return Err(Error::ContextChanged);
         }
         let current = project(&context, request, &target, None)?;
-        let unchanged =
-            if context.runtime.config.provider == provider::ProviderKind::OpenAiResponses {
-                provider::responses::body(&context.runtime.config, &current)?
-                    == provider::responses::body(&context.runtime.config, &prepared.request)?
-            } else {
-                provider::prepare_request(&context.runtime.config, &current)?.body
-                    == provider::prepare_request(&context.runtime.config, &prepared.request)?.body
-            };
+        let unchanged = if context.runtime.config.uses_response_windows() {
+            provider::responses::body(&context.runtime.config, &current)?
+                == provider::responses::body(&context.runtime.config, &prepared.request)?
+        } else {
+            provider::prepare_request(&context.runtime.config, &current)?.body
+                == provider::prepare_request(&context.runtime.config, &prepared.request)?.body
+        };
         if unchanged {
             return Ok(prepared);
         }
-        let responses = if context.runtime.config.provider
-            == provider::ProviderKind::OpenAiResponses
-        {
+        let responses = if context.runtime.config.uses_response_windows() {
             let model = provider::ModelClient::new(context.runtime.clone())?;
             let operation = model.prepare_responses(&current, local);
             let (body, tokens) = tokio::select! {biased;_=caller.cancelled()=>return Err(ModelError::Cancelled.into()),result=operation=>result?};
@@ -188,7 +185,7 @@ impl Controller {
         let source = self.source.clone();
         let mut context = worker(move || load(store, &r, t, None, source)).await?;
         cancel.check()?;
-        if context.runtime.config.provider == provider::ProviderKind::OpenAiResponses {
+        if context.runtime.config.uses_response_windows() {
             if self.force && !context.runtime.config.remote_compaction {
                 return Err(ModelError::RemoteUnsupported.into());
             }
