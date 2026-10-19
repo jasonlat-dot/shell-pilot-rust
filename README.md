@@ -1,14 +1,14 @@
 # ShellPilot Rust 业务库
 
+当前版本 **v0.2.2**，与同版本桌面客户端配套；发布与数据库迁移说明见 [v0.2.2](docs/releases/v0.2.2.md)。
+
 内置 IPC 交互说明见兄弟客户端 [docs/ipc-transport.md](../ai-ssh-terminal-client/docs/ipc-transport.md)。桌面业务仅使用 invoke/Channel，应用不提供远程后端配置；本项目仅提供 Rust 库，没有独立 HTTP 程序入口。
 当前模型协议支持 Chat Completions、Anthropic Messages 和 Responses 的文字、图片与工具续聊，按协议保存推理字段、思考签名和原生输出项。续接状态与 schema 22 的持久化说明见 [MODEL_PROTOCOLS.md](docs/MODEL_PROTOCOLS.md)。
 
 
 Agent 重构当前进度与新窗口续接：见 [docs/AGENT_PROGRESS.md](docs/AGENT_PROGRESS.md)。
 
-下文的阶段验证说明包含早期安装包和迁移时的历史状态，当前能力与下一项以该进度清单为准。C2 已通过 agent::compact::auto::Controller 将普通模型摘要接入基础文本聊天，自动触发、检查较低水位并经版本校验写入较早历史的检查点；完整原始日志保留。C3 已新增 Responses 文字协议与明确配置的供应商远端整理，整体保存并复用返回窗口；完整实时环境/授权重注入与前端占用/整理事件提示仍待 C4–C5。
-
-Java 服务端的分阶段 Rust 重构，目标是随 Tauri 桌面客户端打包，移除 JRE 和独立 MySQL 服务依赖。当前已实现连接配置管理、原生 SSH 终端、SFTP 文件管理/传输及本地文件/附件存储。当前源码已支持模型设置、基础文本 AI 对话、自动整理、停止和原生历史；工具执行与聊天附件仍待后续阶段。客户端 test-rust-ui 分支现已将本库直接嵌入 Tauri，并生成独立的 Rust Preview 0.4.0 Windows 安装包。
+当前已支持 SSH / SFTP、本地附件、带审批的工具与子任务、MCP / Skills、长期记忆、上下文整理及原生历史。模型层支持多模型渠道、同会话模型切换和协议原生续接状态，数据库最新为 schema 24。早期 Preview 安装包及阶段验收记录仅用于历史追溯，不代表当前发布状态。
 
 ## 开发与使用
 
@@ -24,11 +24,11 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ~~~
 
-运行桌面应用需要同时取得以下两个仓库，当前 Rust 重构使用的客户端分支是 `test-rust-ui`：
+运行桌面应用需要同时取得以下两个仓库，正式客户端使用 `master`；重现发行版时应使用对应发布提交：
 
 | 项目 | 仓库 | 分支 | 本地目录名 |
 | --- | --- | --- | --- |
-| 桌面客户端（React / Tauri） | [ai-ssh-terminal-client](https://github.com/jasonlat-dot/ai-ssh-terminal-client) | `test-rust-ui` | `ai-ssh-terminal-client` |
+| 桌面客户端（React / Tauri） | [ai-ssh-terminal-client](https://github.com/jasonlat-dot/ai-ssh-terminal-client) | `master` | `ai-ssh-terminal-client` |
 | Rust 业务库（本仓库） | [shell-pilot-rust](https://github.com/jasonlat-dot/shell-pilot-rust) | `main` | `ai-ssh-terminal-server-rust` |
 
 **按当前默认配置，两个仓库需要放在同一个父目录下，彼此平级。** 它们是两个独立的 Git 仓库，不是把 Rust 库放进客户端内部。父目录的名称和位置可以自行决定：
@@ -50,7 +50,7 @@ cargo clippy --all-targets -- -D warnings
 
 ~~~powershell
 git clone --branch main https://github.com/jasonlat-dot/shell-pilot-rust.git ai-ssh-terminal-server-rust
-git clone --branch test-rust-ui https://github.com/jasonlat-dot/ai-ssh-terminal-client.git ai-ssh-terminal-client
+git clone --branch master https://github.com/jasonlat-dot/ai-ssh-terminal-client.git ai-ssh-terminal-client
 cd ai-ssh-terminal-client
 npm ci
 npm run prepare:backend
