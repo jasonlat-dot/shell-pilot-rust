@@ -243,7 +243,7 @@ async fn effort_contract(protocol: ProviderKind, stream: bool, signature: bool, 
 async fn supplier_contract(protocol: ProviderKind, stream: bool, signature: bool, effort: Option<ReasoningEffort>, supplier: Option<SupplierKind>) {
     let response = |first| {
         let mut value = reply(&protocol, first, signature);
-        if supplier == Some(SupplierKind::Deepseek) && protocol == ProviderKind::AnthropicMessages {
+        if matches!(supplier, Some(SupplierKind::Deepseek | SupplierKind::Glm)) && protocol == ProviderKind::AnthropicMessages {
             for block in value["content"].as_array_mut().unwrap() { block.as_object_mut().unwrap().remove("signature"); }
         }
         value
@@ -342,15 +342,25 @@ async fn supplier_contract(protocol: ProviderKind, stream: bool, signature: bool
     if protocol == ProviderKind::AnthropicMessages {
         for request in requests.iter() {
             if let Some(effort) = &effort {
-                if supplier == Some(SupplierKind::Deepseek) && *effort == ReasoningEffort::None { assert!(request.get("output_config").is_none()); }
+                if matches!(supplier, Some(SupplierKind::Deepseek | SupplierKind::Glm)) && *effort == ReasoningEffort::None { assert!(request.get("output_config").is_none()); }
                 else { assert_eq!(request["output_config"]["effort"], json!(effort)); }
             } else {
                 assert!(request.get("output_config").is_none());
             }
             assert!(request.get("reasoning_effort").is_none());
-            if supplier == Some(SupplierKind::Deepseek) && effort.is_some() {
+            if matches!(supplier, Some(SupplierKind::Deepseek | SupplierKind::Glm)) && effort.is_some() {
                 assert_eq!(request["thinking"]["type"], if effort == Some(ReasoningEffort::None) { "disabled" } else { "enabled" });
             } else { assert!(request.get("thinking").is_none()); }
+        }
+    }
+    if supplier == Some(SupplierKind::Glm) && protocol == ProviderKind::OpenAiCompatible {
+        for request in requests.iter() {
+            assert_eq!(request["max_tokens"], 2048);
+            match &effort {
+                None => assert!(request.get("thinking").is_none()),
+                Some(ReasoningEffort::None) => { assert_eq!(request["thinking"]["type"], "disabled"); assert!(request.get("reasoning_effort").is_none()); }
+                Some(value) => { assert_eq!(request["thinking"]["type"], "enabled"); assert_eq!(request["reasoning_effort"], json!(value)); }
+            }
         }
     }
     let next = &requests[1];
@@ -470,6 +480,17 @@ async fn deepseek_dual_protocol_tools_streaming_and_thinking_roundtrip() {
         for stream in [false, true] {
             for effort in [None, Some(ReasoningEffort::None), Some(ReasoningEffort::High), Some(ReasoningEffort::Max)] {
                 supplier_contract(protocol.clone(), stream, true, effort, Some(SupplierKind::Deepseek)).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn glm_dual_protocol_tools_streaming_and_thinking_roundtrip() {
+    for protocol in [ProviderKind::OpenAiCompatible, ProviderKind::AnthropicMessages] {
+        for stream in [false, true] {
+            for effort in [None, Some(ReasoningEffort::None), Some(ReasoningEffort::Low), Some(ReasoningEffort::High), Some(ReasoningEffort::Max)] {
+                supplier_contract(protocol.clone(), stream, true, effort, Some(SupplierKind::Glm)).await;
             }
         }
     }

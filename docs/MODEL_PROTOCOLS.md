@@ -130,4 +130,16 @@ DeepSeek 的 Messages 思考块允许无签名，JSON、SSE 与流式 JSON 回�
 DeepSeek 本轮最终定向验证：前端 64 项、Rust provider/目录/工具续聊/语义摘要 45 项、桌面原生 IPC 1 项通过；工具续聊覆盖两协议的 JSON/SSE 与四种思考设置，摘要覆盖两协议。TypeScript、Vite 资源构建、生产库严格 Clippy、新策略 Rustfmt 与 diff 检查通过。测试编译为降低本机内存，对本包测试临时关闭调试符号，未改生产配置。尚无真实供应商/中转和桌面视觉联调；未打包。详见 AGENT_PROGRESS.md 最新章节。
 
 
-2026-10-20 默认地址补充：客户端空白地址在保存/查询边界解析为当前供应商/协议的官方默认值；输入框仍使用 placeholder，不自动回填。Google 默认使用 /v1beta，其余默认使用 /v1；DeepSeek Chat 为 https://api.deepseek.com/v1，Messages 为 https://api.deepseek.com/anthropic/v1；Google 为 https://generativelanguage.googleapis.com/v1beta。显式地址和旧 /v1、/v1beta 配置保持原样，Rust URL 校验与相对路径规范化不变。本次前端相关 49 项、TypeScript 与 diff 检查通过，不改 Rust 生产代码；版本依据见 [Google API 版本说明](https://ai.google.dev/gemini-api/docs/api-versions)。
+2026-10-20 默认地址补充：客户端空白地址在保存/查询边界解析为当前供应商/协议的官方默认值；输入框仍使用 placeholder，不自动回填。Google 默认使用 /v1beta；DeepSeek Chat 为 https://api.deepseek.com/v1，Messages 为 https://api.deepseek.com/anthropic/v1；Google 为 https://generativelanguage.googleapis.com/v1beta；GLM 见下节。显式地址和旧 /v1、/v1beta 配置保持原样，Rust URL 校验与相对路径规范化不变。本次前端相关 49 项、TypeScript 与 diff 检查通过，不改 Rust 生产代码；版本依据见 [Google API 版本说明](https://ai.google.dev/gemini-api/docs/api-versions)。
+
+## GLM 供应商策略（2026-10-20）
+
+`SupplierKind::Glm` 独立持久保存，复用 Chat Completions / Messages 的 wire adapter，策略注册于 `supplier.rs`。不增加 wire 协议枚举、不迁移 schema、不依赖模型名或域名猜测。前端供应商描述目录管理默认地址、协议选项、温度和推理档位，DeepSeek 的原有条件分支改为目录覆盖规则。
+
+- Chat 默认 `https://open.bigmodel.cn/api/paas/v4` + `chat/completions`，Bearer；Messages 默认 `https://open.bigmodel.cn/api/anthropic/v1` + `messages`，x-api-key。自定义区域/代理前缀和凭据始终保留。
+- normalize 固定输出 `max_tokens`，校验温度 0–1；显式推理仅支持 none/low/high/max。默认省略字段，none 转 thinking disabled 且移除 effort；其余转 thinking enabled，Chat 使用 reasoning_effort、Messages 使用 output_config.effort。模型支持范围由上游决定，不硬编码模型名单、不降档或重试。部分模型强制思考不可关闭，旧模型可能不支持 effort，应使用默认。
+- GLM Messages 的 JSON/SSE 允许无签名 thinking，原字段保持原样；原生 continuation 绑定包含 supplier，切换到 DeepSeek/通用协议后不重放私有思考状态。思考/签名不进入可见回复或日志。通用 Anthropic 签名校验不变。
+- 模型目录复用所选协议的原生 GET models、鉴权和分页；不自动剥离 GLM API 前缀、不跳转到其他推测目录。公开文档未保证统一模型目录；接口不支持时沿用错误/Trace 和手动模型 ID 维护，不制造内置模型列表。查询不保存草稿，不回显 Key。
+- 两协议使用现有本地语义摘要，不携带工具，不使用 Responses 的计数/远端整理。本次入口只开放定向验收的 Chat 和 Messages。
+
+依据：[智谱 OpenAI 兼容](https://docs.bigmodel.cn/cn/guide/develop/openai/introduction)、[Claude 兼容](https://docs.bigmodel.cn/cn/guide/develop/claude/introduction)、[思考续接](https://docs.bigmodel.cn/cn/guide/capabilities/thinking-mode)、[强度与模型限制](https://docs.bigmodel.cn/cn/guide/capabilities/thinking)。验证命令和真实接口边界见 AGENT_PROGRESS.md 本轮记录。

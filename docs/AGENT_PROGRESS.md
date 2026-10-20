@@ -3,11 +3,31 @@
 ## 当前状态总览（2026-10-20，以本节覆盖下方历史阶段描述）
 
 - 当前版本 v0.2.2，数据库 schema 24；前端 `master`，Rust `main`。A/B/C、D1–D5、E1–E3、E5/E6 已完成；E4 用户取消，不做旧 Java 数据导入。旧章节中的 test-rust-ui、schema 19/21、“下一项 E1/E2”和当时未提交状态仅为历史记录。
-- 已提交基线（本轮开始时核对）：前端 `b1d5f70`，Rust `d2408ba`。支持多模型渠道、筛选/搜索/置顶/创建顺序、会话内模型切换、失败原因持久保存与恢复；数据库 schema 22/23/24 分别用于原生续接、失败/切换、多模型渠道。
+- 本次同步基线：前端 `master/328742e`（`origin/master`），Rust `main/0c05773`（`origin/main`）；已 fetch 并快进同步，两端领先/落后均为 0/0。支持多模型渠道、筛选/搜索/置顶/创建顺序、会话内模型切换、失败原因持久保存与恢复；数据库 schema 22/23/24 分别用于原生续接、失败/切换、多模型渠道。
 - 已接入 Chat Completions、Responses、Anthropic Messages、Google Gemini GenerateContent；四者支持对话和工具续聊（Google 完成本地定向验收，真实供应商待配置后联调）。Responses 使用其原生计数/远端整理能力，其他协议使用本地语义摘要；推理/签名原样续接并按协议/模型/接口/凭据隔离。此前“Messages 仅常规模式”“Responses 不支持工具”“Gemini 仅兼容入口”属于旧阶段边界，Google 原生接入进度见下项。
 - 日志当前为 `logs/agent/YYYY-MM-DD/<traceId>.log`（逐行 JSON），默认 INFO / 7 天，级别和保留天数可即时修改；包含用户与助手正文。旧 .json/.jsonl 不批量改名，仅兼容过期清理。Windows 调试发送栈溢出已用 Box::pin 隔离状态机并完成小栈回归。
 - 既有阶段验证记录分别见对应最新功能文档，历史 E6 验收不能替代新供应商的真实接口/桌面验收。v0.2.2 升级与发布说明已准备；签名安装包、覆盖安装和在线更新须以实际产物独立验收，当前不打包。
-- 最新工作：Google 默认地址已恢复 /v1beta（覆盖下方统一 /v1 的历史记录）；模型基础地址改用应用内建议列表，区分官方默认和现有配置中的已保存地址；留空默认、保存和查询统一解析规则保持。前序 DeepSeek 独立供应商与默认 /v1 已完成本地定向验收，真实供应商/桌面视觉仍待联调。详见下节。
+- 最新工作：GLM / 智谱独立供应商已完成本地定向验收，支持 Chat Completions / Messages、品牌图标、多模型渠道、推理控制、工具续聊和本地摘要。默认地址依供应商配置（GLM Chat 为 /api/paas/v4，Messages 为 /api/anthropic/v1，Google 为 /v1beta），不再用“其余全部 /v1”概括。模型基础地址应用内建议、空白解析、保存与查询保持一致；真实供应商/桌面视觉仍待联调。详见下节。
+
+### GLM / 智谱独立供应商（2026-10-20，本地定向验收）
+
+- [x] Rust `supplier.rs` 新增 `SupplierKind::Glm` 与独立 SupplierPolicy，复用 Chat / Messages adapter；保持独立身份持久化和续接绑定，不增加协议枚举或数据库迁移。输出 max_tokens、温度 0–1；默认不覆盖思考参数，显式 none/low/high/max 按协议编码；不猜模型名称，不自动降档或重试。GLM Messages 允许无签名 thinking，原始思考/签名只进入原生续接，不进入可见正文和诊断日志，通用 Anthropic 严格规则保留。
+- [x] 前端 `models.ts` / `modelProtocols.ts` / `ModelSupplierIcon.tsx` 增加 GLM / 智谱供应商和本地 Zhipu SVG；供应商特有默认地址、能力和档位通过描述目录覆盖。设置/筛选/模型菜单/当前模型/输入框推理共用元数据，支持多模型、编辑恢复、并且搜索、置顶和已存 Key 复用。Chat 默认 https://open.bigmodel.cn/api/paas/v4，Messages 默认 https://open.bigmodel.cn/api/anthropic/v1；显式代理地址保留，空草稿不回填。
+- [x] 查询上游模型保留所选协议的前缀/鉴权/分页；GLM 未记录官方统一模型目录，不跨协议猜地址，不伪造模型列表。上游缺失目录时显示现有 Trace 错误，手动模型维护仍可用。本次独立入口仅开放 Chat / Messages；Responses 未接入此供应商策略。
+- [x] 前端定向 **77 项通过**：model-protocols、model-compaction-ui、model-discovery、model-supplier-icon、model-picker、composer-reasoning、model-endpoints、model-channels；覆盖新建空地址、已存配置恢复/保存/密钥保留、供应商与名称并且筛选、图标、模型选择、思考和查询取消。TypeScript、Vite 资源构建通过。
+- [x] Rust 定向 **74 项通过**：provider 单测 **32**（GLM 新增 3）、agent_model_catalog **15**、agent_provider_continuations **9**、agent_compact **18**。GLM 续聊 1 项包含两协议 × JSON/SSE × 默认/none/low/high/max 共 **20 个场景**，每场景实际运行工具循环并校验思考原样回传、工具仅执行一次、日志与回复不含私有思考；摘要覆盖两协议、无工具和保留原日志。生产库严格 Clippy `-D warnings` 通过。
+- [x] 桌面原生 IPC **1 项通过**：`glm_supplier_ipc_roundtrips_channels_choices_and_saved_key_discovery` 经真实 dispatch 保存两种协议的多模型渠道，DTO 带 GLM 身份，目录复用加密测试 Key，编辑保留成员 ID/Key，代理前缀及 Bearer/x-api-key 正确。临时对本包测试关闭调试符号以降低编译内存，不改 Cargo 配置。
+- 接口依据见两仓库 MODEL_PROTOCOLS / agent-model-settings 文档链接。本轮初次单测发现测试夹具缺少 outputTokenParameter，已补齐；受限环境 DPAPI / 回环网络 / rustfmt / Clippy 配置访问受限后以同命令本机权限复验通过，未修改生产安全边界。仅使用合成响应、一次性数据库和测试 Key，未访问用户真实 GLM Key 或 SSH。
+- 版本仍为 v0.2.2 / schema 24；源码与本进度更新未提交、推送、打包或发布。原有 icon.icns 本地修改保持字节一致；包含原生改动，需要完全退出托盘后重启 `npm run tauri dev` 编译。真实 GLM/中转请求与桌面视觉尚未验收，不能用本地模拟结果替代。
+
+### 仓库同步与当前续接状态（2026-10-20）
+
+- [x] 客户端从 `84754ff` 快进至 `328742e`，Rust 从 `1e0d8fa` 快进至 `0c05773`，各同步 4 个远端提交；未切换分支或创建合并提交。客户端原有 `src-tauri/icons/icon.icns` 本地修改先备份、同步后恢复并校验字节一致；同步后保留该修改，本次另更新本进度文档。
+- [x] 核对新增能力：Google Gemini 原生 GenerateContent 与工具续聊；上游模型查询、搜索/逐个添加/全部添加及手动维护；独立模型目录 Trace 日志；DeepSeek 供应商策略支持 Chat Completions / Messages，保留供应商身份、思考配置和续接隔离。基础地址可留空解析官方默认值，也可选择已保存地址，Google 默认 /v1beta，其余当前默认 /v1。
+- [x] 核对终端交互：常驻操作收进顶部“终端”菜单，按激活窗格确定目标；保留选区复制、粘贴和添加到对话入口。SSH 断线时可在当前终端按普通键手动重连，消费触发键并防止重复请求；连接等待提示随成功、失败、超时或取消关闭。菜单当前只显示字号与 Ctrl + 鼠标滚轮提示，不再提供增减/重置字号项。
+- 版本仍为 v0.2.2 / schema 24。客户端标签 `v0.2.2` 指向 `ab26468`，当前 HEAD 比标签多 5 个提交；最新源码能力不等同于该标签安装包的能力。后续发布按实际选定的源码和版本打包，包级签名、覆盖安装与在线更新验收单独记录，不从标签推断 GitHub Release 状态。
+- 验证沿用各功能原有记录：DeepSeek 前端 64、Rust 定向 45、原生 IPC 1；最新默认地址/模型查询/地址建议相关 55；终端菜单及断线重连分别有对应定向记录。以上是历史功能验证结果，本次仅核对 Git、代码与文档，未重新运行测试、类型检查、构建、真实供应商或 SSH 请求。
+- 后续按用户需求继续优化；新供应商/中转真实接口、实际 WebView 视觉与新安装包升级尚需独立验收。A/B/C、D1–D5、E1–E3、E5/E6 的既有完成状态保留，E4 用户取消，不恢复旧 Java 数据导入任务。本次未提交、推送、打包或发布。
 
 ### Google 默认基础地址恢复 v1beta（2026-10-20）
 
@@ -703,7 +723,7 @@ Rust 重构交接、已完成工作与运行方式见 [WORK_HANDOFF_2026-10-14.m
 
 ## 当前进度与下一项
 
-以文首“当前状态总览”及最新功能记录为准：A/B/C、D1–D5、E1–E3、E5/E6 已完成，E4 取消；当前 schema 24，前端 master / Rust main。下一项为本轮 Google Gemini 原生协议接入与定向验证，不再重复实施 E1/E2。
+以文首“当前状态总览”及最新功能记录为准：A/B/C、D1–D5、E1–E3、E5/E6 已完成，E4 取消；当前 v0.2.2 / schema 24，前端 master / Rust main。Google Gemini 原生协议、模型目录查询和 DeepSeek 策略已完成本地定向验收；后续按用户需求处理产品优化及真实供应商/中转、桌面视觉和包级升级验收，不重复实施已完成的接入或 E1/E2。
 
 已知产品边界：扫描 PDF/OCR/Office、拖入上传、本机通用命令、后台/递归子任务仍未开放；子任务/MCP/Skills 受现有授权与目标约束。Responses 工具续聊已经接入，不再按早期阶段视为只支持文字。用户自行打包；新供应商真实接口与包级升级验收单独记录。
 

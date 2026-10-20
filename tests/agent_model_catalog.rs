@@ -612,3 +612,22 @@ async fn deepseek_catalog_uses_shared_models_and_bearer_for_both_protocols() {
     for (url, headers) in calls.iter() { assert!(url.query().is_none()); assert_eq!(headers["authorization"], "Bearer catalog-test-key"); assert!(!headers.contains_key("x-api-key")); }
     assert!(f.repository.list("user").unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn glm_catalog_preserves_proxy_path_and_protocol_authentication() {
+    let f = Fixture::new(vec![Reply::Json(json!({"data":[{"id":"alias","name":"GLM"}]})), Reply::Json(json!({"data":[{"id":"alias"}],"has_more":false}))]).await;
+    for protocol in [ProviderKind::OpenAiCompatible, ProviderKind::AnthropicMessages] {
+        let mut query = f.query(protocol.clone()); query.supplier = Some(SupplierKind::Glm);
+        let models = f.list(query).await.unwrap(); assert_eq!(models[0].id, "alias");
+        let calls = f.wire.calls.lock().unwrap(); let (uri, headers) = calls.last().unwrap();
+        assert_eq!(uri.path(), "/proxy/v1/models");
+        if protocol == ProviderKind::AnthropicMessages {
+            assert_eq!(headers["x-api-key"], "catalog-test-key");
+            assert!(!headers.contains_key("authorization"));
+        } else {
+            assert_eq!(headers["authorization"], "Bearer catalog-test-key");
+            assert!(!headers.contains_key("x-api-key"));
+        }
+    }
+    assert!(f.repository.list("user").unwrap().is_empty());
+}

@@ -937,3 +937,17 @@ async fn deepseek_both_protocols_use_local_semantic_compaction_without_tools() {
         assert_eq!(body["max_tokens"],2048);assert!(body.get("max_completion_tokens").is_none());assert!(body.get("tools").is_none());assert_eq!(body["thinking"]["type"],"enabled");
     }
 }
+
+#[tokio::test]
+async fn glm_both_protocols_use_local_semantic_compaction_without_tools() {
+    for protocol in [ProviderKind::OpenAiCompatible, ProviderKind::AnthropicMessages] {
+        let f=Fixture::new().await;
+        let evidence=f.append(Payload::UserMessage{text:"保留 GLM 测试目标".into()});
+        f.model_config(|config|{config.supplier=Some(SupplierKind::Glm);config.provider=protocol.clone();config.completions_path=if protocol==ProviderKind::AnthropicMessages {"messages"}else{"chat/completions"}.into();config.reasoning_effort=Some(ReasoningEffort::High);config.capabilities.reasoning_effort=true;},KeyChange::Keep);
+        let summary=document(evidence.id).to_string();
+        f.respond(Reply::Envelope(if protocol==ProviderKind::AnthropicMessages {json!({"type":"message","role":"assistant","content":[{"type":"text","text":summary}],"stop_reason":"end_turn","usage":{"input_tokens":100,"output_tokens":40}})}else{envelope(Some(summary),None)}));
+        let before=f.events();let draft=f.summarize().await.unwrap();assert_eq!(draft.model,"summary-test-model");assert_eq!(f.events(),before);
+        let requests=f.mock.requests.lock().unwrap();assert_eq!(requests.len(),1);let body=&requests[0].0;
+        assert_eq!(body["max_tokens"],2048);assert!(body.get("max_completion_tokens").is_none());assert!(body.get("tools").is_none());assert_eq!(body["thinking"]["type"],"enabled");
+    }
+}
