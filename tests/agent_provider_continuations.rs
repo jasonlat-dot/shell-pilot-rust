@@ -33,6 +33,10 @@ async fn respond(State(w): State<Wire>, uri: Uri, headers: axum::http::HeaderMap
         assert_eq!(headers["authorization"],"Bearer kimi-loopback-fixture");
         assert!(!headers.contains_key("x-api-key"));
     }
+    if body["model"] == "grok-model-alias" {
+        assert_eq!(headers["authorization"],"Bearer grok-loopback-fixture");
+        assert!(!uri.path().ends_with("input_tokens"),"Grok must never call the OpenAI counting endpoint");
+    }
     if uri.path().ends_with("input_tokens") {
         return Response::builder()
             .header("content-type", "application/json")
@@ -275,6 +279,7 @@ async fn supplier_contract(protocol: ProviderKind, stream: bool, signature: bool
     let config: ModelConfig = serde_json::from_value(json!({"provider":protocol,"supplier":supplier,"baseUrl":format!("http://{}/v1/",listener.local_addr().unwrap()),"completionsPath":path,"model":"arbitrary-model-name","outputTokenParameter":"maxTokens","reasoningEffort":effort,"capabilities":{"developerRole":false,"temperature":false,"reasoningEffort":effort.is_some()},"requireApiKey":false})).unwrap();
     let mut config=config;
     if supplier==Some(SupplierKind::Kimi) {config.model="kimi-model-alias".into();config.require_api_key=true;}
+    if supplier==Some(SupplierKind::Grok) {config.model="grok-model-alias".into();config.require_api_key=true;}
     let store = Arc::new(Store::in_memory().unwrap());
     let models = ModelRepository::new(store.clone());
     models
@@ -284,7 +289,7 @@ async fn supplier_contract(protocol: ProviderKind, stream: bool, signature: bool
             0,
             ModelConfigUpdate {
                 config,
-                api_key: if supplier==Some(SupplierKind::Kimi) {KeyChange::Set{value:SecretKey::new("kimi-loopback-fixture").unwrap()}}else{KeyChange::Keep},
+                api_key: if supplier==Some(SupplierKind::Grok) {KeyChange::Set{value:SecretKey::new("grok-loopback-fixture").unwrap()}}else if supplier==Some(SupplierKind::Kimi) {KeyChange::Set{value:SecretKey::new("kimi-loopback-fixture").unwrap()}}else{KeyChange::Keep},
             },
         )
         .unwrap();
@@ -375,6 +380,18 @@ async fn supplier_contract(protocol: ProviderKind, stream: bool, signature: bool
         }
     }
     let next = &requests[1];
+    if supplier==Some(SupplierKind::Grok) {
+        for request in requests.iter() {
+            assert!(request.get("thinking").is_none());assert!(request.get("max_tokens").is_none());
+            if protocol==ProviderKind::OpenAiResponses {
+                assert_eq!(request["store"],false);assert_eq!(request["max_output_tokens"],2048);
+                if let Some(effort)=&effort {assert_eq!(request["reasoning"]["effort"],json!(effort));}else{assert!(request.get("reasoning").is_none());}
+            }else{
+                assert_eq!(request["max_completion_tokens"],2048);
+                if let Some(effort)=&effort {assert_eq!(request["reasoning_effort"],json!(effort));}else{assert!(request.get("reasoning_effort").is_none());}
+            }
+        }
+    }
     if supplier==Some(SupplierKind::Kimi) {
         for request in requests.iter() {
             assert_eq!(request["max_tokens"],2048);assert!(request.get("temperature").is_none());
@@ -554,6 +571,15 @@ async fn kimi_dual_protocol_thinking_replay_and_bearer_auth_json_and_stream() {
                 if protocol==ProviderKind::AnthropicMessages && matches!(effort,Some(ReasoningEffort::None|ReasoningEffort::Enabled)) {continue;}
                 supplier_contract(protocol.clone(),stream,false,effort,Some(SupplierKind::Kimi)).await;
             }
+        }
+    }
+}
+
+#[tokio::test]
+async fn grok_both_protocols_replay_thinking_and_tools_without_remote_counting() {
+    for protocol in [ProviderKind::OpenAiCompatible,ProviderKind::OpenAiResponses] {
+        for effort in [None,Some(ReasoningEffort::Low),Some(ReasoningEffort::Medium),Some(ReasoningEffort::High),Some(ReasoningEffort::Xhigh)] {
+            for stream in [false,true] {supplier_contract(protocol.clone(),stream,false,effort.clone(),Some(SupplierKind::Grok)).await;}
         }
     }
 }

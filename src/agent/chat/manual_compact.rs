@@ -89,7 +89,7 @@ impl Manager {
                 .prepare_text(&request, target, &token, cancel)
                 .await?;
             let (tokens, source) = if let Some(responses) = &prepared.responses {
-                (responses.input_tokens, Source::ProviderCount)
+                (responses.input_tokens, responses.input_source.clone())
             } else {
                 (
                     crate::agent::provider::measure_request(

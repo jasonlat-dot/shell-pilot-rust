@@ -896,7 +896,7 @@ impl Manager {
                 .refresh_text(prepared, &request, target.clone(), &token, cancel)
                 .await?;
             let (tokens, source) = if let Some(response) = &prepared.responses {
-                (response.input_tokens, Source::ProviderCount)
+                (response.input_tokens, response.input_source.clone())
             } else {
                 (
                     super::provider::measure_request(&prepared.runtime.config, &prepared.request)?

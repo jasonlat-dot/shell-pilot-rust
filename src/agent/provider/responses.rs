@@ -249,6 +249,7 @@ pub(crate) fn measure(config: &ModelConfig, request: &ChatRequest) -> Result<Pre
 pub(crate) struct PreparedResponses {
     body: Value,
     pub(crate) input_tokens: u64,
+    pub(crate) input_source: crate::agent::context_status::Source,
     binding: Binding,
     allowed: HashSet<String>,
 }
@@ -322,6 +323,14 @@ impl ModelClient {
         value: &Value,
         cancel: &CancellationToken,
     ) -> Result<u64> {
+        if cancel.is_cancelled() { return Err(ModelError::Cancelled); }
+        if super::supplier::select(self.config.supplier.as_ref()).local_response_count() {
+            // xAI exposes no Responses input_tokens endpoint. Count the complete wire
+            // window locally, including opaque reasoning, instructions, images and tools.
+            let body=serde_json::to_string(value).map_err(|_|ModelError::Response)?;
+            return Ok(super::protocol::media_adjusted_cost(&body)?
+                .saturating_add(value["input"].as_array().map_or(0,|items|items.len() as u64)*12));
+        }
         let mut counted = json!({"model":self.config.model,"input":value["input"],"instructions":value["instructions"]});
         if let Some(tools) = value.get("tools") { counted["tools"] = tools.clone(); }
         let value = counted;
@@ -351,6 +360,7 @@ impl ModelClient {
             PreparedResponses {
                 body: value,
                 input_tokens: count,
+                input_source: if super::supplier::select(self.config.supplier.as_ref()).local_response_count() {crate::agent::context_status::Source::Estimated} else {crate::agent::context_status::Source::ProviderCount},
                 binding: self.binding.clone(),
                 allowed: request.tools.iter().map(|t| t.name.clone()).collect(),
             },

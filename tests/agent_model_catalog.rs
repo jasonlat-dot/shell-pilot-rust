@@ -672,3 +672,15 @@ async fn kimi_catalog_uses_bearer_and_maps_only_documented_messages_paths_withou
     for (uri,headers) in calls.iter() {assert_eq!(uri.path(),"/proxy/v1/models");assert_eq!(headers["authorization"],"Bearer catalog-test-key");assert!(!headers.contains_key("x-api-key"));}
     assert!(f.repository.list("user").unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn grok_both_protocols_share_read_only_bearer_catalog_and_preserve_proxy_prefix() {
+    let f=Fixture::new(vec![Reply::Json(json!({"data":[{"id":"grok-alias","name":"Grok"}]})),Reply::Json(json!({"data":[{"id":"grok-alias"}]}))]).await;
+    for protocol in [ProviderKind::OpenAiCompatible,ProviderKind::OpenAiResponses] {
+        let mut query=f.query(protocol);query.supplier=Some(SupplierKind::Grok);
+        assert_eq!(f.list(query).await.unwrap()[0].id,"grok-alias");
+    }
+    let calls=f.wire.calls.lock().unwrap();assert_eq!(calls.len(),2);
+    for (uri,headers) in calls.iter() {assert_eq!(uri.path(),"/proxy/v1/models");assert_eq!(headers["authorization"],"Bearer catalog-test-key");assert!(!headers.contains_key("x-api-key"));}
+    assert!(f.repository.list("user").unwrap().is_empty());
+}

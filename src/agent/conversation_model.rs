@@ -11,6 +11,13 @@ pub(crate) fn portable_message(payload: &Payload) -> Result<provider::ChatMessag
 }
 impl Repository {
     pub(crate) fn change_model(&self, user: &str, session: &str, previous: &str, next: &str, revision: u64) -> Result<Session> {
+        self.transition_model(user,session,previous,next,revision,false)
+    }
+    /// A saved endpoint/model/key change starts a new native binding on the next idle request.
+    pub(crate) fn refresh_model_binding(&self,user:&str,session:&str,model:&str,revision:u64)->Result<Session>{
+        self.transition_model(user,session,model,model,revision,true)
+    }
+    fn transition_model(&self,user:&str,session:&str,previous:&str,next:&str,revision:u64,refresh:bool)->Result<Session>{
         model::identifier(user)?; model::identifier(session)?; model::identifier(previous)?; model::identifier(next)?;
         self.db(|db| {
             let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -19,7 +26,7 @@ impl Repository {
             if current.session.revision != revision {return Err(Error::Stale);}
             let busy: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM agent_chat_turns WHERE session_id=?1 AND state='running') OR EXISTS(SELECT 1 FROM agent_execution_requests WHERE session_id=?1 AND state='admitted') OR EXISTS(SELECT 1 FROM agent_outputs WHERE session_id=?1 AND state='writing') OR EXISTS(SELECT 1 FROM agent_extension_approvals WHERE session_id=?1 AND state='admitted')",[session],|r|r.get(0))?;
             if busy || !current.pending_tool_call_ids.is_empty() {return Err(Error::Stale);}
-            if previous == next {return Ok(current.session);}
+            if previous == next && !refresh {return Ok(current.session);}
             // Provider-encrypted compact windows cannot move between models. Restore
             // their original journal prefix; ordinary textual checkpoints remain useful.
             let remote: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM agent_responses_checkpoints WHERE checkpoint_id=?1)",[&current.session.checkpoint_id],|r|r.get(0))?;

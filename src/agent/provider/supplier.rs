@@ -15,6 +15,7 @@ pub enum SupplierKind {
     Glm,
     Qwen,
     Kimi,
+    Grok,
 }
 
 pub(super) trait SupplierPolicy: Sync {
@@ -26,6 +27,7 @@ pub(super) trait SupplierPolicy: Sync {
         }
         super::adapter::select(&config.provider).normalize_config(config)
     }
+    fn local_response_count(&self) -> bool { false }
     fn prefers_streaming(&self) -> bool {
         false
     }
@@ -52,11 +54,13 @@ struct DeepSeek;
 struct Glm;
 mod qwen;
 mod kimi;
+mod grok;
 static COMPATIBLE: Compatible = Compatible;
 static DEEPSEEK: DeepSeek = DeepSeek;
 static GLM: Glm = Glm;
 static QWEN: qwen::Qwen = qwen::Qwen;
 static KIMI: kimi::Kimi = kimi::Kimi;
+static GROK: grok::Grok = grok::Grok;
 impl SupplierPolicy for Compatible {}
 pub(super) fn select(supplier: Option<&SupplierKind>) -> &'static dyn SupplierPolicy {
     match supplier {
@@ -64,13 +68,14 @@ pub(super) fn select(supplier: Option<&SupplierKind>) -> &'static dyn SupplierPo
         Some(SupplierKind::Glm) => &GLM,
         Some(SupplierKind::Qwen) => &QWEN,
         Some(SupplierKind::Kimi) => &KIMI,
+        Some(SupplierKind::Grok) => &GROK,
         _ => &COMPATIBLE,
     }
 }
 pub(super) fn validate(supplier: Option<&SupplierKind>, provider: &ProviderKind) -> Result<()> {
     let valid = match supplier {
         None => true,
-        Some(SupplierKind::Openai) => matches!(
+        Some(SupplierKind::Openai | SupplierKind::Grok) => matches!(
             provider,
             ProviderKind::OpenAiCompatible | ProviderKind::OpenAiResponses
         ),
@@ -94,7 +99,7 @@ pub(super) fn canonical(supplier: Option<SupplierKind>) -> Option<SupplierKind> 
     supplier.filter(|s| {
         matches!(
             s,
-            SupplierKind::Deepseek | SupplierKind::Glm | SupplierKind::Qwen | SupplierKind::Kimi
+            SupplierKind::Deepseek | SupplierKind::Glm | SupplierKind::Qwen | SupplierKind::Kimi | SupplierKind::Grok
         )
     })
 }

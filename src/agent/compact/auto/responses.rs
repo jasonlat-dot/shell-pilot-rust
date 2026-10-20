@@ -25,7 +25,7 @@ impl Controller {
             .map_err(|_| Error::CompactionLimit)?;
         let fits = before <= available;
         self.reporter
-            .measured(&context.runtime.config, before, Source::ProviderCount)?;
+            .measured(&context.runtime.config, before, original.input_source.clone())?;
         let trigger = u128::from(before) * 100
             >= u128::from(available) * u128::from(context.runtime.config.compact_percent);
         let force = self.force || context.events.len() >= 200;

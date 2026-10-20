@@ -541,6 +541,7 @@ fn load(
         )?;
         Ok(rows.collect::<std::result::Result<HashSet<_>, _>>()?)
     })?;
+    let new_request=frozen.is_none();
     let runtime = match frozen {
         Some(runtime) => runtime,
         None => provider::ModelRepository::new(store.clone())
@@ -555,10 +556,17 @@ fn load(
         snapshot.through_event_id,
     )?;
     windows.1.retain(|id,_| *id > portable_through);
-    crate::agent::responses_store::validate(
+    let validation=crate::agent::responses_store::validate(
         &windows,
         &provider::responses::Binding::from_runtime(&runtime)?,
-    )?;
+    );
+    if new_request && matches!(validation,Err(ModelError::ContextMismatch)) {
+        // Configuration edits never rewrite a running turn. A subsequent user request
+        // may use the saved binding, retaining old history solely as portable data.
+        repo.refresh_model_binding(&request.user_id,&request.session_id,&request.agent_id,snapshot.session.revision)?;
+        return load(store,request,target,Some(runtime),source);
+    }
+    validation?;
     if repo.snapshot(&request.session_id, &request.user_id)? != snapshot {
         return Err(Error::ContextChanged);
     }

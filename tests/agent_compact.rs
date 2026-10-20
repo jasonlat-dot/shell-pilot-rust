@@ -991,3 +991,13 @@ async fn kimi_both_protocols_use_local_semantic_summary_and_native_effort() {
         if protocol==ProviderKind::AnthropicMessages {assert_eq!(body["output_config"]["effort"],"high");}else{assert_eq!(body["reasoning_effort"],"high");}
     }
 }
+
+#[tokio::test]
+async fn grok_chat_uses_local_semantic_summary_with_native_parameters() {
+    let f=Fixture::new().await;let evidence=f.append(Payload::UserMessage{text:"保留 Grok 测试目标".into()});
+    f.model_config(|config|{config.supplier=Some(SupplierKind::Grok);config.reasoning_effort=Some(ReasoningEffort::High);config.capabilities.reasoning_effort=true;},KeyChange::Keep);
+    f.respond(Reply::Envelope(envelope(Some(document(evidence.id).to_string()),None)));
+    let before=f.events();f.summarize().await.unwrap();assert_eq!(f.events(),before);
+    let requests=f.mock.requests.lock().unwrap();assert_eq!(requests.len(),1);let body=&requests[0].0;
+    assert_eq!(body["max_completion_tokens"],2048);assert_eq!(body["reasoning_effort"],"high");assert!(body.get("tools").is_none());assert!(body.get("thinking").is_none());
+}
