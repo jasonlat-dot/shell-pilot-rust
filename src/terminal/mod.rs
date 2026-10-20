@@ -2,8 +2,9 @@ pub(crate) mod agent_exec;
 mod host_key;
 mod http;
 mod output;
-mod shared_shell;
+mod resources;
 mod sftp_access;
+mod shared_shell;
 use crate::{
     error::Error,
     model::{Connection, ConnectionRequest, Credentials},
@@ -13,6 +14,7 @@ use host_key::HostVerifier;
 pub(crate) use http::routes;
 pub use output::{ConnectionState, DisconnectReason, ReadResult};
 use output::{Output, Session};
+pub use resources::ResourceSnapshot;
 use russh::{
     client,
     keys::{Algorithm, EcdsaCurve, HashAlg, PrivateKeyWithHashAlg},
@@ -465,6 +467,7 @@ impl TerminalManager {
                     terminal_size: Mutex::new((cols, rows)),
                     size_changed: Notify::new(),
                     output: Mutex::new(Output::new()),
+                    resources: AsyncMutex::new(resources::MonitorState::default()),
                     changed: Notify::new(),
                     stop: CancellationToken::new(),
                 });

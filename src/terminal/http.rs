@@ -19,6 +19,7 @@ pub(crate) fn routes() -> Router<crate::http::AppState> {
         .route("/api/v1/ssh/terminal/cancel_connect", post(cancel))
         .route("/api/v1/ssh/terminal/read", get(read))
         .route("/api/v1/ssh/terminal/connected", get(connected))
+        .route("/api/v1/ssh/terminal/resources", get(resources))
         .route("/api/v1/ssh/terminal/write", post(write))
         .route("/api/v1/ssh/terminal/resize", post(resize))
         .route("/api/v1/ssh/terminal/close", post(close))
@@ -78,6 +79,17 @@ async fn connected(
 ) -> Result<Json<Envelope<ConnectionState>>, Error> {
     Ok(success(
         state.terminals.connected(&parse_query(query)?.session_id),
+    ))
+}
+async fn resources(
+    State(state): State<crate::http::AppState>,
+    query: Result<Query<SessionQuery>, QueryRejection>,
+) -> Result<Json<Envelope<super::ResourceSnapshot>>, Error> {
+    Ok(success(
+        state
+            .terminals
+            .resources(&parse_query(query)?.session_id)
+            .await?,
     ))
 }
 async fn write(

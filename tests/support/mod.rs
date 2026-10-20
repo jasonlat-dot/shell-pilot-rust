@@ -30,6 +30,8 @@ pub struct Stats {
     pub execs: Mutex<Vec<String>>,
     pub inputs: Mutex<Vec<Vec<u8>>>,
     pub collectors: AtomicUsize,
+    pub resource_output: Mutex<Option<Vec<u8>>>,
+    pub resource_quiet: std::sync::atomic::AtomicBool,
 }
 #[derive(Clone, Default)]
 pub struct Spec {
@@ -197,11 +199,35 @@ impl server::Handler for TestHandler {
             session.channel_success(channel)?;
             session.data(
                 channel,
-                format!("SHELLPILOT_READY_{token} /tmp/shellpilot-tool.{token} /dev/pts/9999\n").into_bytes(),
+                format!("SHELLPILOT_READY_{token} /tmp/shellpilot-tool.{token} /dev/pts/9999\n")
+                    .into_bytes(),
             )?;
             return Ok(());
         }
         self.stats.execs.lock().unwrap().push(command.clone());
+        if command.starts_with("sh -c '# SHELLPILOT_RESOURCES_V1:") {
+            session.channel_success(channel)?;
+            if self.stats.resource_quiet.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            let output = self
+                .stats
+                .resource_output
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| include_bytes!("../fixtures/resources.txt").to_vec());
+            for chunk in output.chunks(73) {
+                session.data(channel, chunk.to_vec())?;
+            }
+            session.exit_status_request(channel, 0)?;
+            session.eof(channel)?;
+            if self.channels.remove(&channel) {
+                self.stats.channels.fetch_sub(1, Ordering::SeqCst);
+            }
+            session.close(channel)?;
+            return Ok(());
+        }
         if command == "__exec_reject__" {
             session.channel_failure(channel)?;
             if self.channels.remove(&channel) {

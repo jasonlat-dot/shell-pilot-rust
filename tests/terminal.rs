@@ -578,6 +578,17 @@ async fn all_terminal_http_endpoints_match_existing_client_payloads() {
     )
     .await;
     assert_eq!(state["data"]["connected"], true);
+    let (resource_status, resources) = call(
+        &app,
+        "GET",
+        &format!("/api/v1/ssh/terminal/resources?sessionId={id}"),
+        None,
+    )
+    .await;
+    assert_eq!(resource_status, StatusCode::OK);
+    assert_eq!(resources["code"], "SUCCESS_0000");
+    assert_eq!(resources["data"]["supported"], true);
+    assert_eq!(resources["data"]["memoryUsedBytes"], 614400);
     let (_, result) = call(
         &app,
         "POST",

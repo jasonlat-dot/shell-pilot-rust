@@ -1,0 +1,32 @@
+SHELLPILOT_RESOURCES_V1
+[stat]
+cpu 100 0 50 750 50 10 10 30 20 0
+btime 1700000000
+[memory]
+MemTotal: 1000 kB
+MemAvailable: 400 kB
+MemFree: 100 kB
+Buffers: 50 kB
+Cached: 150 kB
+SReclaimable: 25 kB
+Shmem: 5 kB
+[uptime]
+1000.00 5000.00
+
+[network]
+Inter-| Receive | Transmit
+ face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed
+lo: 999999 0 0 0 0 0 0 0 999999 0 0 0 0 0 0 0
+eth0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0
+
+[route]
+Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT
+eth0 00000000 0100000A 0003 0 0 100 00000000 0 0 0
+
+[disks]
+Filesystem 1024-blocks Used Available Capacity Mounted on
+/dev/sdb 200000 100000 100000 50% /mnt/data volume
+tmpfs 1024 0 1024 0% /run
+/dev/sda 100000 40000 60000 40% /
+
+[end]

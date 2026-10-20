@@ -150,6 +150,7 @@ pub(super) struct Session {
     pub terminal_size: Mutex<(u32, u32)>,
     pub size_changed: Notify,
     pub output: Mutex<Output>,
+    pub resources: tokio::sync::Mutex<super::resources::MonitorState>,
     pub changed: Notify,
     pub stop: CancellationToken,
 }
