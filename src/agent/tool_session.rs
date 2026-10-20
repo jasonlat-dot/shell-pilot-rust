@@ -23,15 +23,18 @@ use std::sync::{
 use tokio_util::sync::CancellationToken;
 
 pub const READ_OUTPUT: &str = "read_tool_output";
-const OUTPUT_PAGE_BYTES: u64 = 512;
+const DEFAULT_OUTPUT_PAGE_BYTES: u64 = 4 * 1024;
+const MAX_OUTPUT_PAGE_BYTES: u64 = 16 * 1024;
+// JSON text escaping (up to 6x) plus exact hex (2x), with bounded framing.
+const OUTPUT_RESULT_BYTES: usize = MAX_OUTPUT_PAGE_BYTES as usize * 8 + 4096;
 fn normalize_output_arguments(arguments: &mut Value) {
-    if let Some(limit) = arguments.get_mut("limit") {
-        if limit
-            .as_u64()
-            .is_some_and(|value| value > OUTPUT_PAGE_BYTES)
-        {
-            *limit = json!(OUTPUT_PAGE_BYTES);
+    let Some(arguments) = arguments.as_object_mut() else { return; };
+    match arguments.get_mut("limit") {
+        None => { arguments.insert("limit".into(), json!(DEFAULT_OUTPUT_PAGE_BYTES)); }
+        Some(limit) if limit.as_u64().is_some_and(|value| value > MAX_OUTPUT_PAGE_BYTES) => {
+            *limit = json!(MAX_OUTPUT_PAGE_BYTES);
         }
+        _ => {}
     }
 }
 #[cfg(test)]
@@ -39,12 +42,12 @@ mod output_argument_tests {
     use super::*;
     #[test]
     fn caps_only_oversized_positive_integer_pages_without_rewriting_the_output_or_offset() {
-        for size in [1000u64, 1500, 4096, u64::MAX] {
+        for size in [16385u64, 65536, u64::MAX] {
             let mut args = json!({"outputId":"unchanged","offset":1024,"limit":size});
             normalize_output_arguments(&mut args);
             assert_eq!(
                 args,
-                json!({"outputId":"unchanged","offset":1024,"limit":512})
+                json!({"outputId":"unchanged","offset":1024,"limit":16384})
             );
         }
         for limit in [
@@ -54,6 +57,8 @@ mod output_argument_tests {
             json!("4096"),
             Value::Null,
             json!(512),
+            json!(4096),
+            json!(16384),
         ] {
             let mut args = json!({"outputId":"unchanged","offset":0,"limit":limit});
             let original = args.clone();
@@ -61,19 +66,34 @@ mod output_argument_tests {
             assert_eq!(args, original);
         }
         let mut missing = json!({"outputId":"unchanged","offset":0});
-        let original = missing.clone();
         normalize_output_arguments(&mut missing);
-        assert_eq!(missing, original);
+        assert_eq!(missing, json!({"outputId":"unchanged","offset":0,"limit":4096}));
+        let mut invalid = json!(["invalid"]); let original = invalid.clone();
+        normalize_output_arguments(&mut invalid); assert_eq!(invalid, original);
+    }
+    #[test]
+    fn full_binary_page_fits_result_and_persisted_event_after_double_json_escaping() {
+        let content = json!({"ok":true,"data":{"outputId":uuid::Uuid::new_v4().to_string(),"offset":0,"nextOffset":16384,"eof":true,"size":16384,
+            "text":"\0".repeat(16384),"bytesHex":"00".repeat(16384),"lossyUtf8":false}}).to_string();
+        assert!(content.len() > 128 * 1024);
+        assert!(content.len() <= OUTPUT_RESULT_BYTES);
+        let event = Payload::ToolResult {call_id:"read".into(),outcome:Outcome::Success,exit_code:None,text:content,outputs:vec![]};
+        assert!(serde_json::to_vec(&event).unwrap().len() > 64 * 1024);
+        assert!(event.validate().is_ok());
+        let oversized = Payload::ToolResult {call_id:"read".into(),outcome:Outcome::Success,exit_code:None,text:"x".repeat(192 * 1024),outputs:vec![]};
+        assert!(oversized.validate().is_err());
+        let ordinary = Payload::ToolCall {call_id:"call".into(),tool_name:"test".into(),arguments:json!({"text":"x".repeat(65536)})};
+        assert!(ordinary.validate().is_err());
     }
 }
 pub fn output_definition() -> provider::FunctionDefinition {
     provider::FunctionDefinition {
         name: READ_OUTPUT.into(),
-        description: "Read original bytes of a linked output from this task, without SSH execution or approval. Reads do not consume tool-call quota; requesting the model again still consumes a model round. Use outputs[].id, never a tool call ID. Offsets and limits count bytes. Each page returns at most 512 bytes; larger positive integer limits are capped to 512. When eof=false, continue with nextOffset and the same outputId. bytesHex is exact; text is a possibly lossy UTF-8 view. Never repeat a command to fetch its output.".into(),
+        description: "Read original bytes of a linked output from this task, without SSH execution or approval. Reads do not consume tool-call quota; requesting the model again still consumes a model round. Use outputs[].id, never a tool call ID. Offsets and limits count bytes. Normally request 4096 bytes (4 KiB); the host uses 4096 if limit is omitted. Each page returns at most 16384 bytes (16 KiB); larger positive integer limits are capped to 16384. When eof=false, continue with nextOffset and the same outputId. bytesHex is exact; text is a possibly lossy UTF-8 view. Never repeat a command to fetch its output.".into(),
         parameters: json!({"type":"object","properties":{
             "outputId":{"type":"string","minLength":36,"maxLength":36},
             "offset":{"type":"integer","minimum":0,"maximum":16777216,"description":"Byte offset, initially 0; use the previous result's nextOffset for the next page."},
-            "limit":{"type":"integer","minimum":1,"maximum":OUTPUT_PAGE_BYTES,"description":"Requested page bytes, 1–512. The host caps larger positive integers to 512; continue with nextOffset until eof=true."}
+            "limit":{"type":"integer","minimum":1,"maximum":MAX_OUTPUT_PAGE_BYTES,"description":"Normally use 4096 bytes (4 KiB); host default if omitted is 4096. Maximum 16384 bytes (16 KiB), larger positive integers are capped. Continue with nextOffset until eof=true."}
         },"required":["outputId","offset","limit"],"additionalProperties":false}),
     }
 }
@@ -706,6 +726,9 @@ impl Drop for Cleanup {
     }
 }
 impl ToolExecutor for ToolSession {
+    fn result_byte_limit(&self, call: &ValidatedCall) -> Option<usize> {
+        (call.name() == READ_OUTPUT).then_some(OUTPUT_RESULT_BYTES)
+    }
     fn counts_toward_tool_limit(&self, call: &ValidatedCall) -> bool {
         call.name() != READ_OUTPUT
     }
@@ -918,7 +941,7 @@ impl ToolSession {
         let read=crate::diagnostics::spawn_blocking(move||->super::Result<Value>{
             let output_id=args["outputId"].as_str().ok_or(Error::OutputUnavailable)?;
             let offset=args["offset"].as_u64().ok_or(Error::OutputUnavailable)?;
-            let limit=args["limit"].as_u64().filter(|n|(1..=OUTPUT_PAGE_BYTES).contains(n)).ok_or(Error::OutputUnavailable)? as usize;
+            let limit=args["limit"].as_u64().filter(|n|(1..=MAX_OUTPUT_PAGE_BYTES).contains(n)).ok_or(Error::OutputUnavailable)? as usize;
             let output=repository.output(&binding.session_id,&binding.user_id,output_id)?;
             if output.task_id!=binding.task_id || output.event_id.is_none() {return Err(Error::OutputUnavailable);}
             let range=repository.read_output_range(&binding.session_id,&binding.user_id,output_id,offset,limit)?;

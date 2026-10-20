@@ -86,8 +86,11 @@ pub enum Payload {
 }
 impl Payload {
     pub(crate) fn validate(&self) -> Result<()> {
-        if serde_json::to_vec(self)?.len() > 65536 {
-            return Err(Error::Invalid("event exceeds 64 KiB".into()));
+        // A 16 KiB byte read includes hex and JSON-escaped text, then is escaped
+        // again as the event's text string. Other event kinds keep their old cap.
+        let limit = if matches!(self, Self::ToolResult { .. }) { 192 * 1024 } else { 65536 };
+        if serde_json::to_vec(self)?.len() > limit {
+            return Err(Error::Invalid(format!("event exceeds {} KiB", limit / 1024)));
         }
         match self {
             Self::UserMessage { text } | Self::AssistantMessage { text } => text_value(text, 16000),

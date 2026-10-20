@@ -53,6 +53,7 @@ fn reply(message: Value, reason: &str) -> Value {
 }
 enum Step {
     Calls(Vec<Value>),
+    ReadDefault { id: String, source: String, offset: u64 },
     Read {
         id: String,
         source: String,
@@ -130,6 +131,10 @@ async fn respond(State(wire): State<Wire>, Json(body): Json<Value>) -> Json<Valu
                     json!({"role":"assistant","content":"检查当前批次","tool_calls":calls}),
                     "tool_calls",
                 ),
+                Step::ReadDefault { id, source, offset } => {
+                    let output=s.outputs.get(&source).expect("model must have seen an output reference");
+                    reply(json!({"role":"assistant","content":null,"tool_calls":[tool(&id,READ_OUTPUT,json!({"outputId":output,"offset":offset}))]}),"tool_calls")
+                }
                 Step::Read {
                     id,
                     source,
@@ -1248,43 +1253,42 @@ async fn child_reads_oversized_pages_from_its_own_ssh_output_without_reexecuting
                 "delegate_agent",
                 json!({"task":"读取两条命令及分页输出","context":"只分析实际读到的内容"}),
             )]),
-            Step::Calls(vec![exec("large", "__exec_large__")]),
+            Step::Calls(vec![exec("large", "__exec_chunked__")]),
             Step::Calls(vec![exec("second", "__exec_unicode__")]),
-            Step::Read {
+            Step::ReadDefault {
                 id: "page-1".into(),
                 source: "large".into(),
                 offset: 0,
-                limit: 1000,
             },
             Step::Read {
                 id: "page-2".into(),
                 source: "large".into(),
-                offset: 512,
-                limit: 4096,
+                offset: 4096,
+                limit: 16384,
             },
             Step::Read {
                 id: "page-3".into(),
                 source: "large".into(),
-                offset: 1024,
-                limit: 1500,
+                offset: 20480,
+                limit: 65536,
             },
             Step::Read {
                 id: "page-4".into(),
                 source: "large".into(),
-                offset: 1536,
+                offset: 36864,
                 limit: 4096,
             },
             Step::Read {
                 id: "page-5".into(),
                 source: "large".into(),
-                offset: 2048,
-                limit: 4096,
+                offset: 40960,
+                limit: 1024,
             },
             Step::Read {
                 id: "page-6".into(),
                 source: "large".into(),
-                offset: 2560,
-                limit: 4096,
+                offset: 41984,
+                limit: 16384,
             },
             Step::Final,
             Step::Final,
@@ -1294,6 +1298,9 @@ async fn child_reads_oversized_pages_from_its_own_ssh_output_without_reexecuting
         false,
     )
     .await;
+    let models=ModelRepository::new(b.store.clone());let profile=models.get("model","default").unwrap();
+    let mut model_config=profile.config;model_config.context_window=262144;
+    models.save("model","default",profile.revision,ModelConfigUpdate{config:model_config,api_key:KeyChange::Keep}).unwrap();
     let mut config = extensions::settings(&b.store, "default").unwrap();
     config.config.sub_agents = true;
     config.config.execution_limits.child_tool_calls = 2;
@@ -1350,15 +1357,16 @@ async fn child_reads_oversized_pages_from_its_own_ssh_output_without_reexecuting
         })
         .collect::<Vec<_>>();
     assert_eq!(reads.len(), 6);
-    for (index, (id, args)) in reads.iter().enumerate() {
+    for ((id, args), (offset, size)) in reads.iter().zip([(0,4096),(4096,16384),(20480,16384),(36864,4096),(40960,1024),(41984,16384)]) {
         assert_eq!(args["parentToolCallId"], "delegate");
         assert!(id.starts_with("child_"));
         let value = result(&persisted, id);
         assert_eq!(value["ok"], true);
-        assert_eq!(value["data"]["text"], "x".repeat(512));
-        assert_eq!(value["data"]["bytesHex"], "78".repeat(512));
-        assert_eq!(value["data"]["offset"], index * 512);
-        assert_eq!(value["data"]["nextOffset"], (index + 1) * 512);
+        let expected=(offset..offset+size).map(|index|(index%251) as u8).collect::<Vec<_>>();
+        assert_eq!(value["data"]["text"],String::from_utf8_lossy(&expected).into_owned());
+        assert_eq!(value["data"]["bytesHex"],expected.iter().map(|byte|format!("{byte:02x}")).collect::<String>());
+        assert_eq!(value["data"]["offset"], offset);
+        assert_eq!(value["data"]["nextOffset"], offset + size);
         assert_eq!(value["data"]["eof"], false);
     }
     assert!(events
@@ -2166,7 +2174,7 @@ async fn output_pagination_is_free_of_tool_quota_but_not_model_round_quota() {
                 Step::Read {
                     id: "page-b".into(),
                     source: "source".into(),
-                    offset: 512,
+                    offset: 1000,
                     limit: 4096,
                 },
                 Step::Final,
@@ -2195,8 +2203,11 @@ async fn output_pagination_is_free_of_tool_quota_but_not_model_round_quota() {
             result.unwrap();
             assert_eq!(
                 self::result(&b.events(), "page-b")["data"]["nextOffset"],
-                1024
+                4096
             );
+            assert_eq!(self::result(&b.events(), "page-a")["data"]["nextOffset"],1000);
+            assert_eq!(self::result(&b.events(), "page-b")["data"]["offset"],1000);
+            assert_eq!(self::result(&b.events(), "page-b")["data"]["eof"],true);
             assert_eq!(b.normal().len(), 4);
         } else {
             assert!(matches!(result, Err(tool_loop::Error::ModelRoundLimit)));

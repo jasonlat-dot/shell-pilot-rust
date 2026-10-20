@@ -639,6 +639,25 @@ async fn execution_failure_and_oversized_output_are_bounded_model_visible_result
 }
 
 #[tokio::test]
+async fn trusted_result_override_allows_binary_read_envelopes_but_keeps_a_hard_cap() {
+    struct NativeHost(Host);
+    impl ToolExecutor for NativeHost {
+        fn result_byte_limit(&self, _: &ValidatedCall) -> Option<usize> { Some(usize::MAX) }
+        fn authorize<'a>(&'a self, call: &'a ValidatedCall, cancel: &'a CancellationToken) -> BoxFuture<'a, bool> { self.0.authorize(call,cancel) }
+        fn execute<'a>(&'a self, call: &'a ValidatedCall, cancel: &'a CancellationToken) -> BoxFuture<'a, ToolOutcome> { self.0.execute(call,cancel) }
+    }
+    for (data, success) in [(json!({"text":"\0".repeat(16384),"bytesHex":"00".repeat(16384)}),true),(json!({"text":"x".repeat(132*1024+1)}),false)] {
+        let model=Model::new(vec![calls(vec![call("a",args().to_string())]),final_reply()],|config|{config.context_window=262144;}).await;
+        let registry=registry();let host=NativeHost(Host::new(Behavior::Success(data.clone())));
+        let mut loop_=ToolLoop::new(&registry,input(),Limits::default()).unwrap();
+        loop_.run(&model.client,&host,&CancellationToken::new()).await.unwrap();
+        let actual=results(&loop_);assert_eq!(actual[0]["ok"],success);
+        if success {assert_eq!(actual[0]["data"],data);}else{assert_eq!(actual[0]["error"],"output_too_large");}
+        assert_eq!(host.0.ids.lock().unwrap().len(),1);
+    }
+}
+
+#[tokio::test]
 async fn legacy_tool_capability_is_enabled_by_product_policy() {
     let model = Model::new(vec![], |c| c.capabilities.tool_calls = false).await;
     assert!(model.client.config().capabilities.tool_calls);

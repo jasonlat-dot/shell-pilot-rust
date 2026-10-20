@@ -7,7 +7,16 @@
 - 已接入 Chat Completions、Responses、Anthropic Messages、Google Gemini GenerateContent；四者支持对话和工具续聊（Google 完成本地定向验收，真实供应商待配置后联调）。Responses 使用其原生计数/远端整理能力，其他协议使用本地语义摘要；推理/签名原样续接并按协议/模型/接口/凭据隔离。此前“Messages 仅常规模式”“Responses 不支持工具”“Gemini 仅兼容入口”属于旧阶段边界，Google 原生接入进度见下项。
 - 日志当前为 `logs/agent/YYYY-MM-DD/<traceId>.log`（逐行 JSON），默认 INFO / 7 天，级别和保留天数可即时修改；包含用户与助手正文。旧 .json/.jsonl 不批量改名，仅兼容过期清理。Windows 调试发送栈溢出已用 Box::pin 隔离状态机并完成小栈回归。
 - 既有阶段验证记录分别见对应最新功能文档，历史 E6 验收不能替代新供应商的真实接口/桌面验收。v0.2.2 升级与发布说明已准备；签名安装包、覆盖安装和在线更新须以实际产物独立验收，当前不打包。
-- 最新工作：Qwen / 通义千问独立供应商已接入 Chat Completions / Messages、品牌图标、多模型渠道、思考开关及档位、百炼原生模型目录分页、工具续聊和 SSE 语义摘要。默认地址依供应商配置；显式业务空间/地域/代理地址保留。前序 GLM 已完成本地定向验收并提交，真实供应商/桌面视觉仍待联调。详见下节。
+- 最新工作：模型输出回读改为通常 4 KiB、单页最大 16 KiB；省略 limit 时原生实际补 4096，超过上限的正整数限制到 16384，主任务/子任务共用规则，并补齐结果 JSON 和历史事件的封装额度。Qwen 接入已提交，真实供应商/桌面视觉仍待独立联调。详见下节。
+
+### 模型输出回读默认 4 KiB、单页最大 16 KiB（2026-10-20）
+
+- [x] `tool_session.rs` 将常规读取量与硬上限分为 DEFAULT_OUTPUT_PAGE_BYTES=4096 / MAX_OUTPUT_PAGE_BYTES=16384。模型提示通常使用 4096；缺省 limit 时在严格 JSON 解析后、schema 校验前实际补 4096。合法小页保留，过大正整数封顶 16384，零/负数/小数/null/字符串、非对象和其他非法参数继续拒绝，不改输出 ID 或 offset。schema 保持既有闭合必填参数约定，主任务与子任务复用同一原生归一化。
+- [x] `ToolExecutor::result_byte_limit` 为可信宿主提供有硬上限的结果额度覆盖；仅 read_tool_output 使用 132 KiB，以容纳 16 KiB 原文、精确 bytesHex 和 JSON 转义，其他工具仍沿用 Limits::result_bytes（默认 8 KiB）。Child 转发宿主额度。ToolLoop 对任何覆盖继续强制 132 KiB 上限；ToolResult 事件上限为 192 KiB 容纳再次转义，其他事件仍为 64 KiB。
+- [x] 输出回读仍限当前 user/session/task 的已关联输出，按 nextOffset/eof 分页；不执行 SSH、不额外请求命令批准、不占工具执行次数，但后续模型请求仍计入轮数。初次命令摘要每路约 384 字节、原始捕获每路 16 MiB、UI 每页 64 KiB 自动读取、上下文硬边界和原始证据保留机制不变；没有增加前台设置或数据库迁移。
+- [x] **76 项相关测试通过**：output_argument_tests **2**（默认、上限、非法参数保留及 16 KiB 全零二进制在两次 JSON 转义后的额度校验），agent_context **19**，agent_outputs **17**，agent_tool_loop **14**，agent_tool_session **24**。新增工具循环测试覆盖大回读封装成功与不可信超大额度仍被硬上限拒绝；普通工具 8 KiB 限制测试保留。子任务集成覆盖缺省 4 KiB、16 KiB 请求、64 KiB 请求封顶及小页，逐字节核对二进制结果与 offset，无重复 SSH，免费回读与模型轮数分别计数。
+- 集成测试初轮仅有原 512 字节截断断言不再成立，已调整为实际请求大小、连续 offset 和 EOF；新增 UTF-8 测试断言类型问题也已修正。最终相关测试全通过，生产库严格 Clippy `-D warnings` 与两个仓库 diff 检查通过；本轮前端只有使用文档修改，不重复执行前端构建。
+- 已同步 E3_EXTENSIONS.md 及客户端 agent-model-settings.md，旧阶段 512 字节记录保留为历史。只用临时数据库、测试密钥和回环 SSH/模型服务；未连接用户服务器或真实供应商，未打包、提交或推送。版本仍为 0.2.2 / schema 24，需完全退出托盘后重启 npm run tauri dev 编译原生改动。
 
 ### Qwen / 通义千问独立供应商（2026-10-20，本地定向验收）
 

@@ -15,6 +15,9 @@ use serde_json::{json, Value};
 use std::{collections::BTreeMap, time::Duration};
 use tokio_util::sync::CancellationToken;
 
+// Bounded native exceptions must fit text + exact bytes, even after JSON escaping.
+const MAX_NATIVE_RESULT_BYTES: usize = 132 * 1024;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("Invalid tool registry or loop limits")]
@@ -197,6 +200,10 @@ pub trait ToolExecutor: Send + Sync {
     /// Native-only normalization of parsed arguments, before schema validation.
     /// The default preserves arguments. The complete schema is checked afterwards.
     fn normalize_arguments(&self, _tool_name: &str, _arguments: &mut Value) {}
+
+    /// Trusted host override for bounded native results. Ordinary/MCP tools keep
+    /// Limits::result_bytes; the loop still enforces MAX_NATIVE_RESULT_BYTES.
+    fn result_byte_limit(&self, _call: &ValidatedCall) -> Option<usize> { None }
 
     /// Native policy only: whether this tool is bounded by Limits::tool_timeout.
     /// Tools that opt out must enforce their own timeout and respect cancellation.
@@ -633,7 +640,8 @@ impl<'a> ToolLoop<'a> {
             };
             event(if unknown || value["ok"]==false {Level::Warn}else{Level::Info},"tool.execution_finished",json!({"callId":raw.id,"toolName":raw.function.name,"durationMs":started.elapsed().as_millis(),"ok":value["ok"],"unknown":unknown,"exitCode":value["data"]["exitCode"],"outputTruncated":value["data"]["outputTruncated"],"errorCode":value["error"]}));
             let mut content = value.to_string();
-            if content.len() > self.limits.result_bytes {
+            let result_limit = executor.result_byte_limit(call).unwrap_or(self.limits.result_bytes).clamp(256, MAX_NATIVE_RESULT_BYTES);
+            if content.len() > result_limit {
                 content = failure("output_too_large").to_string();
             }
             if let Some(context) = self.context {
