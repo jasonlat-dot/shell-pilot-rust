@@ -659,3 +659,16 @@ async fn qwen_custom_proxy_catalog_accepts_openai_shape_without_rewriting_prefix
     let calls=f.wire.calls.lock().unwrap();assert_eq!(calls[0].0.path(),"/proxy/v1/models");
     assert!(!calls[0].1.contains_key("authorization"));assert!(!calls[0].1.contains_key("x-api-key"));
 }
+
+#[tokio::test]
+async fn kimi_catalog_uses_bearer_and_maps_only_documented_messages_paths_without_saving() {
+    let f=Fixture::new(vec![Reply::Json(json!({"data":[{"id":"kimi-alias","name":"Kimi"}]})),Reply::Json(json!({"data":[{"id":"kimi-alias"}]}))]).await;
+    for protocol in [ProviderKind::OpenAiCompatible,ProviderKind::AnthropicMessages] {
+        let mut query=f.query(protocol.clone());query.supplier=Some(SupplierKind::Kimi);
+        if protocol==ProviderKind::AnthropicMessages {query.base_url=f.base.replace("/proxy/v1/","/proxy/anthropic/v1/");}
+        assert_eq!(f.list(query).await.unwrap()[0].id,"kimi-alias");
+    }
+    let calls=f.wire.calls.lock().unwrap();assert_eq!(calls.len(),2);
+    for (uri,headers) in calls.iter() {assert_eq!(uri.path(),"/proxy/v1/models");assert_eq!(headers["authorization"],"Bearer catalog-test-key");assert!(!headers.contains_key("x-api-key"));}
+    assert!(f.repository.list("user").unwrap().is_empty());
+}

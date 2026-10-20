@@ -14,6 +14,7 @@ pub enum SupplierKind {
     Deepseek,
     Glm,
     Qwen,
+    Kimi,
 }
 
 pub(super) trait SupplierPolicy: Sync {
@@ -32,6 +33,9 @@ pub(super) trait SupplierPolicy: Sync {
         true
     }
     fn decorate(&self, _config: &ModelConfig, _body: &mut Value) {}
+    fn headers(&self, provider: &ProviderKind, key: Option<&SecretKey>) -> Result<HeaderMap> {
+        super::adapter::select(provider).headers(key)
+    }
     fn catalog(&self, provider: &ProviderKind) -> &'static dyn super::catalog::CatalogAdapter {
         super::adapter::select(provider).catalog()
     }
@@ -47,16 +51,19 @@ struct Compatible;
 struct DeepSeek;
 struct Glm;
 mod qwen;
+mod kimi;
 static COMPATIBLE: Compatible = Compatible;
 static DEEPSEEK: DeepSeek = DeepSeek;
 static GLM: Glm = Glm;
 static QWEN: qwen::Qwen = qwen::Qwen;
+static KIMI: kimi::Kimi = kimi::Kimi;
 impl SupplierPolicy for Compatible {}
 pub(super) fn select(supplier: Option<&SupplierKind>) -> &'static dyn SupplierPolicy {
     match supplier {
         Some(SupplierKind::Deepseek) => &DEEPSEEK,
         Some(SupplierKind::Glm) => &GLM,
         Some(SupplierKind::Qwen) => &QWEN,
+        Some(SupplierKind::Kimi) => &KIMI,
         _ => &COMPATIBLE,
     }
 }
@@ -69,7 +76,7 @@ pub(super) fn validate(supplier: Option<&SupplierKind>, provider: &ProviderKind)
         ),
         Some(SupplierKind::Anthropic) => *provider == ProviderKind::AnthropicMessages,
         Some(SupplierKind::Google) => *provider == ProviderKind::GoogleGemini,
-        Some(SupplierKind::Deepseek | SupplierKind::Glm | SupplierKind::Qwen) => matches!(
+        Some(SupplierKind::Deepseek | SupplierKind::Glm | SupplierKind::Qwen | SupplierKind::Kimi) => matches!(
             provider,
             ProviderKind::OpenAiCompatible | ProviderKind::AnthropicMessages
         ),
@@ -87,7 +94,7 @@ pub(super) fn canonical(supplier: Option<SupplierKind>) -> Option<SupplierKind> 
     supplier.filter(|s| {
         matches!(
             s,
-            SupplierKind::Deepseek | SupplierKind::Glm | SupplierKind::Qwen
+            SupplierKind::Deepseek | SupplierKind::Glm | SupplierKind::Qwen | SupplierKind::Kimi
         )
     })
 }

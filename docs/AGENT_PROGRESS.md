@@ -2,6 +2,16 @@
 
 ## 当前状态总览（2026-10-20，以本节覆盖下方历史阶段描述）
 
+### Kimi / Moonshot 独立供应商（计划随 v0.2.4 发布）
+
+- SupplierKind::Kimi 与 supplier/kimi.rs 提供独立策略，复用 Chat Completions / Messages adapter；不根据模型 ID 或域名推断供应商，不开放 Responses 或 Kimi Code 订阅专用接口。
+- SupplierPolicy.headers 默认保持原协议鉴权，Kimi 覆盖为两协议 Bearer，目录同样使用 Bearer。Kimi Messages 端点为 /anthropic/v1/messages，目录仅映射完整已知后缀至同 origin / 代理前缀下的 /v1/models；其他自定义地址保留。
+- 使用 max_tokens，Temperature 使用上游默认并原生拒绝显式值。Chat 默认不发送，none/enabled 只控制 thinking.type，low/high/max 只发送 reasoning_effort；Messages 仅支持默认或 output_config.effort 的 low/high/max。无虚构思考预算、keep 参数或自动降档重试，模型实际能力由上游验证。
+- 保留 reasoning_content、Messages 思考块/原始签名及工具调用顺序；允许 Kimi 返回无签名块，通用 Anthropic 规则不变。供应商、协议、端点、模型与凭据绑定隔离沿用原生续接实现；思考不进入可见输出与日志。两协议沿用本地语义摘要。
+- 前端描述目录新增 Kimi、本地 MIT 图标和协议级 overrides；多模型、搜索/供应商筛选、置顶、输入框推理、查询/取消/已存密钥继续复用组件。Kimi 温度控件禁用，跨供应商切换清除温度，Chat 切换至 Messages 清除不适用的开关。
+- 本轮仅测试临时数据库、合成密钥与回环服务，不读取或修改本机正式工作区、不调用真实上游或 SSH；当前版本号仍为 0.2.3，schema 24，无新增迁移，不打包或发布。测试结果见下方补充。
+- 验证：前端模型/供应商/设置/选择器/推理/查询 78 项，Rust provider 单元 42 项、模型目录 18 项、工具续聊 11 项、摘要 20 项，桌面 Kimi IPC 1 项通过，合计 170 项定向测试。Kimi 工具续聊覆盖 Chat 默认/none/enabled/low/high/max 与 Messages 默认/low/high/max，分别走 JSON 与分片 SSE，共 20 个场景；校验 Bearer、思考原文回放、工具执行一次及日志隔离。TypeScript、Vite 构建、生产库严格 Clippy 通过。真实 Moonshot/中转与桌面截图未验收。
+
 ### 待随 v0.2.4 发布：单条模型配置异常隔离
 
 - 新增 StoredConfig 错误区分“已存配置不可解析/不受支持/参数无效”和真正数据库故障。ModelRepository.list 仅跳过前者，SQL/锁/读取错误继续返回；正常模型继续出现在 Agent 选择列表，异常模型按 ID 直接访问时明确拒绝。

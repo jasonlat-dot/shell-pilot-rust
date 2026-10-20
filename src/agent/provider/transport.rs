@@ -33,7 +33,7 @@ impl ModelClient {
             return Err(ModelError::KeyMissing);
         }
         let adapter = super::adapter::select(&config.provider);
-        let headers = adapter.headers(runtime.api_key.as_ref())?;
+        let headers = super::supplier::select(config.supplier.as_ref()).headers(&config.provider, runtime.api_key.as_ref())?;
         let endpoint = config.endpoint()?;
         let mut builder = Client::builder()
             .redirect(Policy::none())

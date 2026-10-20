@@ -977,3 +977,17 @@ async fn qwen_both_protocols_collect_streaming_semantic_summary_without_tools() 
         if protocol==ProviderKind::AnthropicMessages {assert_eq!(body["thinking"]["type"],"enabled");}else{assert_eq!(body["enable_thinking"],true);}
     }
 }
+
+#[tokio::test]
+async fn kimi_both_protocols_use_local_semantic_summary_and_native_effort() {
+    for protocol in [ProviderKind::OpenAiCompatible,ProviderKind::AnthropicMessages] {
+        let f=Fixture::new().await;let evidence=f.append(Payload::UserMessage{text:"保留 Kimi 测试目标".into()});
+        f.model_config(|config|{config.supplier=Some(SupplierKind::Kimi);config.provider=protocol.clone();config.completions_path=if protocol==ProviderKind::AnthropicMessages {"messages"}else{"chat/completions"}.into();config.reasoning_effort=Some(ReasoningEffort::High);config.capabilities.reasoning_effort=true;config.temperature=None;},KeyChange::Keep);
+        let summary=document(evidence.id).to_string();
+        f.respond(Reply::Envelope(if protocol==ProviderKind::AnthropicMessages {json!({"type":"message","role":"assistant","content":[{"type":"text","text":summary}],"stop_reason":"end_turn","usage":{"input_tokens":100,"output_tokens":40}})}else{envelope(Some(summary),None)}));
+        let before=f.events();let draft=f.summarize().await.unwrap();assert_eq!(draft.model,"summary-test-model");assert_eq!(f.events(),before);
+        let requests=f.mock.requests.lock().unwrap();assert_eq!(requests.len(),1);let body=&requests[0].0;
+        assert_eq!(body["max_tokens"],2048);assert!(body.get("tools").is_none());assert!(body.get("thinking").is_none());assert!(body.get("temperature").is_none());
+        if protocol==ProviderKind::AnthropicMessages {assert_eq!(body["output_config"]["effort"],"high");}else{assert_eq!(body["reasoning_effort"],"high");}
+    }
+}

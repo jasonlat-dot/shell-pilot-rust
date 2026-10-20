@@ -28,7 +28,11 @@ struct Wire {
     requests: Arc<Mutex<Vec<Value>>>,
     protocol: ProviderKind,
 }
-async fn respond(State(w): State<Wire>, uri: Uri, Json(body): Json<Value>) -> Response {
+async fn respond(State(w): State<Wire>, uri: Uri, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
+    if body["model"] == "kimi-model-alias" {
+        assert_eq!(headers["authorization"],"Bearer kimi-loopback-fixture");
+        assert!(!headers.contains_key("x-api-key"));
+    }
     if uri.path().ends_with("input_tokens") {
         return Response::builder()
             .header("content-type", "application/json")
@@ -245,7 +249,7 @@ async fn effort_contract(protocol: ProviderKind, stream: bool, signature: bool, 
 async fn supplier_contract(protocol: ProviderKind, stream: bool, signature: bool, effort: Option<ReasoningEffort>, supplier: Option<SupplierKind>) {
     let response = |first| {
         let mut value = reply(&protocol, first, signature);
-        if matches!(supplier, Some(SupplierKind::Deepseek | SupplierKind::Glm)) && protocol == ProviderKind::AnthropicMessages {
+        if matches!(supplier, Some(SupplierKind::Deepseek | SupplierKind::Glm | SupplierKind::Kimi)) && protocol == ProviderKind::AnthropicMessages {
             for block in value["content"].as_array_mut().unwrap() { block.as_object_mut().unwrap().remove("signature"); }
         }
         if supplier == Some(SupplierKind::Qwen) && protocol == ProviderKind::AnthropicMessages {
@@ -269,6 +273,8 @@ async fn supplier_contract(protocol: ProviderKind, stream: bool, signature: bool
         _ => "chat/completions",
     };
     let config: ModelConfig = serde_json::from_value(json!({"provider":protocol,"supplier":supplier,"baseUrl":format!("http://{}/v1/",listener.local_addr().unwrap()),"completionsPath":path,"model":"arbitrary-model-name","outputTokenParameter":"maxTokens","reasoningEffort":effort,"capabilities":{"developerRole":false,"temperature":false,"reasoningEffort":effort.is_some()},"requireApiKey":false})).unwrap();
+    let mut config=config;
+    if supplier==Some(SupplierKind::Kimi) {config.model="kimi-model-alias".into();config.require_api_key=true;}
     let store = Arc::new(Store::in_memory().unwrap());
     let models = ModelRepository::new(store.clone());
     models
@@ -278,7 +284,7 @@ async fn supplier_contract(protocol: ProviderKind, stream: bool, signature: bool
             0,
             ModelConfigUpdate {
                 config,
-                api_key: KeyChange::Keep,
+                api_key: if supplier==Some(SupplierKind::Kimi) {KeyChange::Set{value:SecretKey::new("kimi-loopback-fixture").unwrap()}}else{KeyChange::Keep},
             },
         )
         .unwrap();
@@ -344,7 +350,7 @@ async fn supplier_contract(protocol: ProviderKind, stream: bool, signature: bool
     );
     let requests = w.requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
-    if protocol == ProviderKind::AnthropicMessages && supplier != Some(SupplierKind::Qwen) {
+    if protocol == ProviderKind::AnthropicMessages && !matches!(supplier,Some(SupplierKind::Qwen|SupplierKind::Kimi)) {
         for request in requests.iter() {
             if let Some(effort) = &effort {
                 if matches!(supplier, Some(SupplierKind::Deepseek | SupplierKind::Glm)) && *effort == ReasoningEffort::None { assert!(request.get("output_config").is_none()); }
@@ -369,6 +375,18 @@ async fn supplier_contract(protocol: ProviderKind, stream: bool, signature: bool
         }
     }
     let next = &requests[1];
+    if supplier==Some(SupplierKind::Kimi) {
+        for request in requests.iter() {
+            assert_eq!(request["max_tokens"],2048);assert!(request.get("temperature").is_none());
+            match &effort {
+                None=>{assert!(request.get("thinking").is_none());assert!(request.get("reasoning_effort").is_none());assert!(request.get("output_config").is_none());},
+                Some(value @ (ReasoningEffort::None|ReasoningEffort::Enabled))=>{
+                    assert_eq!(request["thinking"]["type"],if *value==ReasoningEffort::None {"disabled"}else{"enabled"});assert!(request.get("reasoning_effort").is_none());
+                },
+                Some(value)=>{assert!(request.get("thinking").is_none());if protocol==ProviderKind::AnthropicMessages {assert_eq!(request["output_config"]["effort"],json!(value));}else{assert_eq!(request["reasoning_effort"],json!(value));}},
+            }
+        }
+    }
     if supplier == Some(SupplierKind::Qwen) {
         for request in requests.iter() {
             assert_eq!(request["stream"],true,"Qwen complete and streaming entry points both use SSE");
@@ -523,6 +541,18 @@ async fn qwen_tools_replay_thinking_through_streaming_and_collected_entry_points
         for stream in [false,true] {
             for effort in [None,Some(ReasoningEffort::None),Some(ReasoningEffort::Enabled),Some(ReasoningEffort::Low),Some(ReasoningEffort::Medium),Some(ReasoningEffort::Xhigh)] {
                 supplier_contract(protocol.clone(),stream,false,effort,Some(SupplierKind::Qwen)).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn kimi_dual_protocol_thinking_replay_and_bearer_auth_json_and_stream() {
+    for protocol in [ProviderKind::OpenAiCompatible,ProviderKind::AnthropicMessages] {
+        for stream in [false,true] {
+            for effort in [None,Some(ReasoningEffort::None),Some(ReasoningEffort::Enabled),Some(ReasoningEffort::Low),Some(ReasoningEffort::High),Some(ReasoningEffort::Max)] {
+                if protocol==ProviderKind::AnthropicMessages && matches!(effort,Some(ReasoningEffort::None|ReasoningEffort::Enabled)) {continue;}
+                supplier_contract(protocol.clone(),stream,false,effort,Some(SupplierKind::Kimi)).await;
             }
         }
     }
