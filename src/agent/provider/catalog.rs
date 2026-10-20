@@ -1,5 +1,6 @@
 //! Bounded, read-only model discovery. Wire formats belong to provider strategies.
 mod diagnostics;
+mod qwen;
 use super::*;
 use reqwest::{header, redirect::Policy, Client};
 use serde::{Deserialize, Serialize};
@@ -42,6 +43,7 @@ pub(super) struct Google;
 pub(super) static OPENAI: OpenAi = OpenAi;
 pub(super) static ANTHROPIC: Anthropic = Anthropic;
 pub(super) static GOOGLE: Google = Google;
+pub(super) static QWEN: qwen::Qwen = qwen::Qwen;
 fn endpoint(base: &Url) -> Result<Url> {
     base.join("models")
         .map_err(|_| ModelError::Invalid("invalid models endpoint"))

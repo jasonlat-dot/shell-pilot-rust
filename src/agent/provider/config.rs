@@ -22,6 +22,8 @@ pub enum OutputTokenParameter {
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     None,
+    /// Supplier-defined thinking switch, without imposing an effort level.
+    Enabled,
     Minimal,
     Low,
     Medium,

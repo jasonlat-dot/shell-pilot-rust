@@ -29,6 +29,7 @@ enum Reply {
     Valid,
     Text(String),
     Envelope(Value),
+    StreamEnvelope(Value),
     Http,
     StreamEof,
 }
@@ -50,6 +51,17 @@ async fn handler(
         mock.release.notified().await;
     }
     let reply = mock.reply.lock().unwrap().clone();
+    if let Reply::StreamEnvelope(response)=&reply {
+        assert_eq!(body["stream"],true,"Qwen summary uses SSE even through collected completion");
+        let frames=if response["type"]=="message" {
+            vec![json!({"type":"message_start","message":{"type":"message","role":"assistant","content":[]}}),
+                json!({"type":"content_block_start","index":0,"content_block":response["content"][0]}),
+                json!({"type":"content_block_stop","index":0}),json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),json!({"type":"message_stop"})]
+        }else{vec![json!({"choices":[{"index":0,"delta":response["choices"][0]["message"],"finish_reason":"stop"}]})]};
+        let mut wire=frames.iter().map(|frame|format!("data: {frame}\n\n")).collect::<String>();
+        if response["type"]!="message" {wire.push_str("data: [DONE]\n\n");}
+        return axum::response::Response::builder().header("content-type","text/event-stream").body(Body::from(wire)).unwrap();
+    }
     if body["stream"] == true {
         let text = format!(
             "data: {}\n\n",
@@ -949,5 +961,19 @@ async fn glm_both_protocols_use_local_semantic_compaction_without_tools() {
         let before=f.events();let draft=f.summarize().await.unwrap();assert_eq!(draft.model,"summary-test-model");assert_eq!(f.events(),before);
         let requests=f.mock.requests.lock().unwrap();assert_eq!(requests.len(),1);let body=&requests[0].0;
         assert_eq!(body["max_tokens"],2048);assert!(body.get("max_completion_tokens").is_none());assert!(body.get("tools").is_none());assert_eq!(body["thinking"]["type"],"enabled");
+    }
+}
+
+#[tokio::test]
+async fn qwen_both_protocols_collect_streaming_semantic_summary_without_tools() {
+    for protocol in [ProviderKind::OpenAiCompatible,ProviderKind::AnthropicMessages] {
+        let f=Fixture::new().await;let evidence=f.append(Payload::UserMessage{text:"保留 Qwen 测试目标".into()});
+        f.model_config(|config|{config.supplier=Some(SupplierKind::Qwen);config.provider=protocol.clone();config.completions_path=if protocol==ProviderKind::AnthropicMessages {"messages"}else{"chat/completions"}.into();config.reasoning_effort=Some(ReasoningEffort::Enabled);config.capabilities.reasoning_effort=true;},KeyChange::Keep);
+        let summary=document(evidence.id).to_string();
+        f.respond(Reply::StreamEnvelope(if protocol==ProviderKind::AnthropicMessages {json!({"type":"message","role":"assistant","content":[{"type":"text","text":summary}],"stop_reason":"end_turn"})}else{envelope(Some(summary),None)}));
+        let before=f.events();let draft=f.summarize().await.unwrap();assert_eq!(draft.model,"summary-test-model");assert_eq!(f.events(),before);
+        let requests=f.mock.requests.lock().unwrap();assert_eq!(requests.len(),1);let body=&requests[0].0;
+        assert_eq!(body["stream"],true);assert_eq!(body["max_tokens"],2048);assert!(body.get("tools").is_none());assert!(body.get("reasoning_effort").is_none());assert!(body.get("output_config").is_none());
+        if protocol==ProviderKind::AnthropicMessages {assert_eq!(body["thinking"]["type"],"enabled");}else{assert_eq!(body["enable_thinking"],true);}
     }
 }

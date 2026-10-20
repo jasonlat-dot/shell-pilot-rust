@@ -3,11 +3,22 @@
 ## 当前状态总览（2026-10-20，以本节覆盖下方历史阶段描述）
 
 - 当前版本 v0.2.2，数据库 schema 24；前端 `master`，Rust `main`。A/B/C、D1–D5、E1–E3、E5/E6 已完成；E4 用户取消，不做旧 Java 数据导入。旧章节中的 test-rust-ui、schema 19/21、“下一项 E1/E2”和当时未提交状态仅为历史记录。
-- 本次同步基线：前端 `master/328742e`（`origin/master`），Rust `main/0c05773`（`origin/main`）；已 fetch 并快进同步，两端领先/落后均为 0/0。支持多模型渠道、筛选/搜索/置顶/创建顺序、会话内模型切换、失败原因持久保存与恢复；数据库 schema 22/23/24 分别用于原生续接、失败/切换、多模型渠道。
+- 本轮 Qwen 接入前本地基线：前端 `master/185baf0`，Rust `main/95291f7`，GLM 接入已在两仓库提交。本轮未重新 fetch，不推断远端状态；下方 328742e / 0c05773 及当时领先/落后 0/0 为前次同步快照。支持多模型渠道、筛选/搜索/置顶/创建顺序、会话内模型切换、失败原因持久保存与恢复；数据库 schema 22/23/24 分别用于原生续接、失败/切换、多模型渠道。
 - 已接入 Chat Completions、Responses、Anthropic Messages、Google Gemini GenerateContent；四者支持对话和工具续聊（Google 完成本地定向验收，真实供应商待配置后联调）。Responses 使用其原生计数/远端整理能力，其他协议使用本地语义摘要；推理/签名原样续接并按协议/模型/接口/凭据隔离。此前“Messages 仅常规模式”“Responses 不支持工具”“Gemini 仅兼容入口”属于旧阶段边界，Google 原生接入进度见下项。
 - 日志当前为 `logs/agent/YYYY-MM-DD/<traceId>.log`（逐行 JSON），默认 INFO / 7 天，级别和保留天数可即时修改；包含用户与助手正文。旧 .json/.jsonl 不批量改名，仅兼容过期清理。Windows 调试发送栈溢出已用 Box::pin 隔离状态机并完成小栈回归。
 - 既有阶段验证记录分别见对应最新功能文档，历史 E6 验收不能替代新供应商的真实接口/桌面验收。v0.2.2 升级与发布说明已准备；签名安装包、覆盖安装和在线更新须以实际产物独立验收，当前不打包。
-- 最新工作：GLM / 智谱独立供应商已完成本地定向验收，支持 Chat Completions / Messages、品牌图标、多模型渠道、推理控制、工具续聊和本地摘要。默认地址依供应商配置（GLM Chat 为 /api/paas/v4，Messages 为 /api/anthropic/v1，Google 为 /v1beta），不再用“其余全部 /v1”概括。模型基础地址应用内建议、空白解析、保存与查询保持一致；真实供应商/桌面视觉仍待联调。详见下节。
+- 最新工作：Qwen / 通义千问独立供应商已接入 Chat Completions / Messages、品牌图标、多模型渠道、思考开关及档位、百炼原生模型目录分页、工具续聊和 SSE 语义摘要。默认地址依供应商配置；显式业务空间/地域/代理地址保留。前序 GLM 已完成本地定向验收并提交，真实供应商/桌面视觉仍待联调。详见下节。
+
+### Qwen / 通义千问独立供应商（2026-10-20，本地定向验收）
+
+- [x] Rust `SupplierKind::Qwen` 与 `supplier/qwen.rs` 实现独立策略，复用 Chat / Messages adapter。固定 max_tokens、温度 `[0,2)`；默认不覆盖上游，none/新增 enabled 仅发送思考开关，low/medium/xhigh 按协议发送强度。enabled 在其他供应商上原生校验拒绝；不猜模型名称，不伪造 token 预算，不全局设置 preserve_thinking，不降档/自动重试。
+- [x] `SupplierPolicy::prefers_streaming` 默认 false，Qwen true；完整回复入口通过 Box::pin 复用流式协议生命周期，覆盖仅支持 SSE 的模型、工具规划与本地语义摘要。取消、超时、体积、结束帧校验及审批边界保留。Messages 接受官方空签名思考并原样续接，通用 Anthropic 严格规则保留；供应商/协议/模型/地址/凭据绑定隔离，私有思考不进入回复或日志。
+- [x] `catalog/qwen.rs` 将完整 `/compatible-mode/v1/`、`/apps/anthropic/v1/`、`/apps/anthropic/` 后缀映射到同 origin / 代理前缀下的 api/v1/models；两协议目录使用 Bearer，读取 output.models[].model/name，并按 page_no/page_size/total 分页。自定义普通前缀及 OpenAI data/id 列表保留；失败响应、畸形页与空洞分页不返回部分成功列表，仍遵守既有取消、超时/总量、日志与凭据边界。
+- [x] 前端供应商描述目录、模型设置/选择器/筛选/输入框推理复用现有组件，新增本地紫色 Qwen SVG 并保留 MIT 许可。多模型、编辑恢复、已存 Key、代理和稳定模型 ID 保留；默认 Chat 为 https://dashscope.aliyuncs.com/compatible-mode/v1，Messages 为 https://dashscope.aliyuncs.com/apps/anthropic/v1。温度输入通过可选 step 配置支持 0.01、最高 1.99，其他供应商仍使用原步长。未接入 DashScope 原生生成协议或 Responses。
+- [x] 前端定向 **81 项通过**，TypeScript 和 Vite 资源构建通过；覆盖供应商/双协议/默认地址、思考开关与档位隔离、渠道保存恢复/Key、并且筛选、图标、模型选择、发现取消与代理保留。
+- [x] Rust 定向 **84 项通过**：provider **38**、目录 **17**、工具续聊 **10**、摘要 **19**。Qwen 续聊涵盖两协议 × 两种调用入口 × 默认/none/enabled/low/medium/xhigh 共 **24 个场景**，全部实际传输 SSE，验证原始思考/空签名回放、工具执行一次、私有状态不泄露；两协议摘要通过 SSE 收集且无工具、原历史不变。生产库严格 Clippy 通过。
+- [x] 桌面原生 IPC **1 项通过**：qwen_supplier_ipc_preserves_channels_thinking_toggle_and_saved_key_catalog，真实 dispatch 保存两种协议的多模型渠道，DTO 保留 Qwen，enabled 与 xhigh 可保存，查询复用加密测试 Key，目录路径映射及 Bearer 正确，编辑保留成员 ID / Key。测试对桌面本包临时关闭调试符号，未改 Cargo 配置。
+- 使用官方百炼文档、合成响应、回环服务和一次性测试数据；未访问用户真实百炼 Key 或 SSH，真实云端/中转和实际桌面视觉未验收。版本仍为 0.2.2 / schema 24；本轮未提交、推送、打包或发布。包含原生代码，需完全退出托盘后重新运行 npm run tauri dev。配置方法与官方来源见两仓库模型文档。
 
 ### GLM / 智谱独立供应商（2026-10-20，本地定向验收）
 

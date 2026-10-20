@@ -97,11 +97,13 @@ fn sse(protocol: &ProviderKind, reply: &Value) -> String {
                 if thinking.is_some() {
                     start["thinking"] = "".into();
                 }
+                if signature.as_ref().and_then(Value::as_str)==Some("") {start["signature"]="".into();}
                 events.push(json!({"type":"content_block_start","index":i,"content_block":start}));
                 if let Some(thinking) = thinking {
                     events.push(json!({"type":"content_block_delta","index":i,"delta":{"type":"thinking_delta","thinking":thinking}}));
                 }
                 if let Some(signature) = signature {
+                    if signature=="" {events.push(json!({"type":"content_block_delta","index":i,"delta":{"type":"signature_delta","signature":""}}));}
                     for part in signature.as_str().unwrap().as_bytes().chunks(3) {
                         events.push(json!({"type":"content_block_delta","index":i,"delta":{"type":"signature_delta","signature":std::str::from_utf8(part).unwrap()}}));
                     }
@@ -246,6 +248,9 @@ async fn supplier_contract(protocol: ProviderKind, stream: bool, signature: bool
         if matches!(supplier, Some(SupplierKind::Deepseek | SupplierKind::Glm)) && protocol == ProviderKind::AnthropicMessages {
             for block in value["content"].as_array_mut().unwrap() { block.as_object_mut().unwrap().remove("signature"); }
         }
+        if supplier == Some(SupplierKind::Qwen) && protocol == ProviderKind::AnthropicMessages {
+            for block in value["content"].as_array_mut().unwrap() { if block["type"] == "thinking" { block["signature"] = "".into(); } }
+        }
         value
     };
     let first = response(true);
@@ -339,7 +344,7 @@ async fn supplier_contract(protocol: ProviderKind, stream: bool, signature: bool
     );
     let requests = w.requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
-    if protocol == ProviderKind::AnthropicMessages {
+    if protocol == ProviderKind::AnthropicMessages && supplier != Some(SupplierKind::Qwen) {
         for request in requests.iter() {
             if let Some(effort) = &effort {
                 if matches!(supplier, Some(SupplierKind::Deepseek | SupplierKind::Glm)) && *effort == ReasoningEffort::None { assert!(request.get("output_config").is_none()); }
@@ -364,6 +369,22 @@ async fn supplier_contract(protocol: ProviderKind, stream: bool, signature: bool
         }
     }
     let next = &requests[1];
+    if supplier == Some(SupplierKind::Qwen) {
+        for request in requests.iter() {
+            assert_eq!(request["stream"],true,"Qwen complete and streaming entry points both use SSE");
+            assert_eq!(request["max_tokens"],2048);assert!(request.get("thinking_budget").is_none());
+            match &effort {
+                None=>{assert!(request.get("thinking").is_none());assert!(request.get("enable_thinking").is_none());}
+                Some(value)=>{
+                    if protocol==ProviderKind::AnthropicMessages {assert_eq!(request["thinking"]["type"],if *value==ReasoningEffort::None {"disabled"}else{"enabled"});}
+                    else {assert_eq!(request["enable_thinking"],*value!=ReasoningEffort::None);}
+                    if matches!(value,ReasoningEffort::None|ReasoningEffort::Enabled) {assert!(request.get("reasoning_effort").is_none());assert!(request.get("output_config").is_none());}
+                    else if protocol==ProviderKind::AnthropicMessages {assert_eq!(request["output_config"]["effort"],json!(value));}
+                    else {assert_eq!(request["reasoning_effort"],json!(value));}
+                }
+            }
+        }
+    }
     match protocol {
         ProviderKind::GoogleGemini => {
             assert_eq!(next["contents"][1],first["candidates"][0]["content"]);
@@ -491,6 +512,17 @@ async fn glm_dual_protocol_tools_streaming_and_thinking_roundtrip() {
         for stream in [false, true] {
             for effort in [None, Some(ReasoningEffort::None), Some(ReasoningEffort::Low), Some(ReasoningEffort::High), Some(ReasoningEffort::Max)] {
                 supplier_contract(protocol.clone(), stream, true, effort, Some(SupplierKind::Glm)).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn qwen_tools_replay_thinking_through_streaming_and_collected_entry_points() {
+    for protocol in [ProviderKind::OpenAiCompatible,ProviderKind::AnthropicMessages] {
+        for stream in [false,true] {
+            for effort in [None,Some(ReasoningEffort::None),Some(ReasoningEffort::Enabled),Some(ReasoningEffort::Low),Some(ReasoningEffort::Medium),Some(ReasoningEffort::Xhigh)] {
+                supplier_contract(protocol.clone(),stream,false,effort,Some(SupplierKind::Qwen)).await;
             }
         }
     }

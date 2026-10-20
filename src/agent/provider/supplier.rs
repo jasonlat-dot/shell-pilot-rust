@@ -13,11 +13,20 @@ pub enum SupplierKind {
     Google,
     Deepseek,
     Glm,
+    Qwen,
 }
 
 pub(super) trait SupplierPolicy: Sync {
     fn normalize(&self, config: &mut ModelConfig) -> Result<()> {
+        if config.reasoning_effort == Some(ReasoningEffort::Enabled) {
+            return Err(ModelError::Invalid(
+                "thinking toggle is not supported by this supplier",
+            ));
+        }
         super::adapter::select(&config.provider).normalize_config(config)
+    }
+    fn prefers_streaming(&self) -> bool {
+        false
     }
     fn requires_thinking_signature(&self) -> bool {
         true
@@ -37,14 +46,17 @@ pub(super) trait SupplierPolicy: Sync {
 struct Compatible;
 struct DeepSeek;
 struct Glm;
+mod qwen;
 static COMPATIBLE: Compatible = Compatible;
 static DEEPSEEK: DeepSeek = DeepSeek;
 static GLM: Glm = Glm;
+static QWEN: qwen::Qwen = qwen::Qwen;
 impl SupplierPolicy for Compatible {}
 pub(super) fn select(supplier: Option<&SupplierKind>) -> &'static dyn SupplierPolicy {
     match supplier {
         Some(SupplierKind::Deepseek) => &DEEPSEEK,
         Some(SupplierKind::Glm) => &GLM,
+        Some(SupplierKind::Qwen) => &QWEN,
         _ => &COMPATIBLE,
     }
 }
@@ -57,7 +69,7 @@ pub(super) fn validate(supplier: Option<&SupplierKind>, provider: &ProviderKind)
         ),
         Some(SupplierKind::Anthropic) => *provider == ProviderKind::AnthropicMessages,
         Some(SupplierKind::Google) => *provider == ProviderKind::GoogleGemini,
-        Some(SupplierKind::Deepseek | SupplierKind::Glm) => matches!(
+        Some(SupplierKind::Deepseek | SupplierKind::Glm | SupplierKind::Qwen) => matches!(
             provider,
             ProviderKind::OpenAiCompatible | ProviderKind::AnthropicMessages
         ),
@@ -72,7 +84,12 @@ pub(super) fn validate(supplier: Option<&SupplierKind>, provider: &ProviderKind)
 }
 /// Generic supplier labels are implied by their protocol; old profiles and replay bindings remain compatible.
 pub(super) fn canonical(supplier: Option<SupplierKind>) -> Option<SupplierKind> {
-    supplier.filter(|s| matches!(s, SupplierKind::Deepseek | SupplierKind::Glm))
+    supplier.filter(|s| {
+        matches!(
+            s,
+            SupplierKind::Deepseek | SupplierKind::Glm | SupplierKind::Qwen
+        )
+    })
 }
 impl SupplierPolicy for Glm {
     fn requires_thinking_signature(&self) -> bool {

@@ -57,7 +57,7 @@ impl ModelClient {
         })
     }
 
-    /// Non-streaming request through the selected wire strategy.
+    /// Collect a complete reply; suppliers may require streaming on the wire.
     pub async fn complete(&self, request: &ChatRequest, cancel: &CancellationToken) -> Result<Completion> {
         self.validate_continuations(request)?;
         let completion = super::diagnostics::observe(&self.config,request,"complete",Box::pin(self.complete_inner(request,cancel))).await?;
@@ -83,6 +83,9 @@ impl ModelClient {
         }
         if self.adapter.response_windows() {
             return self.complete_responses(request, cancel).await;
+        }
+        if super::supplier::select(self.config.supplier.as_ref()).prefers_streaming() {
+            return Box::pin(self.stream_protocol(request, cancel, |_| async { Ok(()) }, !request.tools.is_empty())).await;
         }
         let prepared = prepare_request(&self.config, request)?;
         let operation = async {

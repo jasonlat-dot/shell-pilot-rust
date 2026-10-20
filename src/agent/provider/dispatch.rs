@@ -53,7 +53,7 @@ impl ModelClient {
         if self.adapter.response_windows() { return self.stream_responses(request, cancel, on_text).await; }
         self.stream_protocol(request, cancel, on_text, true).await
     }
-    async fn stream_protocol<F, Fut>(
+    pub(super) async fn stream_protocol<F, Fut>(
         &self,
         request: &ChatRequest,
         cancel: &CancellationToken,

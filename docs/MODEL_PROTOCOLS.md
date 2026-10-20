@@ -143,3 +143,15 @@ DeepSeek 本轮最终定向验证：前端 64 项、Rust provider/目录/工具�
 - 两协议使用现有本地语义摘要，不携带工具，不使用 Responses 的计数/远端整理。本次入口只开放定向验收的 Chat 和 Messages。
 
 依据：[智谱 OpenAI 兼容](https://docs.bigmodel.cn/cn/guide/develop/openai/introduction)、[Claude 兼容](https://docs.bigmodel.cn/cn/guide/develop/claude/introduction)、[思考续接](https://docs.bigmodel.cn/cn/guide/capabilities/thinking-mode)、[强度与模型限制](https://docs.bigmodel.cn/cn/guide/capabilities/thinking)。验证命令和真实接口边界见 AGENT_PROGRESS.md 本轮记录。
+
+## Qwen 供应商策略（2026-10-20）
+
+`SupplierKind::Qwen` 独立持久化，策略实现位于 `supplier/qwen.rs`，复用 Chat Completions / Messages adapter。默认客户端地址为国内公共端点 `https://dashscope.aliyuncs.com/compatible-mode/v1` 与 `https://dashscope.aliyuncs.com/apps/anthropic/v1`；显式业务空间域名、地域、代理和密钥保持原样，不通过模型 ID 推测协议。
+
+`ReasoningEffort::Enabled` 表示仅启用思考，无档位；只由 Qwen 策略接受，其他供应商拒绝该值。默认省略思考字段；none / enabled 映射 Chat 的 enable_thinking=false/true 或 Messages 的 thinking.type=disabled/enabled，移除 effort 字段；low/medium/xhigh 同时启用思考并使用对应协议的 reasoning_effort / output_config.effort。固定 max_tokens，温度 `[0,2)`；不伪造 thinking_budget、budget_tokens，不发送 extra_body 包装，不全局强开 preserve_thinking，不按模型名硬编码支持列表或自动降档。
+
+SupplierPolicy::prefers_streaming 默认 false，Qwen 为 true；完整回复入口 complete 通过 Box::pin 调用既有流式协议生命周期并收集结果，覆盖仅支持 SSE 的模型及工具规划、本地摘要场景。不会改其他供应商的传输方式；结束帧、超时、取消、体积上限、协议状态封装和审批边界复用原逻辑。Messages 接受百炼文档中的空思考签名，原内容保持不变；通用 Anthropic 严格规则不变。
+
+`catalog/qwen.rs` 将已知完整推理后缀映射为同 origin / 代理前缀下的 api/v1/models，两协议目录均用 Bearer，解析 output.total/page_no/page_size/models[].model/name，控制分页和总量；自定义普通前缀保留且接受 OpenAI data/id。错误页、空洞分页或不完整列表失败，不静默返回部分结果。当前不接入 Responses 或 DashScope 原生生成协议。
+
+依据：[百炼 Chat](https://help.aliyun.com/zh/model-studio/qwen-api-via-openai-chat-completions)、[Messages](https://help.aliyun.com/zh/model-studio/anthropic-api-messages)、[思考开关与流式限制](https://help.aliyun.com/zh/model-studio/deep-thinking)、[模型目录](https://help.aliyun.com/zh/model-studio/list-models)。本地回环验收、真实接口和桌面视觉分开记录，见 AGENT_PROGRESS.md 最新章节。

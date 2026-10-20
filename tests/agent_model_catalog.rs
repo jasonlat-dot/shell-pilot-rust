@@ -81,6 +81,7 @@ impl Fixture {
         let app = Router::new()
             .route("/proxy/v1/models", get(respond))
             .route("/proxy/models", get(respond))
+            .route("/proxy/api/v1/models", get(respond))
             .with_state(wire.clone());
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -630,4 +631,31 @@ async fn glm_catalog_preserves_proxy_path_and_protocol_authentication() {
         }
     }
     assert!(f.repository.list("user").unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn qwen_catalog_maps_documented_suffixes_and_paginates_with_bearer_for_both_protocols() {
+    let first=json!({"success":true,"output":{"total":101,"page_no":1,"page_size":100,"models":(0..100).map(|n|json!({"model":format!("alias-{n}"),"name":format!("Model {n}")})).collect::<Vec<_>>()}});
+    let last=json!({"success":true,"output":{"total":101,"page_no":2,"page_size":100,"models":[{"model":"alias-100"}]}});
+    let f=Fixture::new(vec![Reply::Json(first.clone()),Reply::Json(last.clone()),Reply::Json(first),Reply::Json(last)]).await;
+    for (index,protocol) in [ProviderKind::OpenAiCompatible,ProviderKind::AnthropicMessages].into_iter().enumerate() {
+        let mut query=f.query(protocol);query.supplier=Some(SupplierKind::Qwen);
+        query.base_url=f.base.replace("/proxy/v1/",if index==0 {"/proxy/compatible-mode/v1/"}else{"/proxy/apps/anthropic/v1/"});
+        let models=f.list(query).await.unwrap();assert_eq!(models.len(),101);assert_eq!(models[100].id,"alias-100");assert_eq!(models[0].display_name.as_deref(),Some("Model 0"));
+    }
+    let calls=f.wire.calls.lock().unwrap();assert_eq!(calls.len(),4);
+    for (index,(uri,headers)) in calls.iter().enumerate() {
+        assert_eq!(uri.path(),"/proxy/api/v1/models");assert_eq!(uri.query(),Some(if index%2==0 {"page_no=1&page_size=100"}else{"page_no=2&page_size=100"}));
+        assert_eq!(headers["authorization"],"Bearer catalog-test-key");assert!(!headers.contains_key("x-api-key"));
+    }
+    assert!(f.repository.list("user").unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn qwen_custom_proxy_catalog_accepts_openai_shape_without_rewriting_prefix() {
+    let f=Fixture::new(vec![Reply::Json(json!({"data":[{"id":"proxy-alias"}]}))]).await;
+    let mut query=f.query(ProviderKind::AnthropicMessages);query.supplier=Some(SupplierKind::Qwen);query.require_api_key=false;
+    assert_eq!(f.list(query).await.unwrap()[0].id,"proxy-alias");
+    let calls=f.wire.calls.lock().unwrap();assert_eq!(calls[0].0.path(),"/proxy/v1/models");
+    assert!(!calls[0].1.contains_key("authorization"));assert!(!calls[0].1.contains_key("x-api-key"));
 }
