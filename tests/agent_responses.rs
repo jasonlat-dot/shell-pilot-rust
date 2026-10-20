@@ -284,6 +284,7 @@ impl Fixture {
                 ModelConfigUpdate {
                     config: ModelConfig {
                         provider: ProviderKind::OpenAiResponses,
+                        supplier: None,
                         remote_compaction: true,
                         base_url: base,
                         completions_path: "responses".into(),

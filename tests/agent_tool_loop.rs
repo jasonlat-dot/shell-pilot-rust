@@ -45,6 +45,7 @@ impl Model {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut config = ModelConfig {
             provider: ProviderKind::OpenAiCompatible,
+            supplier: None,
             remote_compaction: false,
             base_url: format!("http://{}/v1/", listener.local_addr().unwrap()),
             completions_path: "chat/completions".into(),

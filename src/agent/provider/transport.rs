@@ -111,7 +111,7 @@ impl ModelClient {
                 }
                 bytes.extend_from_slice(&chunk);
             }
-            self.adapter.decode(&bytes, &prepared.allowed_tools)
+            self.adapter.decode_for(&self.config, &bytes, &prepared.allowed_tools)
         };
         tokio::select! {
             biased;

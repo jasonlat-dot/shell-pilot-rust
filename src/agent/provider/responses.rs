@@ -15,6 +15,8 @@ pub(crate) const MAX_WINDOW_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Binding {
     provider: ProviderKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    supplier: Option<SupplierKind>,
     endpoint: String,
     model: String,
     credential: String,
@@ -24,6 +26,7 @@ impl Binding {
         let config = runtime.config.clone().normalized()?;
         Ok(Self {
             provider: config.provider.clone(),
+            supplier: config.supplier.clone(),
             endpoint: config.endpoint()?.to_string(),
             model: config.model,
             credential: runtime.api_key.as_ref().map_or_else(
@@ -38,7 +41,8 @@ impl Binding {
         })
     }
     pub(crate) fn matches_config(&self, config: &ModelConfig) -> Result<()> {
-        if self.provider != config.provider
+        if self.supplier != super::supplier::canonical(config.supplier.clone())
+            || self.provider != config.provider
             || self.endpoint != config.endpoint()?.as_str()
             || self.model != config.model
         {

@@ -80,6 +80,8 @@ impl Default for ModelCapabilities {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelConfig {
     pub provider: ProviderKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supplier: Option<super::SupplierKind>,
     #[serde(default)]
     pub remote_compaction: bool,
     /// Base includes any proxy prefix, e.g. https://api.openai.com/v1/.
@@ -157,7 +159,9 @@ impl ModelConfig {
                 "parameter is invalid or disabled by model capabilities",
             ));
         }
-        super::adapter::select(&self.provider).normalize_config(&mut self)?;
+        super::supplier::validate(self.supplier.as_ref(), &self.provider)?;
+        self.supplier = super::supplier::canonical(self.supplier);
+        super::supplier::select(self.supplier.as_ref()).normalize(&mut self)?;
         self.base_url = normalize_base_url(&self.base_url)?.to_string();
         if self.completions_path.trim().starts_with("//") {
             return Err(ModelError::Invalid(

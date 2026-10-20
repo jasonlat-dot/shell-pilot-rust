@@ -59,17 +59,15 @@ impl ProviderAdapter for AnthropicMessages {
         })
     }
     fn decode(&self, bytes: &[u8], allowed: &HashSet<String>) -> Result<Completion> {
-        let response: Message = serde_json::from_slice(bytes).map_err(|_| ModelError::Response)?;
-        if response.kind != "message" || response.role != "assistant" {
-            return Err(ModelError::Response);
-        }
-        assemble(
-            response.content,
-            response.usage,
-            response.stop_reason,
-            allowed,
-        )
+        decode_message(bytes, allowed, true)
     }
+    fn decode_for(&self, config: &ModelConfig, bytes: &[u8], allowed: &HashSet<String>) -> Result<Completion> {
+        decode_message(bytes, allowed, super::supplier::select(config.supplier.as_ref()).requires_thinking_signature())
+    }
+    fn stream_for(&self, config: &ModelConfig, _: bool) -> Result<Box<dyn ResponseStream>> {
+        Ok(Box::new(stream::MessagesStream::new(!super::supplier::select(config.supplier.as_ref()).requires_thinking_signature())))
+    }
+
     fn stream(&self, _: bool) -> Result<Box<dyn ResponseStream>> {
         Ok(Box::<stream::MessagesStream>::default())
     }
@@ -77,6 +75,21 @@ impl ProviderAdapter for AnthropicMessages {
         true
     }
 }
+fn decode_message(bytes: &[u8], allowed: &HashSet<String>, require_signature: bool) -> Result<Completion> {
+    let response: Message = serde_json::from_slice(bytes).map_err(|_| ModelError::Response)?;
+    if response.kind != "message" || response.role != "assistant" {
+        return Err(ModelError::Response);
+    }
+    assemble_checked(
+        response.content,
+        response.usage,
+        response.stop_reason,
+        allowed,
+        require_signature,
+    )
+
+}
+
 fn push(messages: &mut Vec<Value>, role: &str, mut blocks: Vec<Value>) -> Result<()> {
     if blocks.is_empty() {
         return Err(ModelError::ToolProtocol);
@@ -155,6 +168,7 @@ fn encode(config: &ModelConfig, request: &ChatRequest) -> Result<Value> {
     if let Some(effort) = &config.reasoning_effort {
         body["output_config"] = json!({"effort":effort});
     }
+    super::supplier::select(config.supplier.as_ref()).decorate(config, &mut body);
     if !system.is_empty() {
         body["system"] = system.join("\n\n").into();
     }
@@ -215,11 +229,8 @@ fn usage(value: Option<Value>) -> Result<Option<Usage>> {
         total_tokens: input.checked_add(output).ok_or(ModelError::Response)?,
     }))
 }
-pub(super) fn assemble(
-    blocks: Vec<ContentBlock>,
-    tokens: Option<Value>,
-    reason: Option<String>,
-    allowed: &HashSet<String>,
+fn assemble_checked(
+    blocks: Vec<ContentBlock>, tokens: Option<Value>, reason: Option<String>, allowed: &HashSet<String>, require_signature: bool,
 ) -> Result<Completion> {
     if blocks.len() > 128 {
         return Err(ModelError::ResponseTooLarge);
@@ -252,7 +263,7 @@ pub(super) fn assemble(
                 },
             }),
             "thinking" => {
-                if block.thinking.is_none() || block.signature.as_deref().is_none_or(str::is_empty) { return Err(ModelError::ToolProtocol); }
+                if block.thinking.is_none() || (require_signature && block.signature.as_deref().is_none_or(str::is_empty)) { return Err(ModelError::ToolProtocol); }
                 thinking = true;
             }
             "redacted_thinking" => {

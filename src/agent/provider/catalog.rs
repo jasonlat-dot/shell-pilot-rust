@@ -12,6 +12,8 @@ use url::Url;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CatalogRequest {
     pub provider: ProviderKind,
+    #[serde(default)]
+    pub supplier: Option<SupplierKind>,
     pub base_url: String,
     pub require_api_key: bool,
     #[serde(default)]
@@ -75,7 +77,7 @@ fn data(value: &Value) -> Result<Vec<CatalogModel>> {
             let path = format!("/data/{index}/id");
             model(
                 string(item, "id", &path)?,
-                item["display_name"].as_str(),
+                item["display_name"].as_str().or_else(|| item["name"].as_str()),
                 &path,
             )
         })
@@ -201,6 +203,7 @@ impl CatalogAdapter for Google {
 /// Credentials never leave native memory. Discovery does not save any draft fields.
 pub struct CatalogClient {
     provider: ProviderKind,
+    supplier: Option<SupplierKind>,
     base: Url,
     client: Client,
     headers: header::HeaderMap,
@@ -212,8 +215,9 @@ impl CatalogClient {
         if request.require_api_key && key.is_none() {
             return Err(ModelError::KeyMissing);
         }
-        let strategy = super::adapter::select(&request.provider);
-        let headers = strategy.headers(if request.require_api_key {
+        super::supplier::validate(request.supplier.as_ref(), &request.provider)?;
+        let policy = super::supplier::select(request.supplier.as_ref());
+        let headers = policy.catalog_headers(&request.provider, if request.require_api_key {
             key.as_ref()
         } else {
             None
@@ -231,10 +235,11 @@ impl CatalogClient {
         }
         Ok(Self {
             provider: request.provider.clone(),
+            supplier: super::supplier::canonical(request.supplier.clone()),
             base,
             client: builder.build().map_err(super::transport::network)?,
             headers,
-            adapter: strategy.catalog(),
+            adapter: policy.catalog(&request.provider),
         })
     }
     pub async fn list(&self, cancel: &CancellationToken) -> Result<Vec<CatalogModel>> {

@@ -1,5 +1,7 @@
 //! Provider strategies normalize wire protocols; HTTP and Agent execution remain separate.
 mod adapter;
+mod supplier;
+pub use supplier::SupplierKind;
 mod catalog;
 mod anthropic;
 mod google;

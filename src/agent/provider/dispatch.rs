@@ -72,7 +72,7 @@ impl ModelClient {
             serde_json::from_str(&prepared.body).map_err(|_| ModelError::Response)?;
         let mut endpoint = prepared.endpoint.clone();
         self.adapter.prepare_stream(&mut endpoint, &mut body)?;
-        let mut decoder = self.adapter.stream(tools)?;
+        let mut decoder = self.adapter.stream_for(&self.config, tools)?;
         let operation = async {
             let mut response = self
                 .client
@@ -110,7 +110,7 @@ impl ModelClient {
                     }
                     bytes.extend_from_slice(&chunk);
                 }
-                let completion = self.adapter.decode(&bytes, &prepared.allowed_tools)?;
+                let completion = self.adapter.decode_for(&self.config, &bytes, &prepared.allowed_tools)?;
                 if let Some(text) = completion
                     .message
                     .content

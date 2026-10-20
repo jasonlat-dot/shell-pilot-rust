@@ -118,6 +118,7 @@ impl Fixture {
                 0,
                 ModelConfigUpdate {
                     config: ModelConfig {
+                        supplier: None,
                         provider: if responses {
                             ProviderKind::OpenAiResponses
                         } else {

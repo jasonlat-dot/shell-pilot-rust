@@ -7,7 +7,49 @@
 - 已接入 Chat Completions、Responses、Anthropic Messages、Google Gemini GenerateContent；四者支持对话和工具续聊（Google 完成本地定向验收，真实供应商待配置后联调）。Responses 使用其原生计数/远端整理能力，其他协议使用本地语义摘要；推理/签名原样续接并按协议/模型/接口/凭据隔离。此前“Messages 仅常规模式”“Responses 不支持工具”“Gemini 仅兼容入口”属于旧阶段边界，Google 原生接入进度见下项。
 - 日志当前为 `logs/agent/YYYY-MM-DD/<traceId>.log`（逐行 JSON），默认 INFO / 7 天，级别和保留天数可即时修改；包含用户与助手正文。旧 .json/.jsonl 不批量改名，仅兼容过期清理。Windows 调试发送栈溢出已用 Box::pin 隔离状态机并完成小栈回归。
 - 既有阶段验证记录分别见对应最新功能文档，历史 E6 验收不能替代新供应商的真实接口/桌面验收。v0.2.2 升级与发布说明已准备；签名安装包、覆盖安装和在线更新须以实际产物独立验收，当前不打包。
-- 最新工作：终端工具栏已收纳到顶部“终端”菜单，并新增断开的 SSH 终端按任意键重连及对应提示；菜单粘贴显示 Ctrl+V，字号区仅保留鼠标滚轮提示；模型目录与 Google 空能力/null 分页兼容保持已完成。终端新交互完成本地定向验收，桌面实际联调待确认，详见下节。
+- 最新工作：Google 默认地址已恢复 /v1beta（覆盖下方统一 /v1 的历史记录）；模型基础地址改用应用内建议列表，区分官方默认和现有配置中的已保存地址；留空默认、保存和查询统一解析规则保持。前序 DeepSeek 独立供应商与默认 /v1 已完成本地定向验收，真实供应商/桌面视觉仍待联调。详见下节。
+
+### Google 默认基础地址恢复 v1beta（2026-10-20）
+
+- [x] 前端 master `api/modelProtocols.ts::modelSuppliers.google` 将默认提示恢复为 https://generativelanguage.googleapis.com/v1beta；空白地址保存、查询上游模型及建议菜单官方默认共用该目录。OpenAI / Anthropic / DeepSeek 默认值保持 /v1，已有非空 v1 / v1beta / 中转地址不改写；无需迁移已存配置。本节覆盖此前“全部统一 /v1”的 Google 部分。
+- [x] 更新 `tests/model-protocols.test.ts`、`tests/model-compaction-ui.test.mjs` 的版本断言，包含显式 v1 保留验证；连同查询/地址建议相关回归 **55 项通过**。TypeScript 与两仓库 diff 检查通过；客户端 `docs/agent-model-settings.md` 和 `docs/MODEL_PROTOCOLS.md` 同步默认版本说明。未访问真实上游/SSH、未重新运行无 Rust 生产改动的原生测试，未打包或提交。
+
+### 地址建议滚动条缩窄（2026-10-20）
+
+- [x] 前端 master `components/ModelEndpointInput.css` 为地址建议菜单单独设置 3px 滚动条，较全局 6px 缩小一半，保留现有滑块颜色、圆角及滚动行为。仅局部 CSS 调整，两仓库 diff 检查通过；未重复运行逻辑测试或实际视觉验收，未打包或提交。
+
+### 地址建议字重与浮层阴影（2026-10-20）
+
+- [x] 按用户后续反馈，前端 master `components/ModelEndpointInput.css` 将建议列表文字加重到 500、已选地址 600；边框改用主题 line-strong，在既有主题菜单阴影上叠加柔和近层阴影，强化下拉框层次。自定义字体继续生效，本次字重以局部样式为准。仅样式修改，两仓库 diff 检查通过；未重复运行交互/类型/Rust 测试或实际视觉验收，未打包或提交。
+
+### 地址建议列表字体优化（2026-10-20）
+
+- [x] 前端 master `components/ModelEndpointInput.css` 移除地址文字写死的 12px Consolas/Courier New 等宽字体，改用应用 13px 正文字体，并跟随外观设置中的自定义字体/常规字重；分组标题调整为 12px，选项统一字体继承、36px 最小行高和选中浅色高亮。仅调整下拉列表排版，地址输入和选择逻辑保持。
+- [x] 现有地址建议交互定向 **6 项通过**，两仓库 diff 检查通过；不新增纯样式断言，未重新运行无代码改动的类型/Rust/全量回归，未完成真实 WebView 视觉验收，未打包或提交。保留原有未提交修改。
+
+### 模型基础地址建议 UI（2026-10-20，本地定向验收）
+
+- [x] 前端 master `components/ModelEndpointInput.tsx/.css` 提供可编辑地址建议控件，`ModelSettings.tsx` 接入并关闭表单/字段原生自动补全，替代 WebView“保存的信息”弹层。区分官方默认与已保存地址，沿用主题、高亮、图标、选中勾、长地址省略、Portal 与视口避让；点击选择、方向键循环/回车、Esc/Tab/外部点击/滚动关闭，输入法组合不拦截。菜单内部滚动不影响表单；保存中禁用。
+- [x] `state/modelEndpoints.ts` 从现有模型配置生成建议，不读取浏览器历史或另存未保存草稿；地址去重，最多 8 个已保存地址，输入筛选。排除无效及含用户名/密码/查询参数/片段的记录。选择官方默认清空字段，由已有 `resolvedModelBaseUrl` 解析，选择已保存地址使用原值；不自动改写用户输入或密钥。
+- [x] `tests/model-endpoints.test.mjs` 新增 **6 项通过**，覆盖建议来源/去重/过滤/上限、留空默认与保存地址选择、原文输入、键盘/输入法、浮层位置和关闭/禁用；连同表单、发现、协议相关回归合计 **55 项通过**，TypeScript 与 diff 检查通过。客户端 `docs/agent-model-settings.md` 同步说明。
+- 仅前端代码与测试/说明和本进度记录调整，保留已有 DeepSeek 与用户图标变更；Tabbit tabs/diagnose 启动器均无输出退出（exit 1），未完成真实浏览器/WebView 视觉与原生补全抑制验收。未访问真实上游/用户 SSH，未重新运行 Rust 回归、打包或提交推送。
+
+### 模型基础地址留空默认值与 v1 统一（2026-10-20）
+
+- [x] 前端 `api/modelProtocols.ts::resolvedModelBaseUrl` 作为保存/模型查询的唯一地址解析入口：空或仅空格使用当前供应商/协议的 placeholder，非空自定义地址优先且保留版本/代理前缀；不回填表单草稿。`ModelSettings.tsx` 移除空地址必填限制并在保存时解析，`ModelCatalogInput.tsx` 查询时复用解析；地址下方提示改为“留空使用默认地址，也可填写中转地址”。
+- [x] OpenAI、Anthropic、Google、DeepSeek Chat 与 Messages 的默认提示全部统一到 /v1 结尾；DeepSeek 分别为 https://api.deepseek.com/v1 和 https://api.deepseek.com/anthropic/v1，Google 使用官方稳定版 /v1，已有 /v1beta 或自定义路径不改写。Google 路径提示改为按 API 版本填写，避免继续要求默认 /v1beta。
+- [x] `model-protocols.test.ts`、`model-compaction-ui.test.mjs`、`model-discovery.test.mjs` 定向 **49 项通过**，覆盖各供应商/协议留空/空格默认、保存与查询一致、不回填、代理优先、查询取消与密钥开关；TypeScript 与两个仓库 diff 检查通过。客户端 `docs/agent-model-settings.md` 同步最新用法。
+- 仅前端 master 代码、相关测试与说明/进度记录调整，无 Rust 生产代码修改；保留已有 DeepSeek 改动和用户图标变更。未访问真实上游或用户 SSH、未重新执行原生回归、构建安装包或提交推送。
+
+### DeepSeek 独立供应商接入（2026-10-20，本地定向验收完成）
+
+- [x] `provider/supplier.rs::SupplierPolicy` 将供应商身份与 wire 协议组合，`ModelConfig`/`CatalogRequest` 增加可选 supplier，DeepSeek 保留独立身份，旧 JSON 与原协议 ID 不变，无 schema 迁移；`chat.rs::AgentConfig`、请求/目录日志和续接 Binding 携带身份。默认 Chat Completions，可选 Messages；专属 max_tokens、思考开关/档位、目录策略和无签名思考块规则集中在策略，不复制 HTTP/SSE、工具循环或摘要路径。通用 Anthropic 签名与温度限制不放宽，DeepSeek 不开放当前 Responses 专用流程。
+- [x] 前端 master `api/modelProtocols.ts` / `models.ts`、`ModelSettings.tsx`、`ModelSupplierIcon.tsx`、`ModelPicker.tsx`、`ComposerReasoningControl.tsx`、`modelChannels.ts` 接通供应商选择、双协议、保存/编辑/筛选、本地蓝色鲸鱼图标和聊天推理档位；模型查询参数包含 supplier，`ModelCatalogInput` 供应商变化时取消旧查询。官网地址仅 placeholder，用户地址保留，旧渠道不按域名或名称自动转换。
+- [x] 后端定向 **45 项通过**：provider 单测 **29**（含 supplier 新增 **5**，覆盖旧配置、合法组合、双协议参数、保存重开/绑定隔离、签名保护及完整路径段映射）；`agent_model_catalog.rs` **14**（含新增 DeepSeek 双协议 Bearer/代理前缀/只读查询）；`agent_provider_continuations.rs::deepseek_dual_protocol_tools_streaming_and_thinking_roundtrip` **1**（两协议 × JSON/SSE × 默认/none/high/max 共 **16** 场景，含无签名思考原样续接、真实工具循环、日志不泄露思考）；`agent_compact.rs::deepseek_both_protocols_use_local_semantic_compaction_without_tools` **1**（两协议语义摘要、max_tokens、无工具、原日志保留）。生产库严格 Clippy（-D warnings）通过。
+- [x] 客户端 `backend_ipc_tests.rs::deepseek_supplier_ipc_roundtrips_channels_choices_and_saved_key_discovery` **1 项通过**：两种协议经真实 IPC 保存多模型渠道，模型列表 DTO 返回 DeepSeek 身份，配置/列表不含测试 Key，编辑留空复用已保存加密 Key 查询目录，Messages 目录映射与 Bearer 头正确；仅回环服务器与一次性数据目录，没有用户 SSH。
+- [x] 前端相关 **64 项通过**（供应商/表单/图标/选择/发现 **59** + 聊天推理 **5**），TypeScript / Vite 资源构建、new supplier 模块 Rustfmt 与两个仓库 diff 检查通过；未重新执行无生产改动的终端等无关测试。`docs/MODEL_PROTOCOLS.md` 和客户端 `docs/agent-model-settings.md` 已同步配置方法与验证边界。
+- 本机原生编译遇到内存压力，最终串行完成；provider 库单测与桌面 IPC 单测仅对本包使用命令行 profile.test.package.<包名>.debug=0 降低内存，不改 Cargo 配置或停止用户应用。初轮旧压缩模拟服务仅理解 Chat 消息位置，已改为末条消息/内容块读取，最终两协议摘要验收通过。
+- 本轮均为合成响应/测试 Key/回环服务；**未完成真实 DeepSeek/中转联调与实际桌面视觉验收**，未访问真实用户 Key 或 SSH、未全量回归、打包、提交或推送。前端 master / Rust main；包含原生实现，需重启 `npm run tauri dev` 重新编译后体验，不能仅刷新前端。
 
 ### 移除命令栏 Agent 单终端提示（2026-10-20）
 

@@ -238,10 +238,20 @@ async fn contract(protocol: ProviderKind, stream: bool, signature: bool) {
     effort_contract(protocol, stream, signature, None).await;
 }
 async fn effort_contract(protocol: ProviderKind, stream: bool, signature: bool, effort: Option<ReasoningEffort>) {
-    let first = reply(&protocol, true, signature);
+    supplier_contract(protocol, stream, signature, effort, None).await;
+}
+async fn supplier_contract(protocol: ProviderKind, stream: bool, signature: bool, effort: Option<ReasoningEffort>, supplier: Option<SupplierKind>) {
+    let response = |first| {
+        let mut value = reply(&protocol, first, signature);
+        if supplier == Some(SupplierKind::Deepseek) && protocol == ProviderKind::AnthropicMessages {
+            for block in value["content"].as_array_mut().unwrap() { block.as_object_mut().unwrap().remove("signature"); }
+        }
+        value
+    };
+    let first = response(true);
     let w = Wire {
         replies: Arc::new(Mutex::new(
-            vec![first.clone(), reply(&protocol, false, signature)].into(),
+            vec![first.clone(), response(false)].into(),
         )),
         requests: Arc::default(),
         protocol: protocol.clone(),
@@ -253,7 +263,7 @@ async fn effort_contract(protocol: ProviderKind, stream: bool, signature: bool, 
         ProviderKind::OpenAiResponses => "responses",
         _ => "chat/completions",
     };
-    let config: ModelConfig = serde_json::from_value(json!({"provider":protocol,"baseUrl":format!("http://{}/v1/",listener.local_addr().unwrap()),"completionsPath":path,"model":"arbitrary-model-name","outputTokenParameter":"maxTokens","reasoningEffort":effort,"capabilities":{"developerRole":false,"temperature":false,"reasoningEffort":effort.is_some()},"requireApiKey":false})).unwrap();
+    let config: ModelConfig = serde_json::from_value(json!({"provider":protocol,"supplier":supplier,"baseUrl":format!("http://{}/v1/",listener.local_addr().unwrap()),"completionsPath":path,"model":"arbitrary-model-name","outputTokenParameter":"maxTokens","reasoningEffort":effort,"capabilities":{"developerRole":false,"temperature":false,"reasoningEffort":effort.is_some()},"requireApiKey":false})).unwrap();
     let store = Arc::new(Store::in_memory().unwrap());
     let models = ModelRepository::new(store.clone());
     models
@@ -332,12 +342,15 @@ async fn effort_contract(protocol: ProviderKind, stream: bool, signature: bool, 
     if protocol == ProviderKind::AnthropicMessages {
         for request in requests.iter() {
             if let Some(effort) = &effort {
-                assert_eq!(request["output_config"]["effort"], json!(effort));
+                if supplier == Some(SupplierKind::Deepseek) && *effort == ReasoningEffort::None { assert!(request.get("output_config").is_none()); }
+                else { assert_eq!(request["output_config"]["effort"], json!(effort)); }
             } else {
                 assert!(request.get("output_config").is_none());
             }
             assert!(request.get("reasoning_effort").is_none());
-            assert!(request.get("thinking").is_none());
+            if supplier == Some(SupplierKind::Deepseek) && effort.is_some() {
+                assert_eq!(request["thinking"]["type"], if effort == Some(ReasoningEffort::None) { "disabled" } else { "enabled" });
+            } else { assert!(request.get("thinking").is_none()); }
         }
     }
     let next = &requests[1];
@@ -450,3 +463,14 @@ async fn same_conversation_continues_after_all_cross_protocol_model_changes() {
 
 #[tokio::test]
 async fn google_native_signed_tool_roundtrip_json_and_stream(){for stream in [false,true]{contract(ProviderKind::GoogleGemini,stream,true).await;}}
+
+#[tokio::test]
+async fn deepseek_dual_protocol_tools_streaming_and_thinking_roundtrip() {
+    for protocol in [ProviderKind::OpenAiCompatible, ProviderKind::AnthropicMessages] {
+        for stream in [false, true] {
+            for effort in [None, Some(ReasoningEffort::None), Some(ReasoningEffort::High), Some(ReasoningEffort::Max)] {
+                supplier_contract(protocol.clone(), stream, true, effort, Some(SupplierKind::Deepseek)).await;
+            }
+        }
+    }
+}

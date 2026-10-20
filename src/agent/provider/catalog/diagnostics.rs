@@ -130,7 +130,7 @@ pub(super) async fn observe(
     event(
         Level::Info,
         "model.catalog.started",
-        json!({"provider":client.provider,"timeoutSeconds":30,"maxPages":20,"maxResponseBytes":8*1024*1024}),
+        json!({"provider":client.provider,"supplier":client.supplier,"timeoutSeconds":30,"maxPages":20,"maxResponseBytes":8*1024*1024}),
     );
     let result = future.await;
     match &result {

@@ -20,7 +20,7 @@ pub(super) async fn observe(
     event(
         Level::Info,
         "model.request_started",
-        json!({"modelCallId":call_id,"provider":config.provider,"model":config.model,"mode":mode,"endpointHost":config.endpoint().ok().and_then(|u|u.host_str().map(str::to_owned))}),
+        json!({"modelCallId":call_id,"provider":config.provider,"supplier":config.supplier,"model":config.model,"mode":mode,"endpointHost":config.endpoint().ok().and_then(|u|u.host_str().map(str::to_owned))}),
     );
     let shape: Vec<Value> = request.messages.iter().map(|message|match message {
         ChatMessage::Replay{state} => json!({"role":"assistant","bytes":state.content.as_ref().map_or(0,String::len),"toolCallCount":state.calls.len(),"hasContinuation":true}),

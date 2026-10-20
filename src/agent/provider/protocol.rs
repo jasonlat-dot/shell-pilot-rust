@@ -222,6 +222,7 @@ pub(super) fn measure_chat(config: &ModelConfig, request: &ChatRequest) -> Resul
         body["reasoning_effort"] =
             serde_json::to_value(effort).map_err(|_| ModelError::ToolProtocol)?;
     }
+    super::supplier::select(config.supplier.as_ref()).decorate(config, &mut body);
     if !request.tools.is_empty() {
         body["tools"] = Value::Array(
             request

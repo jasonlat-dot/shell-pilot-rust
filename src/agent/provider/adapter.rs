@@ -35,6 +35,8 @@ pub(super) trait ProviderAdapter: Sync {
     fn headers(&self, key: Option<&SecretKey>) -> Result<HeaderMap>;
     fn measure(&self, config: &ModelConfig, request: &ChatRequest) -> Result<PreparedRequest>;
     fn decode(&self, bytes: &[u8], allowed: &HashSet<String>) -> Result<Completion>;
+    fn decode_for(&self, _config: &ModelConfig, bytes: &[u8], allowed: &HashSet<String>) -> Result<Completion> { self.decode(bytes, allowed) }
+    fn stream_for(&self, _config: &ModelConfig, tools: bool) -> Result<Box<dyn ResponseStream>> { self.stream(tools) }
     fn stream(&self, tools: bool) -> Result<Box<dyn ResponseStream>>;
     fn json_stream_fallback(&self, tools: bool) -> bool {
         tools

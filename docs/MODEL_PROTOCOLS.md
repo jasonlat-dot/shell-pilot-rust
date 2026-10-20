@@ -112,3 +112,22 @@ SSE 使用共享字节帧解析，支持跨 UTF-8 字节/行分块；Google 无 
 协议依据：[OpenAI List models](https://developers.openai.com/api/reference/resources/models/methods/list)、[Anthropic List Models](https://platform.claude.com/docs/en/api/models/list)、[Google models.list](https://ai.google.dev/api/models#method:-models.list)。真实供应商 / 中转是否开放目录及具体权限仍由用户查询时验证。
 
 Google 模型目录对未声明能力（supportedGenerationMethods 缺失 / null / 空数组）的条目直接跳过，不推断其可对话性；仍只保留明确包含 generateContent 的有效记录。nextPageToken 缺失 / null / 空字符串均表示没有下一页。一个页面没有有效模型但有非空游标时仍继续分页；ID 规范化后跨页去重。错误的非空字段类型、有效条目缺少 models/ 前缀等继续报错并记录字段位置。此规则按用户完整中转返回确认，不自动变更 API 地址、鉴权或对话协议。
+
+
+## DeepSeek 独立供应商与协议组合（2026-10-20）
+
+供应商身份与 wire 协议分离：ModelConfig / CatalogRequest 可带 supplier，DeepSeek 保存为 deepseek，仍使用 openAiCompatible 或 anthropicMessages 作为 provider。旧 JSON 缺省 supplier 仍按原协议工作，通用供应商标签规范化为缺省身份，不迁移 schema 或按域名/模型 ID 识别品牌。原生 Agent 模型列表返回可选 supplier，前端配置卡片、筛选与两级模型选择器共用本地蓝色鲸鱼 SVG。
+
+`provider/supplier.rs::SupplierPolicy` 组合原 ProviderAdapter：兼容策略完整沿用原校验，DeepSeek 策略集中处理允许的协议/思考档位、max_tokens、thinking 开关、模型目录与签名要求；HTTP、SSE、工具循环和语义摘要仍复用现有代码。默认思考不发覆盖字段，none 转 thinking disabled 并移除无效 effort 字段；low/high/max 启用思考并按协议发送 reasoning_effort 或 output_config.effort。DeepSeek Messages 的温度范围允许 0–2，通用 Anthropic 保持 0–1；思考模式下上游忽略温度。此次独立入口不开放 Responses，不能据此推断 DeepSeek 上游不支持该协议。
+
+DeepSeek Chat 使用配置前缀下的 chat/completions 与 Bearer，Messages 使用 messages 与 x-api-key。官网占位地址分别为 https://api.deepseek.com/ 和 https://api.deepseek.com/anthropic/v1/，不写入空草稿。两种协议的目录均使用 OpenAI data/id 格式和 Bearer；仅 Messages 的完整后缀 /anthropic/v1/ 或 /anthropic/ 映射至同一 origin、保留代理前缀的 models，不剥离名字相似但不完整的路径段，不追随上游 URL、重试其他地址或发送真实用户凭据进行探测。已有目录的分页、超时/取消、体积、Trace 与密钥保护继续复用；DeepSeek name 元数据可作为可选展示名称。
+
+DeepSeek 的 Messages 思考块允许无签名，JSON、SSE 与流式 JSON 回退走同一供应商规则；不会生成或伪造签名，通用 Anthropic 仍执行原严格规则。续接绑定增加向后兼容的可选 supplier，供应商变更后禁止原生思考/签名跨供应商重放；旧缺省绑定继续正常使用。本地摘要不带工具，不使用 Responses 计数/远端整理端点，失败保留原历史。
+
+接口依据：[官方接入](https://api-docs.deepseek.com/)、[Anthropic 兼容](https://api-docs.deepseek.com/guides/anthropic_api/)、[思考模式](https://api-docs.deepseek.com/guides/thinking_mode/)、[models](https://api-docs.deepseek.com/api/list-models/)。本轮本地回环测试结果以 AGENT_PROGRESS.md 最新章节为准；真实供应商和桌面视觉验收分别记录，不把模拟测试标成真实联调完成。
+
+
+DeepSeek 本轮最终定向验证：前端 64 项、Rust provider/目录/工具续聊/语义摘要 45 项、桌面原生 IPC 1 项通过；工具续聊覆盖两协议的 JSON/SSE 与四种思考设置，摘要覆盖两协议。TypeScript、Vite 资源构建、生产库严格 Clippy、新策略 Rustfmt 与 diff 检查通过。测试编译为降低本机内存，对本包测试临时关闭调试符号，未改生产配置。尚无真实供应商/中转和桌面视觉联调；未打包。详见 AGENT_PROGRESS.md 最新章节。
+
+
+2026-10-20 默认地址补充：客户端空白地址在保存/查询边界解析为当前供应商/协议的官方默认值；输入框仍使用 placeholder，不自动回填。Google 默认使用 /v1beta，其余默认使用 /v1；DeepSeek Chat 为 https://api.deepseek.com/v1，Messages 为 https://api.deepseek.com/anthropic/v1；Google 为 https://generativelanguage.googleapis.com/v1beta。显式地址和旧 /v1、/v1beta 配置保持原样，Rust URL 校验与相对路径规范化不变。本次前端相关 49 项、TypeScript 与 diff 检查通过，不改 Rust 生产代码；版本依据见 [Google API 版本说明](https://ai.google.dev/gemini-api/docs/api-versions)。

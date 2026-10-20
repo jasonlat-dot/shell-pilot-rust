@@ -102,6 +102,7 @@ impl Fixture {
         let store = Arc::new(Store::in_memory().unwrap());
         let config = ModelConfig {
             provider: ProviderKind::OpenAiCompatible,
+            supplier: None,
             remote_compaction: false,
             base_url: base,
             completions_path: "chat/completions".into(),

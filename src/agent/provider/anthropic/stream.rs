@@ -3,6 +3,7 @@ use super::*;
 use crate::agent::provider::adapter::{ResponseStream, StreamFrame};
 #[derive(Default)]
 pub(super) struct MessagesStream {
+    allow_unsigned_thinking: bool,
     started: bool,
     terminal: bool,
     delta_seen: bool,
@@ -22,6 +23,7 @@ struct BlockStart {
     content_block: ContentBlock,
 }
 impl MessagesStream {
+    pub(super) fn new(allow_unsigned_thinking: bool) -> Self { Self { allow_unsigned_thinking, ..Self::default() } }
     fn visible(&mut self, text: String) -> Result<StreamFrame> {
         self.text_bytes = self.text_bytes.saturating_add(text.len());
         self.encoded_text = self.encoded_text.saturating_add(
@@ -210,11 +212,12 @@ impl ResponseStream for MessagesStream {
         if !self.terminal {
             return Err(ModelError::Incomplete);
         }
-        assemble(
+        assemble_checked(
             self.blocks.into_iter().map(|block| block.content).collect(),
             self.usage,
             self.reason,
             allowed,
+            !self.allow_unsigned_thinking,
         )
     }
 }

@@ -80,6 +80,7 @@ impl Fixture {
         wire.replies.lock().unwrap().extend(replies);
         let app = Router::new()
             .route("/proxy/v1/models", get(respond))
+            .route("/proxy/models", get(respond))
             .with_state(wire.clone());
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -95,6 +96,7 @@ impl Fixture {
     fn query(&self, provider: ProviderKind) -> CatalogRequest {
         CatalogRequest {
             provider,
+            supplier: None,
             base_url: self.base.clone(),
             require_api_key: true,
             api_key: KeyChange::Set {
@@ -594,4 +596,19 @@ async fn google_empty_capability_page_follows_cursor_and_empty_markers_end_clean
             Err(ModelError::Response)
         ));
     }
+}
+
+#[tokio::test]
+async fn deepseek_catalog_uses_shared_models_and_bearer_for_both_protocols() {
+    let f = Fixture::new(vec![Reply::Json(json!({"data":[{"id":"deepseek-model","name":"DeepSeek model"}]})), Reply::Json(json!({"data":[{"id":"deepseek-model"}]}))]).await;
+    for protocol in [ProviderKind::OpenAiCompatible, ProviderKind::AnthropicMessages] {
+        let mut query = f.query(protocol.clone()); query.supplier = Some(SupplierKind::Deepseek);
+        if protocol == ProviderKind::AnthropicMessages { query.base_url = f.base.replace("/proxy/v1/", "/proxy/anthropic/v1/"); }
+        let models = f.list(query).await.unwrap(); assert_eq!(models[0].id, "deepseek-model");
+        if protocol == ProviderKind::OpenAiCompatible { assert_eq!(models[0].display_name.as_deref(), Some("DeepSeek model")); }
+    }
+    let calls = f.wire.calls.lock().unwrap();
+    assert_eq!(calls[0].0.path(), "/proxy/v1/models"); assert_eq!(calls[1].0.path(), "/proxy/models");
+    for (url, headers) in calls.iter() { assert!(url.query().is_none()); assert_eq!(headers["authorization"], "Bearer catalog-test-key"); assert!(!headers.contains_key("x-api-key")); }
+    assert!(f.repository.list("user").unwrap().is_empty());
 }

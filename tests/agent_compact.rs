@@ -75,8 +75,8 @@ async fn handler(
             .body(Body::from("provider-private-body"))
             .unwrap();
     }
-    let source: Value =
-        serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+    let content = &body["messages"].as_array().unwrap().last().unwrap()["content"];
+    let source: Value = serde_json::from_str(content.as_str().or_else(||content[0]["text"].as_str()).unwrap()).unwrap();
     let document = json!({"summary":"已分析日志中的 upstream 超时，尚未重启；下一步核实配置。",
         "nextSteps":["只读核实 upstream 配置"],"retainedUserFacts":[],"evidenceEventIds":[source["availableEvidenceEventIds"].as_array().unwrap().last().unwrap()]});
     let response = match reply {
@@ -121,6 +121,7 @@ impl Fixture {
         });
         let router = Router::new()
             .route("/proxy/v1/chat/completions", post(handler))
+            .route("/proxy/v1/messages", post(handler))
             .with_state(mock.clone());
         let server = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
@@ -133,6 +134,7 @@ impl Fixture {
                 ModelConfigUpdate {
                     config: ModelConfig {
                         provider: ProviderKind::OpenAiCompatible,
+                        supplier: None,
                         remote_compaction: false,
                         base_url: base,
                         completions_path: "chat/completions".into(),
@@ -920,4 +922,18 @@ async fn eof_partial_stays_failed_evidence_and_never_becomes_completed_by_summar
         .unwrap();
     assert_eq!(history.turns[0].state, chat::TurnState::Failed);
     assert!(history.turns[0].result_text.is_none());
+}
+
+#[tokio::test]
+async fn deepseek_both_protocols_use_local_semantic_compaction_without_tools() {
+    for protocol in [ProviderKind::OpenAiCompatible, ProviderKind::AnthropicMessages] {
+        let f=Fixture::new().await;
+        let evidence=f.append(Payload::UserMessage{text:"请保留测试目标".into()});
+        f.model_config(|config|{config.supplier=Some(SupplierKind::Deepseek);config.provider=protocol.clone();config.completions_path=if protocol==ProviderKind::AnthropicMessages {"messages"}else{"chat/completions"}.into();config.reasoning_effort=Some(ReasoningEffort::High);config.capabilities.reasoning_effort=true;},KeyChange::Keep);
+        let summary=document(evidence.id).to_string();
+        f.respond(Reply::Envelope(if protocol==ProviderKind::AnthropicMessages {json!({"type":"message","role":"assistant","content":[{"type":"text","text":summary}],"stop_reason":"end_turn","usage":{"input_tokens":100,"output_tokens":40}})}else{envelope(Some(summary),None)}));
+        let before=f.events();let draft=f.summarize().await.unwrap();assert_eq!(draft.model,"summary-test-model");assert_eq!(f.events(),before);
+        let requests=f.mock.requests.lock().unwrap();assert_eq!(requests.len(),1);let body=&requests[0].0;
+        assert_eq!(body["max_tokens"],2048);assert!(body.get("max_completion_tokens").is_none());assert!(body.get("tools").is_none());assert_eq!(body["thinking"]["type"],"enabled");
+    }
 }

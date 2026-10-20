@@ -21,6 +21,7 @@ const TEST_KEY: &str = "unit-test-model-key";
 fn config() -> ModelConfig {
     ModelConfig {
         provider: ProviderKind::OpenAiCompatible,
+        supplier: None,
         remote_compaction: false,
         base_url: "https://model.example/v1/".into(),
         completions_path: "chat/completions".into(),
