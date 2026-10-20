@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 pub(super) struct GoogleGemini;
 impl ProviderAdapter for GoogleGemini {
+    fn catalog(&self) -> &'static dyn super::catalog::CatalogAdapter { &super::catalog::GOOGLE }
     fn normalize_config(&self, config: &mut ModelConfig) -> Result<()> {
         config.output_token_parameter = OutputTokenParameter::MaxTokens;
         let model = config

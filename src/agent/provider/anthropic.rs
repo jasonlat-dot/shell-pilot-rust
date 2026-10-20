@@ -12,6 +12,7 @@ use std::collections::HashSet;
 
 pub(super) struct AnthropicMessages;
 impl ProviderAdapter for AnthropicMessages {
+    fn catalog(&self) -> &'static dyn super::catalog::CatalogAdapter { &super::catalog::ANTHROPIC }
     fn normalize_config(&self, config: &mut ModelConfig) -> Result<()> {
         config.output_token_parameter = OutputTokenParameter::MaxTokens;
         if matches!(config.reasoning_effort, Some(ReasoningEffort::None | ReasoningEffort::Minimal)) {

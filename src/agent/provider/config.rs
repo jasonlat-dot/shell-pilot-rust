@@ -158,29 +158,7 @@ impl ModelConfig {
             ));
         }
         super::adapter::select(&self.provider).normalize_config(&mut self)?;
-        if self.base_url.len() > 4096 {
-            return Err(ModelError::Invalid("API URL too long"));
-        }
-        let mut base = Url::parse(self.base_url.trim())
-            .map_err(|_| ModelError::Invalid("invalid API base URL"))?;
-        if !matches!(base.scheme(), "http" | "https")
-            || base.host_str().is_none()
-            || !base.username().is_empty()
-            || base.password().is_some()
-            || base.query().is_some()
-            || base.fragment().is_some()
-        {
-            return Err(ModelError::Invalid(
-                "API URL must be HTTP(S), without login information, query or fragment",
-            ));
-        }
-        if base.path().contains('%') || base.path().contains('\\') {
-            return Err(ModelError::Invalid(
-                "API base path must not contain encoded or ambiguous segments",
-            ));
-        }
-        base.set_path(&format!("{}/", base.path().trim_end_matches('/')));
-        self.base_url = base.to_string();
+        self.base_url = normalize_base_url(&self.base_url)?.to_string();
         if self.completions_path.trim().starts_with("//") {
             return Err(ModelError::Invalid(
                 "completion path must not be a network URL",
@@ -286,6 +264,33 @@ pub struct ModelChannel {
     #[serde(flatten)]
     pub profile: ModelProfile,
     pub models: Vec<ChannelModel>,
+}
+
+/// Shared base validation for inference and model discovery; preserve proxy prefixes.
+pub(super) fn normalize_base_url(value: &str) -> Result<Url> {
+    if value.len() > 4096 {
+        return Err(ModelError::Invalid("API URL too long"));
+    }
+    let mut base =
+        Url::parse(value.trim()).map_err(|_| ModelError::Invalid("invalid API base URL"))?;
+    if !matches!(base.scheme(), "http" | "https")
+        || base.host_str().is_none()
+        || !base.username().is_empty()
+        || base.password().is_some()
+        || base.query().is_some()
+        || base.fragment().is_some()
+    {
+        return Err(ModelError::Invalid(
+            "API URL must be HTTP(S), without login information, query or fragment",
+        ));
+    }
+    if base.path().contains('%') || base.path().contains('\\') {
+        return Err(ModelError::Invalid(
+            "API base path must not contain encoded or ambiguous segments",
+        ));
+    }
+    base.set_path(&format!("{}/", base.path().trim_end_matches('/')));
+    Ok(base)
 }
 
 #[cfg(test)]

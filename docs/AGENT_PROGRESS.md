@@ -3,11 +3,36 @@
 ## 当前状态总览（2026-10-20，以本节覆盖下方历史阶段描述）
 
 - 当前版本 v0.2.2，数据库 schema 24；前端 `master`，Rust `main`。A/B/C、D1–D5、E1–E3、E5/E6 已完成；E4 用户取消，不做旧 Java 数据导入。旧章节中的 test-rust-ui、schema 19/21、“下一项 E1/E2”和当时未提交状态仅为历史记录。
-- 已提交基线：前端 `84754ff`，Rust `1e0d8fa`。支持多模型渠道、筛选/搜索/置顶/创建顺序、会话内模型切换、失败原因持久保存与恢复；数据库 schema 22/23/24 分别用于原生续接、失败/切换、多模型渠道。
+- 已提交基线（本轮开始时核对）：前端 `b1d5f70`，Rust `d2408ba`。支持多模型渠道、筛选/搜索/置顶/创建顺序、会话内模型切换、失败原因持久保存与恢复；数据库 schema 22/23/24 分别用于原生续接、失败/切换、多模型渠道。
 - 已接入 Chat Completions、Responses、Anthropic Messages、Google Gemini GenerateContent；四者支持对话和工具续聊（Google 完成本地定向验收，真实供应商待配置后联调）。Responses 使用其原生计数/远端整理能力，其他协议使用本地语义摘要；推理/签名原样续接并按协议/模型/接口/凭据隔离。此前“Messages 仅常规模式”“Responses 不支持工具”“Gemini 仅兼容入口”属于旧阶段边界，Google 原生接入进度见下项。
 - 日志当前为 `logs/agent/YYYY-MM-DD/<traceId>.log`（逐行 JSON），默认 INFO / 7 天，级别和保留天数可即时修改；包含用户与助手正文。旧 .json/.jsonl 不批量改名，仅兼容过期清理。Windows 调试发送栈溢出已用 Box::pin 隔离状态机并完成小栈回归。
 - 既有阶段验证记录分别见对应最新功能文档，历史 E6 验收不能替代新供应商的真实接口/桌面验收。v0.2.2 升级与发布说明已准备；签名安装包、覆盖安装和在线更新须以实际产物独立验收，当前不打包。
-- 最新工作：Google Gemini 原生接入已完成本地定向验收；本轮补充 SSH 连接等待通知生命周期与前端超时兜底，详见下节。
+- 最新工作：上游模型目录查询、标签维护和独立 Trace 日志已接通；按用户新确认规则补充 Google 空能力条目跳过与 null 分页结束，已完成本地定向验收，详见下节。
+
+### Google 模型目录空能力与空分页兼容（2026-10-20，本地定向验收）
+
+- [x] 用户提供完整中转返回后明确批准这两条规则，覆盖上一节“仅日志、不兼容”的当时限制。Rust `provider/catalog.rs::Google::decode` 对 supportedGenerationMethods 缺失 / null / 空数组跳过当前条目，保留后面的 generateContent 有效条目；nextPageToken 缺失 / null / 空字符串作为没有下一页。有效条目的 models/ 前缀、ID 校验、非空错误字段类型校验、原生鉴权、URL 与分页/大小/取消限制不变，不猜测未知能力。
+- [x] `provider/catalog/diagnostics.rs` 添加每页一次的 DEBUG `model.catalog.entries_skipped` 汇总缺失/空能力条目数量，不逐模型刷日志，不记录正文；原解析失败定位与 Trace 保留。`tests/agent_model_catalog.rs` 新增完整混合返回的 7 模型去重回归、空能力页仍按游标前进、空分页标记结束及错误标记拒绝；原日志错误夹具和客户端原生 IPC 负例改为错误字符串类型，继续验证真正的协议错误。
+- [x] 最终源码的 `tests/agent_model_catalog.rs` 定向 **13 项通过**（原目录 / 日志回归 11 + 新兼容场景 2）：用户混合返回提取 7 个唯一模型、null / 缺失 / 空数组能力跳过、空能力页仍继续下一页、缺失 / null / 空字符串游标结束、错误类型与非对象模型记录仍拒绝、跳过汇总及原 Trace 脱敏正常；生产库严格 Clippy（-D warnings）、新增 Rustfmt / diff 格式检查通过。
+- [x] 桌面 `cargo check --offline --tests -j1` 通过；只修改 Rust 查询解码、日志汇总、相关测试夹具和说明，不改前端交互或请求地址。验证曾等待开发应用构建锁，未停止用户进程；未再次运行无生产改动的桌面 IPC 运行时测试，未访问真实上游 / 用户 SSH、未全量回归或打包、未提交推送，保留既有未提交改动。
+
+### 模型查询独立日志与按钮命名（2026-10-20，本地定向验收）
+
+- [x] 按用户澄清，本轮仅增加查询日志，**不兼容中转返回格式、不改 Google 模型名称前缀或 supportedGenerationMethods 的解析要求**。`provider/catalog/diagnostics.rs` 抽离固定元数据日志；`catalog.rs` 接入 GET 地址 / 分页 / 鉴权方式、HTTP 状态 / 媒体类型、DEBUG 结构类型和 ERROR JSON 路径 / 预期 / 实际类型。成功记 INFO，取消 WARN，失败 ERROR；使用现有全局级别、日期目录和保留设置。分页游标脱敏，不记录密钥、原始请求头或响应正文。
+- [x] 客户端 `backend_ipc.rs::dispatch_json_request` 为 agent/model_catalog 创建独立 Trace，覆盖凭据预检、所有分页及结束 / 失败 / 取消；复用 IPC requestId 写入 `<日期>/<traceId>.log`，失败 Toast 附带 Trace ID。其他 JSON 请求不增加日志，聊天既有 Trace 不变；Box::pin 隔离诊断状态机。
+- [x] `ModelCatalogInput.tsx` 初始按钮改为“查询上游模型”。查询仍跟随当前“使用 API Key”开关，输入新值优先、编辑留空复用已存密钥，关闭不发送；保留原供应商鉴权头，不额外增加跨协议凭据或重试。
+- [x] `tests/agent_model_catalog.rs` 定向 **11 项通过**（原目录回归 8 + 新日志契约 3），覆盖分页同 Trace、实际鉴权元数据、密钥 / 游标 / 正文不落盘、截图同类 null 字段和裸名称前缀的精确错误位置、INFO / WARN / ERROR 过滤与取消；确认仍拒绝原不接受的格式。前端查询行为 **9 项通过**，TypeScript、生产库严格 Clippy（-D warnings）、新增 Rustfmt / diff 检查通过。
+- [x] 客户端原生 IPC 定向 **2 项通过**：原未保存草稿查询不写配置 / 404 反馈回归；新增 `model_catalog_json_request_logs_trace_and_exposes_id_for_failure` 核对真实 JSON 入口一次开始 / 一次失败、所有事件同 Trace、Toast 带定位 ID、字段错误路径准确、预取消记 WARN 且不误报完成，测试 Key / 响应内容不落盘。
+- 本轮仅日志与按钮命名，不放宽响应解析、不改用户 API 地址或密钥配置；未发送真实 API 请求、未执行用户 SSH、未全量回归或打包、未提交推送。前端 master / Rust main；包含原生代码，需开发应用重新编译后生效，保留原有改动（含用户图标文件）。
+
+### 上游模型发现与点击维护（2026-10-20，本地定向验收）
+
+- [x] Rust `provider/catalog.rs` 定义独立目录适配接口，`ProviderAdapter::catalog` 挂接 OpenAI / Anthropic / Google 策略，Chat Completions 和 Responses 共用 OpenAI 目录。GET 基础地址 + models，保留版本与代理前缀；原生鉴权请求头复用，Anthropic 游标 / Google pageToken 分页，Google 仅保留 generateContent 并去除 models/ 前缀。HTTP 禁止重定向和自动重试，整个查询 30 秒 / 20 页 / 8 MiB / 10000 模型上限，重复游标报错，不返回部分查询假装完整。
+- [x] `provider/config.rs` 提取已有基础 URL 校验；`repository/channels.rs::catalog_client` 使用草稿密钥或按用户和渠道修订读取已保存的加密 Key，关闭鉴权不解密/发送。查询独立于模型 ID / 参数是否填完，不保存草稿、创建渠道或修改历史；支持原始模型已被移除后的渠道根凭据。客户端 `backend_ipc.rs` 增加 agent/model_catalog 原生入口及 404 / 鉴权 / 超时提示，不把原始上游正文回传界面。
+- [x] 客户端 master：`ModelCatalogInput.tsx/.css`、`modelSelection.ts`、`api/models.ts` 接入查询与重新查询、搜索、点击单个添加、已选标签 × 移除、全部添加与手动填写折叠入口，`ModelSettings.tsx` 传入当前草稿和已存渠道身份。保留原单渠道 64 模型上限，超限 Toast 且整批不修改，不截断或覆盖已选；更改供应商/地址/密钥/鉴权或关闭弹窗取消旧请求并丢弃迟到结果。
+- [x] 前端定向共 **45 项通过**（新模型查询/选择行为 9、原设置/渠道/协议 36），TypeScript 与 Vite 资源构建通过（保留既有大资源块提示）；搜索回车不会误提交外层配置。Rust 新目录回环契约 **8 项通过**，共享基础 URL 校验回归 **1 项通过**，生产库严格 Clippy（-D warnings）、新增模块 Rustfmt / diff 格式检查通过。新测试树遍历器初轮错误已修正后通过。
+- [x] 客户端 `src-tauri/src/backend_ipc_tests.rs::model_catalog_ipc_queries_unsaved_draft_without_persisting_and_reports_errors` 定向 **1 项通过**（原生测试模块编译通过）：未保存草稿查询返回可选模型、配置列表保持为空、404 提示手动填写、未知供应商拒绝。原生入口 Box::pin 隔离查询 Future，不增加聊天状态机的内联存储。
+- 实际 GUI 视觉验收未完成：Tabbit tabs / diagnose 返回 exit 69。全部验证仅用临时库、模拟数据/Key 和回环接口，不调用真实模型 API 或用户 SSH，未全量回归、未打包、未提交或推送。前端保持 master、Rust main，包含原生变更，开发应用需重新编译后使用。
 
 ### 输入框当前模型使用 Google G（2026-10-20，最终图标范围）
 

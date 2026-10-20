@@ -1,5 +1,6 @@
 //! Provider strategies normalize wire protocols; HTTP and Agent execution remain separate.
 mod adapter;
+mod catalog;
 mod anthropic;
 mod google;
 mod config;
@@ -13,6 +14,7 @@ mod stream;
 mod tool_stream;
 mod transport;
 pub use config::*;
+pub use catalog::{CatalogClient, CatalogModel, CatalogRequest};
 pub use continuation::Continuation;
 pub use protocol::*;
 pub use repository::{ModelRepository, RuntimeConfig};

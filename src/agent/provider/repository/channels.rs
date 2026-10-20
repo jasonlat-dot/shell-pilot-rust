@@ -114,3 +114,28 @@ impl ModelRepository {
         tx.commit()?;Ok(())
     }
 }
+
+impl ModelRepository {
+    /// Resolve the draft key, or reuse the channel key without persisting the draft.
+    pub fn catalog_client(&self, user: &str, request: CatalogRequest) -> Result<CatalogClient> {
+        checked_id(user)?;
+        let key = if !request.require_api_key { None } else { match &request.api_key {
+            KeyChange::Set { value } => Some(SecretKey::new(value.0.clone())?),
+            KeyChange::Clear => None,
+            KeyChange::Keep => match &request.channel_id {
+                None => None,
+                Some(id) => {
+                    checked_id(id)?;
+                    let db = self.store.database.lock().map_err(|_|ModelError::Database)?;
+                    let channel = channel_view(&db,id,user)?;
+                    if request.revision != Some(channel.profile.revision) { return Err(ModelError::Stale); }
+                    row(&db,id,user)?.ok_or(ModelError::NotFound)?.2.map(|encrypted| {
+                        let plain = secrets::unprotect(&encrypted,&entropy(user,id)).map_err(|_|ModelError::Credentials)?;
+                        SecretKey::new(plain).map_err(|_|ModelError::Credentials)
+                    }).transpose()?
+                }
+            }
+        }};
+        CatalogClient::new(&request,key)
+    }
+}

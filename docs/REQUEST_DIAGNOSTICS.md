@@ -51,3 +51,13 @@
 
 
 失败原因与诊断文件分开保存：schema 23 的 agent_turn_errors 以 sessionId/requestId 关联失败回合，保存经现有错误类型处理的简短原因，和最终失败状态同事务提交。历史接口返回 errorMessage，不把错误拼入 partialText，也不将供应商原始响应体或密钥作为错误详情保存。删除对话同步删除；七天诊断文件清理不删除这部分对话信息。准入前未形成持久回合的错误仅在当前页面显示，界面明确区分。
+
+## 上游模型查询日志（2026-10-20）
+
+“查询上游模型”不属于某条聊天：桌面 IPC 为每次查询建立独立 Trace，沿用 `logs/agent/YYYY-MM-DD/<traceId>.log` 和前台日志级别 / 保留设置，失败 Toast 带 Trace ID。设置 → 本地工作区 → 诊断日志可打开目录；同一次查询的所有分页与收尾事件使用相同 Trace。
+
+- INFO：`request.started/completed`、`model.catalog.started/completed`、`model.catalog.http_request/http_response`，包含 GET 地址、页号、鉴权方式（bearer / x-api-key / x-goog-api-key / none）、状态码、媒体类型、结果数量及耗时。
+- DEBUG：`model.catalog.response_shape` 记录 models / data 和第一条相关字段的类型，不保存内容；现有 `model.http_response` 包含安全上游请求 ID。
+- WARN：取消 / Future 中断；ERROR：HTTP / 网络 / 超时 / 大小与分页失败，以及 `model.catalog.parse_failed` 的 JSON 字段路径、预期格式和实际类型。JSON 本身无效仅记录行列，不保存原文。
+
+请求地址保留版本 / 代理前缀，pageSize / limit 可见，pageToken / after_id 值替换为 REDACTED。密钥、原始 Header 和完整响应正文不落盘。例如 `/models/0/supportedGenerationMethods` 预期 array、实际 string 时，能定位错误字段。按 2026-10-20 用户后续批准，缺失 / null / 空数组能力条目现在跳过，DEBUG 用 `model.catalog.entries_skipped` 汇总数量；nextPageToken 为 null / 空字符串时结束分页，不再记为协议错误。

@@ -102,3 +102,13 @@ SSE 使用共享字节帧解析，支持跨 UTF-8 字节/行分块；Google 无 
 
 
 本轮定向验证：Rust 46 项通过（供应商单测 24、Google HTTP/摘要/持久化 5、渠道 6、四协议续接 7、Anthropic 传输 3、严格工具参数 1）；四协议切换覆盖全部 12 个方向的文字/工具共 24 场景。前端 48 项、TypeScript / Vite、桌面原生 tests 编译和生产库严格 Clippy 通过。临时数据库与回环服务，无真实 Google Key/用户 SSH；实际桌面视觉及真实供应商联调未完成，未打包或提交。完整结果与初轮修正记录见 AGENT_PROGRESS.md。
+
+## 上游模型目录
+
+`provider/catalog.rs` 通过独立 CatalogAdapter 与现有 ProviderAdapter 工厂组合，查询与对话参数、工具循环分离。OpenAI 两种协议共享 data/id 列表；Anthropic 使用 x-api-key + anthropic-version 和 after_id / has_more / last_id；Google 使用 x-goog-api-key 和 pageToken / nextPageToken，过滤 supportedGenerationMethods 中的 generateContent，规范化 models/ 前缀。Endpoint 均为校验后的基础地址拼接 models，不自动切换版本或追随上游 URL。
+
+模型发现直接使用草稿连接字段，不要求已有模型 ID。KeyChange::Keep 按用户、渠道、修订解析加密凭据，Set 使用草稿，关闭鉴权不解密/发送；查询不会修改配置。保留现有单渠道 64 个模型及原存储限制。HTTP 禁止重定向/重试；全查询 30 秒 / 20 页 / 8 MiB / 10000 模型，取消或失败不提交部分结果，重复游标拒绝。目录不推断未声明的工具、图片、推理、上下文能力。
+
+协议依据：[OpenAI List models](https://developers.openai.com/api/reference/resources/models/methods/list)、[Anthropic List Models](https://platform.claude.com/docs/en/api/models/list)、[Google models.list](https://ai.google.dev/api/models#method:-models.list)。真实供应商 / 中转是否开放目录及具体权限仍由用户查询时验证。
+
+Google 模型目录对未声明能力（supportedGenerationMethods 缺失 / null / 空数组）的条目直接跳过，不推断其可对话性；仍只保留明确包含 generateContent 的有效记录。nextPageToken 缺失 / null / 空字符串均表示没有下一页。一个页面没有有效模型但有非空游标时仍继续分页；ID 规范化后跨页去重。错误的非空字段类型、有效条目缺少 models/ 前缀等继续报错并记录字段位置。此规则按用户完整中转返回确认，不自动变更 API 地址、鉴权或对话协议。
