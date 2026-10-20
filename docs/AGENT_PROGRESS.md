@@ -7,7 +7,30 @@
 - 已接入 Chat Completions、Responses、Anthropic Messages、Google Gemini GenerateContent；四者支持对话和工具续聊（Google 完成本地定向验收，真实供应商待配置后联调）。Responses 使用其原生计数/远端整理能力，其他协议使用本地语义摘要；推理/签名原样续接并按协议/模型/接口/凭据隔离。此前“Messages 仅常规模式”“Responses 不支持工具”“Gemini 仅兼容入口”属于旧阶段边界，Google 原生接入进度见下项。
 - 日志当前为 `logs/agent/YYYY-MM-DD/<traceId>.log`（逐行 JSON），默认 INFO / 7 天，级别和保留天数可即时修改；包含用户与助手正文。旧 .json/.jsonl 不批量改名，仅兼容过期清理。Windows 调试发送栈溢出已用 Box::pin 隔离状态机并完成小栈回归。
 - 既有阶段验证记录分别见对应最新功能文档，历史 E6 验收不能替代新供应商的真实接口/桌面验收。v0.2.2 升级与发布说明已准备；签名安装包、覆盖安装和在线更新须以实际产物独立验收，当前不打包。
-- 最新工作：上游模型目录查询、标签维护和独立 Trace 日志已接通；按用户新确认规则补充 Google 空能力条目跳过与 null 分页结束，已完成本地定向验收，详见下节。
+- 最新工作：终端工具栏已收纳到顶部“终端”菜单，并新增断开的 SSH 终端按任意键重连及对应提示；菜单粘贴显示 Ctrl+V，字号区仅保留鼠标滚轮提示；模型目录与 Google 空能力/null 分页兼容保持已完成。终端新交互完成本地定向验收，桌面实际联调待确认，详见下节。
+
+### 移除命令栏 Agent 单终端提示（2026-10-20）
+
+- [x] 前端 master `TerminalCommandBar.tsx/.css` 移除“Agent 始终单终端”徽标与专用样式，保留命令目标选择、广播状态以及既有 Agent 终端绑定逻辑。更新 `tests/terminal-broadcast.test.mjs` 原提示用例，定向 **1 项通过**，覆盖 single/all/selected 三种模式下提示移除与广播徽标保留；diff 检查通过。只调整展示和进度记录，保留此前改动，未打包或提交。
+
+### 终端菜单提示精简（2026-10-20，本地定向验收）
+
+- [x] `RemoteTerminalView.tsx` 将粘贴主快捷键提示改为 Ctrl+V（macOS ⌘V），保持 Ctrl+Shift+V 原有兼容；删除放大/缩小/默认字号菜单动作与闲置 changeFontSize 函数。`TerminalMenu.tsx/.css` 字号区只展示当前字号和“Ctrl + 鼠标滚轮”提示，移除底部重复提示，沿用既有滚轮实现、字号约束及持久化/同步。
+- [x] 更新 `tests/terminal-menu.test.mjs` 的平台粘贴提示与无字号命令断言，连同原复制/粘贴快捷键回归 **11 项通过**；TypeScript、diff 检查通过。`docs/operation-feedback.md` 同步说明；只改前端 master 及进度文档，不做真实 SSH/桌面联调或打包，保留此前菜单/断线重连改动。
+
+### SSH 断线按任意键重新连接（2026-10-20，本地定向验收）
+
+- [x] 前端 `RemoteTerminalView.tsx::handleTerminalKeyDown` 在当前可见、激活的断线 SSH 终端交互区消费普通按键并调用现有 `reconnectNow` 手动入口（含主动断开后保留页签）。进行中状态、同步 ref 互斥与 repeat 检查避免重复请求，按键不进入 xterm 输入队列，失败后下一次独立按键可重试；本地终端、仍存活的后端传输恢复、隐藏/非激活窗格、聊天与菜单控件不触发，保留复制/粘贴组合键、Tab/Escape 和 IME 组合行为。
+- [x] `RemoteTerminalView.tsx` 调整初始化和状态变化聚焦：断线 SSH 仍可获得按键焦点，状态变化不抢聊天、其他窗格或终端控件焦点。断线原因后追加“在终端内按任意键重新连接”，重连中显示进度；`state/remoteTerminal.ts` 清理旧“点击重新连接”文案，`App.tsx::cancelTerminalReconnect` 同步取消后的引导。`docs/operation-feedback.md` 更新使用说明，既有顶部菜单改动完整保留。
+- [x] `tests/terminal-reconnect-key.test.mjs` **新增 6 项通过**：真实手动入口/连按互斥、失败解锁重试、终端与目标范围、修饰键/快捷键/IME 隔离、断线与重连文案、断线焦点及外部输入保护；与复制快捷键/菜单/分屏/连接通知直接关联回归合计 **42 项通过**，TypeScript 与 diff 格式检查通过。分屏原焦点断言同步为允许断线 SSH 聚焦，未扩大到无关全量验证。
+- 仅前端 master 代码与本进度记录修改，无 Rust 生产代码变更；未访问用户 SSH 或真实上游 API、未做实际桌面联调，未打包、提交或推送。
+
+### 顶部终端菜单收纳（2026-10-20，本地定向验收）
+
+- [x] 按用户明确选择，在应用顶部添加“终端”菜单，操作当前终端；前端 `Shell.tsx` / `TerminalMenu.tsx/.css` 提供当前终端名称、文本/字号/连接分组、禁用原因、快捷键提示、键盘导航及点击外部关闭，沿用浅色/深色主题变量。复制、粘贴、添加到对话、字号增减/默认、重连/取消与断开/关闭收纳到菜单，`RemoteTerminalView.tsx` 移除整排常驻工具栏，保留选区附近的添加入口与终端内剪贴板反馈/手动粘贴兜底框。
+- [x] `state/terminalActions.ts` 与 `TerminalActionsContext.tsx` 独立管理当前终端动作，`main.tsx` 挂接稳定 Provider、`App.tsx` 传入会话标题；仅可见且激活窗格注册，无目标时显示空态。所有者校验阻止旧菜单调用新目标或旧窗格清理新目标，分屏切换后迟到剪贴板结果不再粘入旧窗格；终端运行时和 xterm 初始化不因菜单开关重建。原终端快捷键、无选区 Ctrl+C 与 Ctrl+滚轮不增加全局拦截，字号仍本地保存并同步现有终端。
+- [x] `tests/terminal-menu.test.mjs` 新增 **6 项通过**：动作所有者/陈旧调用/禁用状态、真实注册配置与本地/SSH 差异、离线/重连/取消、字号限制/持久化/广播、异步粘贴焦点与运行时竞态、键盘循环/Escape/Tab。直接相关快捷键/选区/分屏/主题/顶部栏/对话文本回归 **41 项通过**，TypeScript 与 Vite 前端资源构建通过；构建仍有体积提示，不影响成功。`docs/operation-feedback.md` 同步使用说明，diff 格式检查通过。
+- 仅前端 master 代码与本进度文档修改，没有 Rust 生产代码变更；Tabbit CLI 当前无可用浏览器连接（exit 69），未做实际桌面视觉验收，未访问用户 SSH/真实 API、未全量回归、未打包安装程序或提交推送。
 
 ### Google 模型目录空能力与空分页兼容（2026-10-20，本地定向验收）
 
