@@ -13,6 +13,11 @@ fn channel_view(db: &Connection, id: &str, user: &str) -> Result<ModelChannel> {
     let mut query=db.prepare("SELECT profile_id,model FROM agent_model_channel_members WHERE user_id=?1 AND channel_id=?2 AND active=1 ORDER BY position,profile_id")?;
     let models=query.query_map(params![user,id],|r|Ok(ChannelModel{id:r.get(0)?,model:r.get(1)?}))?.collect::<std::result::Result<Vec<_>,_>>()?;
     let first=models.first().ok_or(ModelError::Database)?;
+    // Do not offer a partially readable channel for editing: saving that subset
+    // could deactivate an unreadable member. Preserve the entire channel instead.
+    for model in models.iter().skip(1) {
+        profile_view(db,&model.id,user,row(db,&model.id,user)?.ok_or(ModelError::Database)?)?;
+    }
     let mut profile=profile_view(db,&first.id,user,row(db,&first.id,user)?.ok_or(ModelError::Database)?)?;
     profile.id=id.into();profile.display_name=name;profile.revision=revision;
     Ok(ModelChannel{profile,models})
@@ -20,6 +25,10 @@ fn channel_view(db: &Connection, id: &str, user: &str) -> Result<ModelChannel> {
 
 impl ModelRepository {
     pub fn channels(&self,user:&str)->Result<Vec<ModelChannel>> {
+        Ok(self.channel_report(user)?.items)
+    }
+
+    pub fn channel_report(&self,user:&str)->Result<ModelChannelReport> {
         checked_id(user)?;
         let db=self.store.database.lock().map_err(|_|ModelError::Database)?;
         // The original profile row is retained when a legacy profile becomes a
@@ -27,7 +36,18 @@ impl ModelRepository {
         // order for both channel types; updated_at changes on every edit.
         let mut query=db.prepare("SELECT c.id,p.rowid AS creation_order FROM agent_model_channels c JOIN agent_model_profiles p ON p.user_id=c.user_id AND p.id=c.id WHERE c.user_id=?1 UNION ALL SELECT p.id,p.rowid AS creation_order FROM agent_model_profiles p WHERE p.user_id=?1 AND NOT EXISTS(SELECT 1 FROM agent_model_channel_members m WHERE m.user_id=p.user_id AND m.profile_id=p.id) ORDER BY creation_order,id LIMIT 32")?;
         let ids=query.query_map([user],|r|r.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
-        ids.into_iter().map(|id|channel_view(&db,&id,user)).collect()
+        let mut report=ModelChannelReport{items:Vec::new(),issues:Vec::new()};
+        for id in ids {
+            match channel_view(&db,&id,user) {
+                Ok(channel)=>report.items.push(channel),
+                Err(ModelError::StoredConfig)=> {
+                    let name:Option<String>=db.query_row("SELECT display_name FROM agent_model_channels WHERE user_id=?1 AND id=?2",params![user,id],|r|r.get(0)).optional()?;
+                    report.issues.push(ModelChannelIssue{id:id.clone(),display_name:match name {Some(name)=>name,None=>display_name(&db,&id,user)?},message:ModelError::StoredConfig.to_string()});
+                }
+                Err(error)=>return Err(error),
+            }
+        }
+        Ok(report)
     }
 
     pub fn save_channel(&self,id:&str,user:&str,expected_revision:u64,mut update:ModelConfigUpdate,name:&str,models:Vec<String>)->Result<ModelChannel> {

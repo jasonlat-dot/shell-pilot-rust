@@ -272,6 +272,20 @@ pub struct ModelChannel {
     pub models: Vec<ChannelModel>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelChannelIssue {
+    pub id: String,
+    pub display_name: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ModelChannelReport {
+    pub items: Vec<ModelChannel>,
+    pub issues: Vec<ModelChannelIssue>,
+}
+
 /// Shared base validation for inference and model discovery; preserve proxy prefixes.
 pub(super) fn normalize_base_url(value: &str) -> Result<Url> {
     if value.len() > 4096 {

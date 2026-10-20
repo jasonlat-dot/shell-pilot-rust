@@ -36,6 +36,8 @@ pub enum ModelError {
     Credentials,
     #[error("Model database operation failed")]
     Database,
+    #[error("此模型配置无法读取或当前版本不支持，请在模型设置中检查；原始数据已保留。")]
+    StoredConfig,
     #[error("Model request exceeds the configured context window")]
     BudgetExceeded,
     #[error("Model tool-call protocol is invalid or incomplete")]

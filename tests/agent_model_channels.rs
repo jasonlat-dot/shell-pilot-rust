@@ -8,6 +8,59 @@ fn update(config:ModelConfig)->ModelConfigUpdate {ModelConfigUpdate{config,api_k
 fn ids(values:&[&str])->Vec<String>{values.iter().map(|v|(*v).into()).collect()}
 
 #[test]
+fn unreadable_configurations_are_isolated_preserved_and_reported_without_private_data() {
+    let dir=tempfile::tempdir().unwrap();let path=dir.path().join("isolated.sqlite");
+    let store=Arc::new(Store::open(&path).unwrap());let repo=ModelRepository::new(store);
+    repo.save_named("good","u",0,update(config()),Some("Healthy")).unwrap();
+    repo.save_named("bad","u",0,update(config()),Some("Unreadable")).unwrap();
+    let db=rusqlite::Connection::open(&path).unwrap();
+    let original:String=db.query_row("SELECT config_json FROM agent_model_profiles WHERE id='bad'",[],|r|r.get(0)).unwrap();
+    let base:serde_json::Value=serde_json::from_str(&original).unwrap();
+    let mut unknown=base.clone();unknown["supplier"]=json!("future-private-supplier");
+    let mut extra=base.clone();extra["private-future-field"]=json!("private-test-secret");
+    let mut invalid=base.clone();invalid["baseUrl"]=json!("private-test-secret");
+    let mut effort=base.clone();effort["reasoningEffort"]=json!("future-effort");
+    for damaged in ["{invalid private-test-secret".to_owned(),unknown.to_string(),extra.to_string(),invalid.to_string(),effort.to_string()] {
+        db.execute("UPDATE agent_model_profiles SET config_json=?1 WHERE id='bad'",[&damaged]).unwrap();
+        let report=repo.channel_report("u").unwrap();
+        assert_eq!(report.items.len(),1);assert_eq!(report.items[0].profile.id,"good");
+        assert_eq!(report.issues.len(),1);assert_eq!(report.issues[0].id,"bad");
+        assert_eq!(report.issues[0].display_name,"Unreadable");
+        let json=serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("private-test-secret"));assert!(!json.contains("future-private-supplier"));
+        assert_eq!(repo.list("u").unwrap().len(),1);
+        assert_eq!(repo.channels("u").unwrap().len(),1);
+        assert!(matches!(repo.get("bad","u"),Err(ModelError::StoredConfig)));
+        assert!(matches!(repo.runtime("bad","u"),Err(ModelError::StoredConfig)));
+        assert!(repo.channel_report("other").unwrap().issues.is_empty());
+        let after:(String,u64)=db.query_row("SELECT config_json,revision FROM agent_model_profiles WHERE id='bad'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(after,(damaged,1));
+    }
+    db.execute("UPDATE agent_model_profiles SET config_json=?1 WHERE id='bad'",[original]).unwrap();
+    let report=repo.channel_report("u").unwrap();assert!(report.issues.is_empty());assert_eq!(report.items.len(),2);
+    db.execute("DROP TABLE agent_model_profiles",[]).unwrap();
+    assert!(matches!(repo.list("u"),Err(ModelError::Database)));
+    assert!(matches!(repo.channel_report("u"),Err(ModelError::Database)));
+}
+
+#[test]
+fn unreadable_nonfirst_member_does_not_offer_a_partial_channel_for_editing() {
+    let dir=tempfile::tempdir().unwrap();let path=dir.path().join("member.sqlite");
+    let store=Arc::new(Store::open(&path).unwrap());let repo=ModelRepository::new(store);
+    let channel=repo.save_channel("channel","u",0,update(config()),"Mixed channel",ids(&["one","two"])).unwrap();
+    repo.save_named("good","u",0,update(config()),Some("Healthy")).unwrap();
+    let db=rusqlite::Connection::open(&path).unwrap();
+    db.execute("UPDATE agent_model_profiles SET config_json='{}' WHERE id=?1",[&channel.models[1].id]).unwrap();
+    let report=repo.channel_report("u").unwrap();
+    assert_eq!(report.items.len(),1);assert_eq!(report.items[0].profile.id,"good");
+    assert_eq!(report.issues.len(),1);assert_eq!(report.issues[0].id,"channel");
+    assert_eq!(report.issues[0].display_name,"Mixed channel");
+    assert_eq!(repo.list("u").unwrap().len(),2);
+    let members:usize=db.query_row("SELECT COUNT(*) FROM agent_model_channel_members WHERE active=1",[],|r|r.get(0)).unwrap();
+    assert_eq!(members,2);
+}
+
+#[test]
 fn channels_keep_creation_order_across_edits_legacy_conversion_and_reopening() {
     let dir=tempfile::tempdir().unwrap();let path=dir.path().join("order.sqlite");
     let store=Arc::new(Store::open(&path).unwrap());let repo=ModelRepository::new(store);

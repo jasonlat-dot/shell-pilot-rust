@@ -50,8 +50,11 @@ fn display_name(db: &Connection, id: &str, user: &str) -> Result<String> {
 }
 fn view(id: &str, row: Row, display_name: String) -> Result<ModelProfile> {
     let (revision, json, key) = row;
-    let config: ModelConfig = serde_json::from_str(&json).map_err(|_| ModelError::Database)?;
-    let config = config.normalized()?;
+    let config: ModelConfig = serde_json::from_str(&json).map_err(|_| ModelError::StoredConfig)?;
+    let config = config.normalized().map_err(|error| match error {
+        ModelError::Invalid(_) => ModelError::StoredConfig,
+        other => other,
+    })?;
     Ok(ModelProfile {
         id: id.into(),
         display_name,
@@ -100,9 +103,15 @@ impl ModelRepository {
         let rows = statement.query_map([user], |r| {
             Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?)))
         })?;
-        rows.map(|r| {
-            let (id, row) = r?;
-            profile_view(&db, &id, user, row)
+        rows.filter_map(|r| {
+            let result = (|| {
+                let (id, row) = r?;
+                profile_view(&db, &id, user, row)
+            })();
+            match result {
+                Err(ModelError::StoredConfig) => None,
+                other => Some(other),
+            }
         })
         .collect()
     }
