@@ -48,6 +48,8 @@ pub enum Method {
 pub struct Status {
     pub request_id: String,
     pub usage: Option<InputUsage>,
+    #[serde(default)]
+    pub usage_stale: bool,
     pub phase: Phase,
     pub method: Option<Method>,
     pub error_code: Option<String>,
@@ -143,6 +145,7 @@ impl Observation {
         let status = Status {
             request_id: request.request_id.clone(),
             usage: None,
+            usage_stale: false,
             phase: Phase::Idle,
             method: None,
             error_code: None,
@@ -153,6 +156,10 @@ impl Observation {
         };
         {
             let db = store.database.lock().map_err(|_| Error::Storage)?;
+            let previous: Option<String> = db.query_row("SELECT status_json FROM agent_context_status WHERE session_id=?1", [&request.session_id], |r|r.get(0)).optional().map_err(db_error)?;
+            let mut status = status;
+            status.usage = previous.and_then(|json|serde_json::from_str::<Status>(&json).ok()).and_then(|previous|previous.usage);
+            status.usage_stale = status.usage.is_some();
             let json = serde_json::to_string(&status).map_err(|_| Error::Storage)?;
             db.execute("INSERT INTO agent_context_status(session_id,owner,status_json,lease_until) VALUES(?1,?2,?3,?4) ON CONFLICT(session_id) DO UPDATE SET owner=excluded.owner,status_json=excluded.status_json,lease_until=excluded.lease_until",params![request.session_id,owner,json,now()+30_000]).map_err(db_error)?;
         }
@@ -187,7 +194,7 @@ impl Observation {
         let Some(json) = json else { return Ok(None) };
         let mut status: Status = serde_json::from_str(&json).map_err(|_| Error::Storage)?;
         match update {
-            Update::Measured(usage) => status.usage = Some(usage),
+            Update::Measured(usage) => { status.usage = Some(usage); status.usage_stale = false; }
             Update::Started(method) => {
                 if status.phase != Phase::Succeeded {
                     status.phase = Phase::Running;
@@ -270,6 +277,7 @@ pub(crate) fn read(store: Arc<Store>, agent: &str, user: &str, session: &str) ->
         Status {
             request_id: String::new(),
             usage: None,
+            usage_stale: false,
             phase: Phase::Idle,
             method: None,
             error_code: None,
@@ -281,6 +289,21 @@ pub(crate) fn read(store: Arc<Store>, agent: &str, user: &str, session: &str) ->
     };
     status.compaction_count = counts(&db, session)?;
     Ok(status)
+}
+
+/// Retain display-only measurements across a binding change. These values never
+/// participate in request budgeting. Revoke old reporters only for an explicit
+/// idle model switch; a binding refresh can already have a new active reporter.
+pub(crate) fn invalidate_usage(db: &rusqlite::Connection, session: &str, revoke_reporter: bool) -> super::Result<()> {
+    let json: Option<String> = db.query_row("SELECT status_json FROM agent_context_status WHERE session_id=?1", [session], |r|r.get(0)).optional()?;
+    let Some(mut status) = json.and_then(|json|serde_json::from_str::<Status>(&json).ok()) else {
+        db.execute("DELETE FROM agent_context_status WHERE session_id=?1", [session])?;
+        return Ok(());
+    };
+    status.usage_stale = status.usage.is_some();
+    status.phase = Phase::Idle; status.method = None; status.error_code = None; status.fallback = false; status.checkpoint_id = None;
+    db.execute("UPDATE agent_context_status SET status_json=?2,owner=CASE WHEN ?3 THEN ?4 ELSE owner END,lease_until=CASE WHEN ?3 THEN 0 ELSE lease_until END WHERE session_id=?1", params![session,serde_json::to_string(&status)?,revoke_reporter,uuid::Uuid::new_v4().to_string()])?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -349,6 +372,40 @@ mod tests {
             message: "hello".into(),
             attachments: vec![],
         }
+    }
+    fn measured(tokens: u64) -> Update {
+        Update::Measured(InputUsage { input_tokens: tokens, available_input_tokens: 6000, context_window: 8192, output_reserve: 1680, safety_reserve: 512, compact_percent: 75, source: Source::Estimated })
+    }
+    #[test]
+    fn next_request_retains_last_usage_until_measurement_even_if_preparation_fails() {
+        let store=Arc::new(Store::in_memory().unwrap());let mut r=request(&store,"first");
+        let first=Observation::begin(store.clone(),&r).unwrap();first.apply(measured(1500)).unwrap();
+        r.request_id="next".into();let next=Observation::begin(store.clone(),&r).unwrap();
+        let status=read(store.clone(),"model","owner",&r.session_id).unwrap();assert_eq!(status.usage.unwrap().input_tokens,1500);assert!(status.usage_stale);assert_eq!(status.request_id,"next");
+        assert!(first.apply(measured(999)).unwrap().is_none());
+        next.apply(Update::Started(Method::Summary)).unwrap();next.apply(Update::Finished(Some("MODEL_HTTP_ERROR".into()))).unwrap();
+        let failed=read(store.clone(),"model","owner",&r.session_id).unwrap();assert_eq!(failed.usage.unwrap().input_tokens,1500);assert!(failed.usage_stale);
+        let updated=next.apply(measured(2400)).unwrap().unwrap();assert_eq!(updated.usage.unwrap().input_tokens,2400);assert!(!updated.usage_stale);
+    }
+    #[test]
+    fn model_switch_retains_stale_usage_across_reopen_and_revokes_old_reporters() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("retained.db");let store=Arc::new(Store::open(&path).unwrap());
+        let r=request(&store,"old");let old=Observation::begin(store.clone(),&r).unwrap();old.apply(measured(1500)).unwrap();
+        let repo=Repository::new(store.clone());repo.change_model("owner",&r.session_id,"model","model",0).unwrap();assert!(!read(store.clone(),"model","owner",&r.session_id).unwrap().usage_stale);
+        // Legacy JSON without the new optional marker remains readable.
+        { let db=store.database.lock().unwrap();let json:String=db.query_row("SELECT status_json FROM agent_context_status WHERE session_id=?1",[&r.session_id],|row|row.get(0)).unwrap();let mut raw:serde_json::Value=serde_json::from_str(&json).unwrap();raw.as_object_mut().unwrap().remove("usageStale");db.execute("UPDATE agent_context_status SET status_json=?1 WHERE session_id=?2",params![raw.to_string(),r.session_id]).unwrap(); }
+        repo.change_model("owner",&r.session_id,"model","next-model",0).unwrap();assert!(old.apply(measured(999)).unwrap().is_none());
+        assert!(read(store.clone(),"model","owner",&r.session_id).is_err());assert!(read(store.clone(),"next-model","other-user",&r.session_id).is_err());
+        drop(old);drop(repo);drop(store);let store=Arc::new(Store::open(&path).unwrap());
+        let status=read(store,"next-model","owner",&r.session_id).unwrap();assert_eq!(status.usage.unwrap().input_tokens,1500);assert!(status.usage_stale);assert_eq!(status.phase,Phase::Idle);
+    }
+    #[test]
+    fn binding_refresh_keeps_the_new_request_reporter_and_unknown_sessions_do_not_invent_usage() {
+        let store=Arc::new(Store::in_memory().unwrap());let r=request(&store,"fresh");let repo=Repository::new(store.clone());
+        repo.change_model("owner",&r.session_id,"model","model-two",0).unwrap();let status=read(store.clone(),"model-two","owner",&r.session_id).unwrap();assert!(status.usage.is_none());assert!(!status.usage_stale);
+        let mut r=r;r.agent_id="model-two".into();let observation=Observation::begin(store.clone(),&r).unwrap();observation.apply(measured(1500)).unwrap();
+        repo.refresh_model_binding("owner",&r.session_id,"model-two",1).unwrap();assert!(read(store.clone(),"model-two","owner",&r.session_id).unwrap().usage_stale);
+        let updated=observation.apply(measured(2400)).unwrap().unwrap();assert_eq!(updated.usage.unwrap().input_tokens,2400);assert!(!updated.usage_stale);
     }
     #[test]
     fn measurements_survive_schema_ten_upgrade_and_reopen_without_keys_or_model_calls() {

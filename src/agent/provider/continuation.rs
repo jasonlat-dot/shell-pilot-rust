@@ -122,6 +122,12 @@ impl Continuation {
     pub(crate) fn seal(&mut self, binding: &super::responses::Binding) {
         self.binding = Some(binding.clone());
     }
+    pub(super) fn rename_chat_reasoning(&mut self, field: &str) -> Result<()> {
+        if self.protocol != ProviderKind::OpenAiCompatible { return Err(ModelError::ContextMismatch); }
+        let wire = self.wire.as_object_mut().ok_or(ModelError::ContextMismatch)?;
+        if let Some(reasoning) = wire.remove("reasoning_content") { wire.insert(field.into(), reasoning); }
+        Ok(())
+    }
     pub(crate) fn validate_binding(&self, binding: &super::responses::Binding) -> Result<()> {
         if self.binding.as_ref() != Some(binding) {
             return Err(ModelError::ContextMismatch);

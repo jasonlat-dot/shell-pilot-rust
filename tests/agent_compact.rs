@@ -1001,3 +1001,14 @@ async fn grok_chat_uses_local_semantic_summary_with_native_parameters() {
     let requests=f.mock.requests.lock().unwrap();assert_eq!(requests.len(),1);let body=&requests[0].0;
     assert_eq!(body["max_completion_tokens"],2048);assert_eq!(body["reasoning_effort"],"high");assert!(body.get("tools").is_none());assert!(body.get("thinking").is_none());
 }
+
+#[tokio::test]
+async fn ollama_uses_local_semantic_summary_without_vendor_specific_thinking_fields() {
+    let f=Fixture::new().await;let evidence=f.append(Payload::UserMessage{text:"保留本地 Ollama 测试目标".into()});
+    f.model_config(|config|{config.supplier=Some(SupplierKind::Ollama);config.model="qwen3:8b".into();config.require_api_key=false;config.reasoning_effort=Some(ReasoningEffort::Low);config.capabilities.reasoning_effort=true;},KeyChange::Keep);
+    f.respond(Reply::Envelope(envelope(Some(document(evidence.id).to_string()),None)));
+    let before=f.events();f.summarize().await.unwrap();assert_eq!(f.events(),before);
+    let requests=f.mock.requests.lock().unwrap();assert_eq!(requests.len(),1);let body=&requests[0].0;
+    assert_eq!(body["max_tokens"],2048);assert_eq!(body["reasoning_effort"],"low");
+    for field in ["tools","thinking","enable_thinking","options","think","max_completion_tokens"] {assert!(body.get(field).is_none());}
+}

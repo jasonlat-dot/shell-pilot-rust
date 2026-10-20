@@ -684,3 +684,17 @@ async fn grok_both_protocols_share_read_only_bearer_catalog_and_preserve_proxy_p
     for (uri,headers) in calls.iter() {assert_eq!(uri.path(),"/proxy/v1/models");assert_eq!(headers["authorization"],"Bearer catalog-test-key");assert!(!headers.contains_key("x-api-key"));}
     assert!(f.repository.list("user").unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn ollama_catalog_lists_all_local_tags_without_a_key_and_supports_authenticated_proxies() {
+    let page=json!({"data":[{"id":"deepseek-r1:14b"},{"id":"qwen3:8b"},{"id":"library/custom:latest"}]});
+    let f=Fixture::new(vec![Reply::Json(page.clone()),Reply::Json(page)]).await;
+    for require_key in [false,true] {
+        let mut query=f.query(ProviderKind::OpenAiCompatible);query.supplier=Some(SupplierKind::Ollama);query.require_api_key=require_key;
+        let models=f.list(query).await.unwrap();assert_eq!(models.iter().map(|m|m.id.as_str()).collect::<Vec<_>>(),vec!["deepseek-r1:14b","qwen3:8b","library/custom:latest"]);
+    }
+    let calls=f.wire.calls.lock().unwrap();assert_eq!(calls.len(),2);
+    assert!(calls.iter().all(|(uri,_)|uri.path()=="/proxy/v1/models"));
+    assert!(!calls[0].1.contains_key("authorization"));assert_eq!(calls[1].1["authorization"],"Bearer catalog-test-key");
+    assert!(f.repository.list("user").unwrap().is_empty());
+}

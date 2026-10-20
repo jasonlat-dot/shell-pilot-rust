@@ -59,7 +59,9 @@ Responses 工具使用原生 function 定义及 `call_id` / `function_call_outpu
 
 Manager.change_model 在会话执行锁内检查新模型可用性、用户归属和 revision；原子更换 agent_id，保留 session/task/scope、SSH 身份、项目关系及审批策略。运行中的 turn、准入的执行或扩展调用、写入中的输出和悬挂工具调用会阻止切换。
 
-schema 23 的 agent_model_transitions 保存切换前事件边界。边界前的 assistant 和工具事件以明确标注的 JSON 历史数据传入，不形成新模型的可执行调用；原始事件、工具证据与对话界面不被重写。边界后的回复按新模型协议正常保存和回传原生状态。上下文用量清零待下次实际测量，普通文本检查点继续使用。
+schema 23 的 agent_model_transitions 保存切换前事件边界。边界前的 assistant 和工具事件以明确标注的 JSON 历史数据传入，不形成新模型的可执行调用；原始事件、工具证据与对话界面不被重写。边界后的回复按新模型协议正常保存和回传原生状态。上下文用量保留上次快照并标记 usageStale，待下次测量替换；普通文本检查点继续使用。
+
+usageStale 默认 false，兼容已存状态。显式切换在同一事务内保留统计、清除旧整理状态并撤销旧 observation owner，避免延迟回执覆盖；配置绑定刷新保留当前准备阶段 reporter 的身份。新请求 begin 保留上次 usage，Measured 才替换所有预算字段并清除标记。此缓存不参与实际请求预算，跨模型仍重新测量；没有测量的会话继续为未知。该显示状态随工作区持久保存，不增加迁移。
 
 Responses 加密压缩窗口不能跨模型转发，切换时解除当前窗口引用，并恢复完整原始事件前缀；旧窗口作为历史记录保留。新请求仍受目标模型的上下文容量限制，不承诺较小窗口能容纳任意长历史。
 
@@ -68,6 +70,16 @@ Responses 加密压缩窗口不能跨模型转发，切换时解除当前窗口�
 运行中可编辑已保存的模型配置；当前轮次继续使用准备阶段固定的 RuntimeConfig。下一次用户请求在载入时若发现供应商/协议/模型/端点/凭据绑定变化，refresh_model_binding 复用相同的事务、忙碌及 CAS 校验，记录原生状态边界、解除远端加密窗口引用，再从保留的原始事件重建。普通文字检查点、任务、服务器身份和审批策略保留；旧思考、签名和密文不跨绑定重放。自动整理中使用已固定 RuntimeConfig 的重载不执行此刷新，避免运行中上下文被配置编辑改写。不增加 schema 或迁移。
 
 回环测试覆盖三种协议间全部六种切换方向，分别验证文字和工具模式共 12 个场景：重开数据库后继续原 session、新请求包含旧历史、不携带旧协议状态、历史证据不会成为待执行工具。另有权限、CAS、忙碌拒绝、服务器目标、文本及远端检查点单测。未使用真实供应商凭据。
+
+### Ollama 同端点多模型
+
+SupplierKind::Ollama 使用独立供应商策略及现有 Chat Completions adapter，固定 `max_tokens`，默认省略强度，可选 `none / low / medium / high` 写入 `reasoning_effort`；不会因本地模型命名为 DeepSeek/Qwen 而发送云厂商的 thinking 字段。仅支持 Chat 协议，目录使用相同前缀的 `/models`。本地配置关闭 requireApiKey，代理认证可选 Bearer；地址、密钥、模型和供应商绑定继续隔离。没有 schema 迁移。
+
+供应商策略提供可覆盖的 decode_chat / stream_chat，默认保持原解码器。Ollama 将官方 JSON/SSE 的 `reasoning` 映射到已有严格解码器，再以原始字段名保存原生续接；同模型后续工具请求回放 `reasoning`，可见回复与日志不包含思考。冲突、非字符串思考和未正常结束的流均拒绝；取消、体积及工具调用验证沿用原逻辑。
+
+从同一 Ollama 地址的 DeepSeek 切到 Qwen 仍复用 change_model，保留同一 session、原始历史和审批边界，用可移植问答及工具记录重建新模型输入，不跨模型复用思考或运行缓存。专项回环测试在普通文字与启用工具两种模式下验证同端点切换、数据库重开、旧问题与回答进入新模型请求、旧原生思考不进入新请求。
+
+应用窗口数值只用于预算，不能修改 Ollama 实际分配的 context；用户需按 `ollama ps` 的 CONTEXT 配置窗口、输出及安全预留。整理使用本地语义摘要，未接入原生 /api/chat、Responses、模型管理或服务控制。接口依据见客户端文档的 Ollama 章节及 [官方兼容层源码](https://github.com/ollama/ollama/blob/main/openai/openai.go)。
 
 
 ## Messages 原生 effort

@@ -82,13 +82,15 @@ fn sse(protocol: &ProviderKind, reply: &Value) -> String {
         ProviderKind::GoogleGemini => { events.push(reply.clone()); }
         ProviderKind::OpenAiCompatible => {
             let message = &reply["choices"][0]["message"];
-            if let Some(reasoning) = message["reasoning_content"].as_str() {
+            let reasoning_field=if message.get("reasoning").is_some() {"reasoning"}else{"reasoning_content"};
+            if let Some(reasoning) = message[reasoning_field].as_str() {
                 for part in ["", reasoning] {
-                    events.push(json!({"choices":[{"index":0,"delta":{"reasoning_content":part},"finish_reason":null}]}));
+                    events.push(json!({"choices":[{"index":0,"delta":{reasoning_field:part},"finish_reason":null}]}));
                 }
             }
             let mut delta = message.clone();
             delta.as_object_mut().unwrap().remove("reasoning_content");
+            delta.as_object_mut().unwrap().remove("reasoning");
             if let Some(calls) = delta["tool_calls"].as_array_mut() {
                 for (i, c) in calls.iter_mut().enumerate() {
                     c["index"] = i.into();
@@ -253,6 +255,10 @@ async fn effort_contract(protocol: ProviderKind, stream: bool, signature: bool, 
 async fn supplier_contract(protocol: ProviderKind, stream: bool, signature: bool, effort: Option<ReasoningEffort>, supplier: Option<SupplierKind>) {
     let response = |first| {
         let mut value = reply(&protocol, first, signature);
+        if supplier==Some(SupplierKind::Ollama) {
+            let message=value["choices"][0]["message"].as_object_mut().unwrap();
+            let reasoning=message.remove("reasoning_content").unwrap();message.insert("reasoning".into(),reasoning);
+        }
         if matches!(supplier, Some(SupplierKind::Deepseek | SupplierKind::Glm | SupplierKind::Kimi)) && protocol == ProviderKind::AnthropicMessages {
             for block in value["content"].as_array_mut().unwrap() { block.as_object_mut().unwrap().remove("signature"); }
         }
@@ -380,6 +386,13 @@ async fn supplier_contract(protocol: ProviderKind, stream: bool, signature: bool
         }
     }
     let next = &requests[1];
+    if supplier==Some(SupplierKind::Ollama) {
+        for request in requests.iter() {
+            assert_eq!(request["max_tokens"],2048);
+            for field in ["thinking","enable_thinking","think","options","max_completion_tokens"] {assert!(request.get(field).is_none());}
+            if let Some(effort)=&effort {assert_eq!(request["reasoning_effort"],json!(effort));}else{assert!(request.get("reasoning_effort").is_none());}
+        }
+    }
     if supplier==Some(SupplierKind::Grok) {
         for request in requests.iter() {
             assert!(request.get("thinking").is_none());assert!(request.get("max_tokens").is_none());
@@ -581,5 +594,46 @@ async fn grok_both_protocols_replay_thinking_and_tools_without_remote_counting()
         for effort in [None,Some(ReasoningEffort::Low),Some(ReasoningEffort::Medium),Some(ReasoningEffort::High),Some(ReasoningEffort::Xhigh)] {
             for stream in [false,true] {supplier_contract(protocol.clone(),stream,false,effort.clone(),Some(SupplierKind::Grok)).await;}
         }
+    }
+}
+
+#[tokio::test]
+async fn ollama_tools_replay_reasoning_in_json_and_stream_with_local_thinking_controls() {
+    for effort in [None,Some(ReasoningEffort::None),Some(ReasoningEffort::Low),Some(ReasoningEffort::Medium),Some(ReasoningEffort::High)] {
+        for stream in [false,true] {supplier_contract(ProviderKind::OpenAiCompatible,stream,false,effort.clone(),Some(SupplierKind::Ollama)).await;}
+    }
+}
+
+#[tokio::test]
+async fn switching_deepseek_to_qwen_on_one_ollama_endpoint_reuses_history_after_reopen() {
+    use shellpilot_server::agent::chat::{Manager,Request};
+    for tools in [false,true] {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("ollama-switch.sqlite");let store=Arc::new(Store::open(&path).unwrap());
+        let (wire,server)=endpoint(ProviderKind::OpenAiCompatible,store.clone(),"local-deepseek").await;
+        let models=ModelRepository::new(store.clone());let original=models.get("local-deepseek","test").unwrap();
+        let mut config=original.config;config.supplier=Some(SupplierKind::Ollama);config.model="deepseek-r1:14b".into();
+        models.save("local-deepseek","test",original.revision,ModelConfigUpdate{config:config.clone(),api_key:KeyChange::Keep}).unwrap();
+        config.model="qwen3:8b".into();models.save("local-qwen","test",0,ModelConfigUpdate{config,api_key:KeyChange::Keep}).unwrap();
+        {
+            let mut replies=wire.replies.lock().unwrap();let message=replies.front_mut().unwrap()["choices"][0]["message"].as_object_mut().unwrap();
+            let reasoning=message.remove("reasoning_content").unwrap();message.insert("reasoning".into(),reasoning);
+            let next=replies.front().unwrap().clone();replies.push_back(next);
+        }
+        let repo=Repository::new(store.clone());let session=repo.create_general_session_with_policy("local-deepseek","test",Some(Policy::Deny)).unwrap();
+        let manager=Manager::new(store.clone(),CancellationToken::new());
+        let mut request=Request{agent_id:"local-deepseek".into(),user_id:"test".into(),session_id:session.id.clone(),request_id:"ollama-one".into(),terminal_session_id:String::new(),message:"记住端口是 12233".into(),attachments:vec![]};
+        manager.chat_desktop(request.clone(),None,tools,&CancellationToken::new(),|_|async{Ok(())}).await.unwrap();
+        let history=manager.history("local-deepseek".into(),"test".into(),session.id.clone(),0,20).await.unwrap();let before=repo.events(&session.id,"test",0,200).unwrap();
+        let switched=manager.change_model("test".into(),session.id.clone(),"local-deepseek".into(),"local-qwen".into(),history.session.revision).await.unwrap();
+        assert_eq!(switched.id,session.id);assert_eq!(switched.scope,history.session.scope);assert_eq!(switched.task,history.session.task);
+        drop(manager);drop(repo);drop(models);drop(store);
+        let store=Arc::new(Store::open(&path).unwrap());let manager=Manager::new(store.clone(),CancellationToken::new());
+        request.agent_id="local-qwen".into();request.request_id="ollama-two".into();request.message="刚才端口是多少？".into();
+        manager.chat_desktop(request,None,tools,&CancellationToken::new(),|_|async{Ok(())}).await.unwrap();
+        let history=manager.history("local-qwen".into(),"test".into(),session.id.clone(),0,20).await.unwrap();assert_eq!(history.turns.len(),2);
+        assert_eq!(history.turns[0].message,"记住端口是 12233");assert_eq!(history.turns[0].result_text.as_deref(),Some("检查完成"));
+        assert!(Repository::new(store).events(&session.id,"test",0,200).unwrap().starts_with(&before));
+        let calls=wire.requests.lock().unwrap();assert_eq!(calls.len(),2);assert_eq!(calls[0]["model"],"deepseek-r1:14b");assert_eq!(calls[1]["model"],"qwen3:8b");
+        let context=calls[1].to_string();assert!(context.contains("12233")&&context.contains("检查完成"));assert!(!context.contains("private-reasoning"));server.abort();
     }
 }

@@ -32,7 +32,7 @@ impl Repository {
             let remote: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM agent_responses_checkpoints WHERE checkpoint_id=?1)",[&current.session.checkpoint_id],|r|r.get(0))?;
             tx.execute("INSERT INTO agent_model_transitions(session_id,through_event_id,updated_at) VALUES(?1,?2,?3) ON CONFLICT(session_id) DO UPDATE SET through_event_id=excluded.through_event_id,updated_at=excluded.updated_at",params![session,current.through_event_id,chrono::Utc::now().timestamp_millis()])?;
             tx.execute("UPDATE agent_sessions SET agent_id=?2,revision=?3,checkpoint_id=CASE WHEN ?4 THEN NULL ELSE checkpoint_id END WHERE id=?1",params![session,next,repository::next_revision(revision)?,remote])?;
-            tx.execute("DELETE FROM agent_context_status WHERE session_id=?1",[session])?;
+            context_status::invalidate_usage(&tx,session,!refresh)?;
             let result=repository::read_session(&tx,session,user)?;
             tx.commit()?;
             Ok(result)

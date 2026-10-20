@@ -16,6 +16,7 @@ pub enum SupplierKind {
     Qwen,
     Kimi,
     Grok,
+    Ollama,
 }
 
 pub(super) trait SupplierPolicy: Sync {
@@ -35,6 +36,12 @@ pub(super) trait SupplierPolicy: Sync {
         true
     }
     fn decorate(&self, _config: &ModelConfig, _body: &mut Value) {}
+    fn decode_chat(&self, bytes: &[u8], allowed: &std::collections::HashSet<String>) -> Result<Completion> {
+        super::protocol::decode_response(bytes, allowed)
+    }
+    fn stream_chat(&self, tools: bool) -> Box<dyn super::adapter::ResponseStream> {
+        if tools { super::tool_stream::decoder() } else { super::stream::decoder() }
+    }
     fn headers(&self, provider: &ProviderKind, key: Option<&SecretKey>) -> Result<HeaderMap> {
         super::adapter::select(provider).headers(key)
     }
@@ -55,12 +62,14 @@ struct Glm;
 mod qwen;
 mod kimi;
 mod grok;
+mod ollama;
 static COMPATIBLE: Compatible = Compatible;
 static DEEPSEEK: DeepSeek = DeepSeek;
 static GLM: Glm = Glm;
 static QWEN: qwen::Qwen = qwen::Qwen;
 static KIMI: kimi::Kimi = kimi::Kimi;
 static GROK: grok::Grok = grok::Grok;
+static OLLAMA: ollama::Ollama = ollama::Ollama;
 impl SupplierPolicy for Compatible {}
 pub(super) fn select(supplier: Option<&SupplierKind>) -> &'static dyn SupplierPolicy {
     match supplier {
@@ -69,12 +78,14 @@ pub(super) fn select(supplier: Option<&SupplierKind>) -> &'static dyn SupplierPo
         Some(SupplierKind::Qwen) => &QWEN,
         Some(SupplierKind::Kimi) => &KIMI,
         Some(SupplierKind::Grok) => &GROK,
+        Some(SupplierKind::Ollama) => &OLLAMA,
         _ => &COMPATIBLE,
     }
 }
 pub(super) fn validate(supplier: Option<&SupplierKind>, provider: &ProviderKind) -> Result<()> {
     let valid = match supplier {
         None => true,
+        Some(SupplierKind::Ollama) => *provider == ProviderKind::OpenAiCompatible,
         Some(SupplierKind::Openai | SupplierKind::Grok) => matches!(
             provider,
             ProviderKind::OpenAiCompatible | ProviderKind::OpenAiResponses
@@ -99,7 +110,7 @@ pub(super) fn canonical(supplier: Option<SupplierKind>) -> Option<SupplierKind> 
     supplier.filter(|s| {
         matches!(
             s,
-            SupplierKind::Deepseek | SupplierKind::Glm | SupplierKind::Qwen | SupplierKind::Kimi | SupplierKind::Grok
+            SupplierKind::Deepseek | SupplierKind::Glm | SupplierKind::Qwen | SupplierKind::Kimi | SupplierKind::Grok | SupplierKind::Ollama
         )
     })
 }

@@ -85,6 +85,12 @@ impl ProviderAdapter for ChatCompletions {
     fn decode(&self, b: &[u8], a: &HashSet<String>) -> Result<Completion> {
         super::protocol::decode_response(b, a)
     }
+    fn decode_for(&self, config: &ModelConfig, bytes: &[u8], allowed: &HashSet<String>) -> Result<Completion> {
+        super::supplier::select(config.supplier.as_ref()).decode_chat(bytes, allowed)
+    }
+    fn stream_for(&self, config: &ModelConfig, tools: bool) -> Result<Box<dyn ResponseStream>> {
+        Ok(super::supplier::select(config.supplier.as_ref()).stream_chat(tools))
+    }
     fn stream(&self, tools: bool) -> Result<Box<dyn ResponseStream>> {
         Ok(if tools {
             super::tool_stream::decoder()
