@@ -1,11 +1,11 @@
 # 模型协议策略
 
-原生模型层通过策略工厂支持 `openAiCompatible`、`openAiResponses` 和 `anthropicMessages`。schema 22 新增原生续接状态表；旧模型配置和加密 Key 保持原值，已有数据库启动时自动升级。
+原生模型层通过策略工厂支持 `openAiCompatible`、`openAiResponses`、`anthropicMessages` 和 `googleGemini`。当前 schema 24（原生续接状态表在 schema 22 引入）；本轮 Google 接入不新增迁移。旧模型配置和加密 Key 保持原值，已有数据库启动时自动升级。
 
 ## 分层与扩展
 
-- `src/agent/provider/adapter.rs`：`ProviderAdapter` 策略接口及单一工厂。策略拥有认证头、配置归一化、请求编码/预算估算、完整响应解码与流解析器创建；能力查询供业务使用。
-- `transport.rs` / `dispatch.rs`：共享 HTTP 生命周期，负责超时、取消、禁止重定向/自动重试、响应大小及 MIME 检查；不解释 Claude 的字段或工具片段。密钥头标记为 sensitive，供应商错误正文不回传。
+- `src/agent/provider/adapter.rs`：`ProviderAdapter` 策略接口及单一工厂。策略拥有端点、流式请求准备、EOF 完成策略、认证头、配置归一化、请求编码/预算估算、完整响应解码与流解析器创建；能力查询供业务使用。
+- `transport.rs` / `dispatch.rs`：共享 HTTP 生命周期，负责超时、取消、禁止重定向/自动重试、响应大小及 MIME 检查；不解释供应商的字段或工具片段。密钥头标记为 sensitive，供应商错误正文不回传。
 - `protocol.rs`：共享内部消息、工具历史配对、工具名称/参数/结束原因校验及预算硬限制。`ResponseStream` 将供应商 SSE 归一为可见文本和最终 `Completion`；工具 JSON 片段只在完整响应校验后交给现有工具循环。
 - `anthropic.rs` / `anthropic/stream.rs`：Anthropic Messages 编解码与事件状态机。`stream.rs` / `tool_stream.rs` 保留 Chat Completions 的文本/工具解析器。
 - `continuation.rs`：按协议选择续接策略，只保留供应商实际返回的推理内容或签名，封装为不可从 IPC 构造的原生消息。`continuation_store.rs` 在原始事件范围旁保存状态，工具批次、最终回复和追加输入的中间回复与对应事件原子提交。
@@ -86,3 +86,19 @@ schema 24 增加 agent_model_channels 和 agent_model_channel_members，旧配�
 独立的输入框强度更新只允许改变成员的 reasoningEffort 和对应能力位，禁止绕过渠道编辑器修改公共端点、名称或密钥；它同时推进渠道修订版本，防止过期渠道编辑覆盖新设置。跨模型切换继续沿用会话锁、revision 校验和历史模型边界，签名和密文仍不会跨模型转发。
 
 验证：Rust 全量 453 项通过、6 项既有忽略，生产库严格 Clippy 通过；客户端原生库 59 项和前端 530 项通过。渠道集成测试使用临时数据库、测试密钥和回环模型，验证两个实际模型名、共享密钥的请求头、轮换/清除、同会话历史续聊和旧配置重开。未调用真实供应商、未打包或提交。
+
+
+## Google GenerateContent（2026-10-20）
+
+`google.rs` 为独立 ProviderAdapter，不向 Agent 循环增加供应商分支。基础地址保留官方 /v1beta 或代理前缀，相对路径 models，实际模型 ID 作为安全 URL 段追加；生成与流式分别用 :generateContent 和 :streamGenerateContent?alt=sse。模型 ID 限定为本地安全标识，可规范去掉 models/ 前缀；不接受完整 URL/查询或任意路径。API Key 由原生仓库加密保存，只通过 sensitive 的 x-goog-api-key 发送。
+
+内部 system/developer 合并为 systemInstruction；用户/模型/工具映射到 contents 的 user/model、functionCall 和 functionResponse，工具参数仍经过既有白名单、闭合 schema、审批和执行边界。FunctionDeclaration 使用 parametersJsonSchema 保留既有 JSON Schema 约束；Google 原生 args 在转成 Value 前使用共享 strict_json 拒绝重复字段，不能把模糊参数归一化后派发。图片使用 inlineData，预算按现有图片预留估算，不按 base64 字符串长度计费。
+
+generationConfig 包含 maxOutputTokens、candidateCount=1 及显式温度；显式 minimal/low/medium/high 转为 thinkingConfig.thinkingLevel。默认省略思考参数；不猜模型代际、不伪造预算或签名、不自动重试降档。thought 文本不进入可见回复，保留 model parts 原始顺序与 thoughtSignature，回复/工具 ID 与结果正确配对（供应商无 ID 时使用本地主机 ID，回传不编造供应商 ID）。原生状态沿用数据库的绑定、保存、切换及删除机制，不写入诊断正文。
+
+SSE 使用共享字节帧解析，支持跨 UTF-8 字节/行分块；Google 无 [DONE]，仅完整 EOF、明确 STOP 和无未闭合 SSE 帧时成功。保留结束帧之后的 usageMetadata；截断、过滤、MAX_TOKENS、未知工具或异常参数不能触发执行。共享 HTTP 超时/取消/响应限制、禁止重定向与禁止自动重试保持。Google 整理使用本地摘要及现有检查点 CAS，不调用 Responses 计数或远端 compact。
+
+范围是 Gemini Developer API 的 GenerateContent；旧 Gemini OpenAI 兼容配置不变。Vertex OAuth、Live/Interactions、原生文件上传、托管搜索/代码执行不属于此次接入。使用者仍须提供端点支持的模型 ID 和凭据。依据：[GenerateContent API](https://ai.google.dev/api/generate-content)、[思考配置](https://ai.google.dev/gemini-api/docs/generate-content/thinking)、[思考签名](https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures)。
+
+
+本轮定向验证：Rust 46 项通过（供应商单测 24、Google HTTP/摘要/持久化 5、渠道 6、四协议续接 7、Anthropic 传输 3、严格工具参数 1）；四协议切换覆盖全部 12 个方向的文字/工具共 24 场景。前端 48 项、TypeScript / Vite、桌面原生 tests 编译和生产库严格 Clippy 通过。临时数据库与回环服务，无真实 Google Key/用户 SSH；实际桌面视觉及真实供应商联调未完成，未打包或提交。完整结果与初轮修正记录见 AGENT_PROGRESS.md。

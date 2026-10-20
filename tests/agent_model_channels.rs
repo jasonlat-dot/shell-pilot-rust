@@ -122,3 +122,20 @@ async fn selected_model_and_shared_credentials_reach_http_and_same_session_keeps
     assert!(!disabled.profile.ready);for model in disabled.models {assert!(repo.runtime(&model.id,"u").is_err());}
     task.abort();
 }
+
+
+#[test]
+fn google_channel_uses_canonical_model_identity_and_preserves_members_and_shared_keys(){
+    let directory=tempfile::tempdir().unwrap();let path=directory.path().join("google-channels.sqlite");
+    let repo=ModelRepository::new(Arc::new(Store::open(&path).unwrap()));let mut config=config();
+    config.provider=ProviderKind::GoogleGemini;config.completions_path="models".into();config.require_api_key=true;
+    let channel=repo.save_channel("google","u",0,ModelConfigUpdate{config:config.clone(),api_key:KeyChange::Set{value:SecretKey::new("google-test-shared").unwrap()}},"Google",ids(&["models/one","two"])).unwrap();
+    assert_eq!(channel.models[0].id,"google");assert_eq!(channel.models[0].model,"one");let second=channel.models[1].id.clone();
+    for member in &channel.models {let runtime=repo.runtime(&member.id,"u").unwrap();assert_eq!(runtime.config.model,member.model);assert!(repo.get(&member.id,"u").unwrap().api_key_configured);}
+    assert!(repo.save_channel("google","u",channel.profile.revision,update(config.clone()),"bad",ids(&["one","models/one"])).is_err());
+    assert_eq!(repo.channels("u").unwrap()[0].profile.revision,channel.profile.revision);
+    let edited=repo.save_channel("google","u",channel.profile.revision,update(config),"Google",ids(&["models/two","one"])).unwrap();
+    assert_eq!(edited.models[0].id,second);assert_eq!(edited.models[1].id,"google");drop(repo);
+    let repo=ModelRepository::new(Arc::new(Store::open(&path).unwrap()));assert_eq!(repo.channels("u").unwrap()[0].models[0].id,second);
+    assert_eq!(repo.runtime(&second,"u").unwrap().config.provider,ProviderKind::GoogleGemini);
+}

@@ -379,6 +379,10 @@ pub(crate) fn media_adjusted_cost(body: &str) -> Result<u64> {
                 *v = json!({"type":"image","detail":"high"});
                 crate::agent::attachments::IMAGE_TOKENS
             }
+            Value::Object(object) if object.get("inlineData").is_some_and(|data| data["mimeType"].as_str().is_some_and(|mime| mime.starts_with("image/"))) => {
+                *v = json!({"type":"image","detail":"high"});
+                crate::agent::attachments::IMAGE_TOKENS
+            }
             Value::Object(object) => object.values_mut().map(replace).sum(),
             Value::Array(array) => array.iter_mut().map(replace).sum(),
             _ => 0,

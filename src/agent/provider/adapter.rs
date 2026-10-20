@@ -24,6 +24,13 @@ pub(super) trait ProviderAdapter: Sync {
     fn response_windows(&self) -> bool {
         false
     }
+    fn endpoint(&self, config: &ModelConfig) -> Result<url::Url> { config.relative_endpoint() }
+    fn prepare_stream(&self, endpoint: &mut url::Url, body: &mut serde_json::Value) -> Result<()> {
+        let _ = endpoint;
+        body["stream"] = true.into();
+        Ok(())
+    }
+    fn finish_on_eof(&self) -> bool { false }
     fn headers(&self, key: Option<&SecretKey>) -> Result<HeaderMap>;
     fn measure(&self, config: &ModelConfig, request: &ChatRequest) -> Result<PreparedRequest>;
     fn decode(&self, bytes: &[u8], allowed: &HashSet<String>) -> Result<Completion>;
@@ -36,12 +43,14 @@ struct ChatCompletions;
 struct Responses;
 static CHAT: ChatCompletions = ChatCompletions;
 static RESPONSES: Responses = Responses;
+static GOOGLE: super::google::GoogleGemini = super::google::GoogleGemini;
 static ANTHROPIC: super::anthropic::AnthropicMessages = super::anthropic::AnthropicMessages;
 pub(super) fn select(kind: &ProviderKind) -> &'static dyn ProviderAdapter {
     match kind {
         ProviderKind::OpenAiCompatible => &CHAT,
         ProviderKind::OpenAiResponses => &RESPONSES,
         ProviderKind::AnthropicMessages => &ANTHROPIC,
+        ProviderKind::GoogleGemini => &GOOGLE,
     }
 }
 pub(super) fn credential_headers(

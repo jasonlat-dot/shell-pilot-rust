@@ -1,6 +1,7 @@
 //! Provider strategies normalize wire protocols; HTTP and Agent execution remain separate.
 mod adapter;
 mod anthropic;
+mod google;
 mod config;
 pub(crate) mod continuation;
 mod dispatch;

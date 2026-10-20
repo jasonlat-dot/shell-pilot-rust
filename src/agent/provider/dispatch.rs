@@ -70,12 +70,13 @@ impl ModelClient {
         let prepared = prepare_request(&self.config, request)?;
         let mut body: Value =
             serde_json::from_str(&prepared.body).map_err(|_| ModelError::Response)?;
-        body["stream"] = true.into();
+        let mut endpoint = prepared.endpoint.clone();
+        self.adapter.prepare_stream(&mut endpoint, &mut body)?;
         let mut decoder = self.adapter.stream(tools)?;
         let operation = async {
             let mut response = self
                 .client
-                .post(prepared.endpoint)
+                .post(endpoint)
                 .headers(self.headers.clone())
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::ACCEPT, "text/event-stream")
@@ -141,7 +142,7 @@ impl ModelClient {
                     }
                 }
             }
-            Err(ModelError::Incomplete)
+            if self.adapter.finish_on_eof() && parser.is_complete() { decoder.finish(&prepared.allowed_tools) } else { Err(ModelError::Incomplete) }
         };
         tokio::select! {biased;_=cancel.cancelled()=>Err(ModelError::Cancelled),result=tokio::time::timeout(Duration::from_secs(self.config.timeout_seconds),operation)=>result.unwrap_or(Err(ModelError::Timeout))}
     }

@@ -44,7 +44,7 @@ async fn respond(State(w): State<Wire>, uri: Uri, Json(body): Json<Value>) -> Re
         .unwrap()
         .pop_front()
         .expect("unexpected retry");
-    let stream = body["stream"] == true;
+    let stream = body["stream"] == true || uri.path().ends_with(":streamGenerateContent");
     let bytes = if stream {
         sse(&w.protocol, &reply)
     } else {
@@ -71,6 +71,7 @@ async fn respond(State(w): State<Wire>, uri: Uri, Json(body): Json<Value>) -> Re
 fn sse(protocol: &ProviderKind, reply: &Value) -> String {
     let mut events = vec![];
     match protocol {
+        ProviderKind::GoogleGemini => { events.push(reply.clone()); }
         ProviderKind::OpenAiCompatible => {
             let message = &reply["choices"][0]["message"];
             if let Some(reasoning) = message["reasoning_content"].as_str() {
@@ -143,6 +144,11 @@ fn sse(protocol: &ProviderKind, reply: &Value) -> String {
 fn reply(protocol: &ProviderKind, first: bool, signature: bool) -> Value {
     let call = json!({"id":"call-one","type":"function","function":{"name":"inspect","arguments":"{\"target\":\"测试\"}"}});
     match protocol {
+        ProviderKind::GoogleGemini => {
+            let mut parts=vec![json!({"thought":true,"text":"private-reasoning-原样"})];
+            parts.push(if first {json!({"functionCall":{"id":"call-one","name":"inspect","args":{"target":"测试"}},"thoughtSignature":"original-opaque-signature"})} else {json!({"text":"检查完成","thoughtSignature":"final-opaque-signature"})});
+            json!({"candidates":[{"index":0,"content":{"role":"model","parts":parts},"finishReason":"STOP"}]})
+        }
         ProviderKind::OpenAiCompatible => {
             let mut message = if first {
                 json!({"role":"assistant","content":"检查一下","tool_calls":[call]})
@@ -242,6 +248,7 @@ async fn effort_contract(protocol: ProviderKind, stream: bool, signature: bool, 
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let path = match protocol {
+        ProviderKind::GoogleGemini => "models",
         ProviderKind::AnthropicMessages => "messages",
         ProviderKind::OpenAiResponses => "responses",
         _ => "chat/completions",
@@ -335,6 +342,11 @@ async fn effort_contract(protocol: ProviderKind, stream: bool, signature: bool, 
     }
     let next = &requests[1];
     match protocol {
+        ProviderKind::GoogleGemini => {
+            assert_eq!(next["contents"][1],first["candidates"][0]["content"]);
+            assert_eq!(next["contents"][2]["parts"][0]["functionResponse"]["id"],"call-one");
+            assert_eq!(next["contents"][2]["parts"][0]["functionResponse"]["name"],"inspect");
+        }
         ProviderKind::OpenAiCompatible => {
             let replay = next["messages"]
                 .as_array()
@@ -393,7 +405,7 @@ async fn responses_reasoning_function_roundtrip_json_and_stream() {
 async fn endpoint(protocol: ProviderKind, store: Arc<Store>, profile: &str) -> (Wire,tokio::task::JoinHandle<()>) {
     let wire=Wire{replies:Arc::new(Mutex::new(vec![reply(&protocol,false,false)].into())),requests:Arc::default(),protocol:protocol.clone()};
     let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let path=match protocol{ProviderKind::OpenAiCompatible=>"chat/completions",ProviderKind::AnthropicMessages=>"messages",ProviderKind::OpenAiResponses=>"responses"};
+    let path=match protocol{ProviderKind::OpenAiCompatible=>"chat/completions",ProviderKind::AnthropicMessages=>"messages",ProviderKind::OpenAiResponses=>"responses",ProviderKind::GoogleGemini=>"models"};
     let config:ModelConfig=serde_json::from_value(json!({"provider":protocol,"baseUrl":format!("http://{}/v1/",listener.local_addr().unwrap()),"completionsPath":path,"model":profile,"outputTokenParameter":"maxTokens","capabilities":{"developerRole":false,"temperature":false,"reasoningEffort":false},"requireApiKey":false})).unwrap();
     ModelRepository::new(store).save(profile,"test",0,ModelConfigUpdate{config,api_key:KeyChange::Keep}).unwrap();
     let app=Router::new().route("/{*path}",post(respond)).with_state(wire.clone());
@@ -402,7 +414,7 @@ async fn endpoint(protocol: ProviderKind, store: Arc<Store>, profile: &str) -> (
 #[tokio::test]
 async fn same_conversation_continues_after_all_cross_protocol_model_changes() {
     use shellpilot_server::agent::chat::{Manager,Request};
-    let protocols=[ProviderKind::OpenAiCompatible,ProviderKind::AnthropicMessages,ProviderKind::OpenAiResponses];
+    let protocols=[ProviderKind::OpenAiCompatible,ProviderKind::AnthropicMessages,ProviderKind::OpenAiResponses,ProviderKind::GoogleGemini];
     for from in &protocols {for to in &protocols {if from==to{continue;}
         for tools in [false,true] {
             let dir=tempfile::tempdir().unwrap();let path=dir.path().join("switch.sqlite");
@@ -435,3 +447,6 @@ async fn same_conversation_continues_after_all_cross_protocol_model_changes() {
         }
     }}
 }
+
+#[tokio::test]
+async fn google_native_signed_tool_roundtrip_json_and_stream(){for stream in [false,true]{contract(ProviderKind::GoogleGemini,stream,true).await;}}

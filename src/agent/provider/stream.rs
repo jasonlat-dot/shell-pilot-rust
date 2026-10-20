@@ -9,6 +9,7 @@ pub(super) struct Sse {
     data: String,
 }
 impl Sse {
+    pub(super) fn is_complete(&self) -> bool { self.line.is_empty() && self.data.is_empty() }
     pub(super) fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>> {
         let mut frames = Vec::new();
         for &byte in bytes {

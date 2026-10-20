@@ -23,6 +23,8 @@ trait ReplayStrategy: Sync {
 struct ChatReplay;
 struct MessagesReplay;
 struct ResponsesReplay;
+struct GoogleReplay;
+static GOOGLE: GoogleReplay = GoogleReplay;
 static CHAT: ChatReplay = ChatReplay;
 static MESSAGES: MessagesReplay = MessagesReplay;
 static RESPONSES: ResponsesReplay = ResponsesReplay;
@@ -31,6 +33,7 @@ fn strategy(protocol: &ProviderKind) -> &'static dyn ReplayStrategy {
         ProviderKind::OpenAiCompatible => &CHAT,
         ProviderKind::AnthropicMessages => &MESSAGES,
         ProviderKind::OpenAiResponses => &RESPONSES,
+        ProviderKind::GoogleGemini => &GOOGLE,
     }
 }
 impl ReplayStrategy for ChatReplay {
@@ -54,6 +57,12 @@ impl ReplayStrategy for ResponsesReplay {
         if !state.wire.is_array() {
             return Err(ModelError::ContextMismatch);
         }
+        Ok(state.wire.clone())
+    }
+}
+impl ReplayStrategy for GoogleReplay {
+    fn replay(&self, state: &Continuation) -> Result<Value> {
+        if state.wire["role"] != "model" || !state.wire["parts"].is_array() { return Err(ModelError::ContextMismatch); }
         Ok(state.wire.clone())
     }
 }

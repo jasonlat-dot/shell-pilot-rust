@@ -35,11 +35,15 @@ impl ModelRepository {
         let name=name.trim();
         if name.is_empty()||name.chars().count()>64||name.len()>256||name.chars().any(char::is_control) {return Err(ModelError::Invalid("channel name must contain 1 to 64 printable characters"));}
         if models.is_empty()||models.len()>64 {return Err(ModelError::Invalid("a channel requires 1 to 64 model IDs"));}
-        let models=models.into_iter().map(|model|model.trim().to_owned()).collect::<Vec<_>>();
+        // A strategy may canonicalize model IDs (e.g. Google's models/ prefix).
+        // Use that same identity for membership, duplicate checks and runtime config.
+        let models=models.into_iter().map(|model| {
+            update.config.model=model;
+            update.config.clone().normalized().map(|config|config.model)
+        }).collect::<Result<Vec<_>>>()?;
         let mut unique=HashSet::new();
         for model in &models {
             if !unique.insert(model.clone()) {return Err(ModelError::Invalid("model IDs in one channel must be unique"));}
-            update.config.model=model.clone();update.config.clone().normalized()?;
         }
         update.config.model=models[0].clone();
         let base=update.config.normalized()?;

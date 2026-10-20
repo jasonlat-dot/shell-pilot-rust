@@ -1,7 +1,7 @@
 # Codex CLI 上下文与决策机制：ShellPilot Rust Agent 参考方案
 
 研究日期：2026-10-13。实际读取官方 openai/codex 的 Rust 源码，固定提交 f82e36592278a0a782fb0d0fc97e5fa10e832ac2，并核对 OpenAI Docs。源码参考副本位于 E:/project/ai-ssh/artifacts/codex-reference；未运行其代码。
-本文件是设计建议，本轮未修改 Java/Rust Agent 的生产行为，未调用真实模型、连接用户远端或打包。Rust Agent 仍属待迁移的阶段 5。
+本文件保留 2026-10-13 的源码研究与设计建议；当时尚未实施 Rust Agent。当前实施状态见 [AGENT_PROGRESS.md](AGENT_PROGRESS.md)，不要把本研究快照当作最新迁移进度。研究本身未修改生产行为、调用真实模型、连接用户远端或打包。
 
 ## 1. 可核实的 Codex 机制
 

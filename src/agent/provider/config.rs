@@ -10,6 +10,7 @@ pub enum ProviderKind {
     OpenAiCompatible,
     OpenAiResponses,
     AnthropicMessages,
+    GoogleGemini,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -203,6 +204,9 @@ impl ModelConfig {
         Ok(self)
     }
     pub fn endpoint(&self) -> Result<Url> {
+        super::adapter::select(&self.provider).endpoint(self)
+    }
+    pub(super) fn relative_endpoint(&self) -> Result<Url> {
         let base =
             Url::parse(&self.base_url).map_err(|_| ModelError::Invalid("invalid API base URL"))?;
         let endpoint = base

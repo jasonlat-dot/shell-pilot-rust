@@ -1,5 +1,6 @@
 //! Persistent context, native model adapters, text turns and journaled SSH tool turns.
 //! Desktop tools require explicit target binding and durable human approval.
+pub(crate) mod strict_json;
 pub mod approvals;
 pub mod extensions;
 pub mod attachments;

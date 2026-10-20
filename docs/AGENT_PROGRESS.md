@@ -1,5 +1,53 @@
 # Rust SSH Agent 实施清单与续接入口
 
+## 当前状态总览（2026-10-20，以本节覆盖下方历史阶段描述）
+
+- 当前版本 v0.2.2，数据库 schema 24；前端 `master`，Rust `main`。A/B/C、D1–D5、E1–E3、E5/E6 已完成；E4 用户取消，不做旧 Java 数据导入。旧章节中的 test-rust-ui、schema 19/21、“下一项 E1/E2”和当时未提交状态仅为历史记录。
+- 已提交基线：前端 `84754ff`，Rust `1e0d8fa`。支持多模型渠道、筛选/搜索/置顶/创建顺序、会话内模型切换、失败原因持久保存与恢复；数据库 schema 22/23/24 分别用于原生续接、失败/切换、多模型渠道。
+- 已接入 Chat Completions、Responses、Anthropic Messages、Google Gemini GenerateContent；四者支持对话和工具续聊（Google 完成本地定向验收，真实供应商待配置后联调）。Responses 使用其原生计数/远端整理能力，其他协议使用本地语义摘要；推理/签名原样续接并按协议/模型/接口/凭据隔离。此前“Messages 仅常规模式”“Responses 不支持工具”“Gemini 仅兼容入口”属于旧阶段边界，Google 原生接入进度见下项。
+- 日志当前为 `logs/agent/YYYY-MM-DD/<traceId>.log`（逐行 JSON），默认 INFO / 7 天，级别和保留天数可即时修改；包含用户与助手正文。旧 .json/.jsonl 不批量改名，仅兼容过期清理。Windows 调试发送栈溢出已用 Box::pin 隔离状态机并完成小栈回归。
+- 既有阶段验证记录分别见对应最新功能文档，历史 E6 验收不能替代新供应商的真实接口/桌面验收。v0.2.2 升级与发布说明已准备；签名安装包、覆盖安装和在线更新须以实际产物独立验收，当前不打包。
+- 最新工作：Google Gemini 原生接入已完成本地定向验收；本轮补充 SSH 连接等待通知生命周期与前端超时兜底，详见下节。
+
+### 输入框当前模型使用 Google G（2026-10-20，最终图标范围）
+
+- [x] 按最新截图，客户端 `ModelPicker.tsx` 输入框当前模型图标使用供应商默认展示（Google 四色 G）；只有下拉列表的具体 Gemini 模型行使用 model 展示（蓝色星形）。供应商分组与配置卡片保持四色 G。
+- [x] 菜单定向 **5 项**及相关 diff 格式检查通过；同步客户端说明。仅前端展示，不改模型配置或协议；未全量回归、未打包或提交。
+
+### Google 供应商 / Gemini 模型图标区分（2026-10-20，覆盖上一轮图标范围）
+
+- [x] 按用户澄清，供应商分组与配置卡片保留四色 Google G，具体模型行及输入框当前模型恢复原蓝色 Gemini 星形。客户端 `ModelSupplierIcon.tsx` 新增 supplier/model 展示类型，`ModelPicker.tsx` 仅为模型位置指定 model，不影响供应商与其他协议。
+- [x] 图标/模型菜单定向 **9 项**、TypeScript、相关 diff 格式检查通过；更新客户端说明。仅前端和文档，未全量回归、未 GUI 视觉验收、未打包或提交，保留其他改动。
+
+### Google 供应商图标改为四色 G（2026-10-20）
+
+- [x] 客户端 master：`src/components/ModelSupplierIcon.tsx` 用本地四色 G SVG 替换 Gemini 星形；模型渠道菜单与配置卡片等共用位置同步生效，保持尺寸、装饰性无障碍属性与原有主题容器，不增加依赖或图片网络请求。
+- [x] 图标/菜单定向 **8 项通过**，TypeScript 与相关 diff 格式检查通过。首次旧断言固定 path 的属性顺序，改为按实际 SVG 属性匹配后通过；未全量回归、未实际桌面视觉验收、未打包或提交。仅前端和文档修改，保留已有开发改动。
+
+### Google 首次中转请求 404 排查（2026-10-20，只读定位）
+
+- [x] Trace `cafe7dc4-83eb-47d6-beae-95b00d2a9f46`：11:23:39，googleGemini / gemini-3.8-flash，api-direct.loveapi.top 在约 504ms 返回 HTTP 404，上游 requestId 为 `62fd1ceb-23d5-4987-bc44-16900014e33e`，未开始工具执行。错误日志未给出可用的供应商 code/type，不能仅据此断定模型不存在。
+- [x] 只读查询该配置的非敏感字段（revision 1）：baseUrl 仍为 `https://api-direct.loveapi.top/v1/`，相对路径 models。当前代码实际构造 `/v1/models/gemini-3.8-flash:streamGenerateContent?alt=sse`；Google 官方原生端点前缀为 `/v1beta/models/...`。models 作为本程序相对路径是正确的，优先核对中转的原生基础地址是否应改为 /v1beta/，以及该中转是否开放对应模型与原生协议。
+- [ ] 中转具体路由/模型可用性尚未证实，未将路径差异标记为唯一根因或已修复。未改用户配置、不读取/输出密钥、不发真实 API 请求；仅记录定位结果，没有产品代码改动或测试。
+
+### SSH 连接等待提示按请求结果关闭（2026-10-20）
+
+- [x] 根因：客户端 `src/App.tsx::selectHost` 使用固定 60 秒 Toast，成功/失败后新增通知但未移除等待通知；悬停还会延迟其计时。改为 `src/state/notifications.ts::beginNotice` 为每个操作返回独立关闭函数，`NotificationToast.tsx` 支持 durationMs=0 由操作收尾。成功、失败、取消和超时通过 finally 关闭，不受鼠标悬停影响；重复点击不新增第二条计时等待通知，同名并发请求也不共用通知 ID。
+- [x] `src/state/sshConnectAttempt.ts::open` 使用连接配置 connectTimeout，缺省 10 秒（原生范围 1–300 秒），对 IPC/连接请求添加前端期限与取消竞速；到期取消原 requestId，立即释放连接中状态并显示服务器名及超时/失败原因。正常返回清理计时器与监听，用户取消保持 AbortError、不误报失败；迟到成功会话关闭且不注册页签，原 backendUrl/requestId 始终保持。首次和重连入口都传入各自连接配置的超时值。
+- [x] `tests/ssh-connection-notice.test.mjs` 执行真实 App 函数、SshConnectAttempt 和 Toast 源码，**11 项通过**：成功、服务端失败、自定义/默认超时、取消、迟到清理、同名并发、取消后立即重试、手动关闭、持久/普通 Toast 计时及重复点击。`tests/toast-errors.test.mjs` **3 项通过**，TypeScript、相关 diff 格式检查通过。测试使用模拟 API 和虚拟时钟，无真实 SSH；未全量回归、未实际桌面视觉验收、未运行 Rust 测试或打包。
+- [x] 更新客户端 `docs/operation-feedback.md`；前端改动保留在 master，本轮没有 Rust 生产代码修改。保留此前 Google 接入及用户已有 Cargo.toml / 图标等修改，未提交或推送。
+
+### Google Gemini 原生协议接入（2026-10-20，本地定向验收）
+
+- [x] Rust `src/agent/provider/google.rs` 新增独立 GoogleGemini 策略，`adapter.rs` 注册工厂和通用 endpoint / prepare_stream / finish_on_eof 钩子。共享 HTTP 层只调用策略，不向 Agent 主循环增加 Google 分支；x-goog-api-key、模型方法 URL、generationConfig、systemInstruction、contents、inlineData、functionDeclarations / functionResponse 均在适配器封装。共享超时、取消、大小/预算、权限和未知结果规则不变；无新依赖或数据库迁移，schema 24。
+- [x] `continuation.rs` 保存原生 model parts，严格绑定协议/模型/接口/密钥；保留 thoughtSignature / thought 顺序，不泄露到可见回复或诊断。JSON / 跨字节 SSE、工具续聊、结束后 usageMetadata、STOP 与截断检查接通。`strict_json.rs` 从既有工具 schema 提取重复键拒绝逻辑，Google 解码和 `tool_loop/schema.rs` 复用，不在参数归一化前丢弃歧义。`protocol.rs` 图片预算支持 inlineData。
+- [x] `repository/channels.rs` 用策略归一化后的模型 ID 做成员键和唯一检查，支持 models/xxx 前缀并规范为 xxx；同一渠道不重复保存别名，编辑、换序和重开保持配置 ID。凭据继续加密保存，旧供应商参数与旧配置不自动转换。
+- [x] 前端 master：`src/api/models.ts` / `modelProtocols.ts` 新增 googleGemini 与 Google 兼容目录、地址占位提示及原生输出参数；`agent.ts` 引用统一协议类型。`ModelSupplierIcon.tsx` 本地 Gemini 标志用于配置卡片、供应商和模型菜单；`ModelSettings.tsx` 说明模型 URL 自动拼接。多模型渠道、筛选、模型切换、输入框强度沿用现有流程。默认不发送 thinkingConfig；显式 minimal/low/medium/high 映射 thinkingLevel，较早模型/不支持档位的端点保持默认，不自动重试或降档。
+- [x] 前端定向 **48 项通过**：协议目录、供应商 SVG / Select、渠道保存/恢复/筛选、强度控件和宽窄模型菜单；TypeScript 与最终 Vite 资源构建通过（保留既有大资源块提示）。最终路径提示也由目录驱动，设置页没有新增 Google 供应商条件分支。
+- [x] Rust 定向共 **46 项通过**：供应商单测 24（含 Google 7、Anthropic、OpenAI 工具流与原生绑定），Google 回环集成 5、多模型渠道 6、四协议原生续接 7、Anthropic HTTP/SSE 3、工具 schema 重复键回归 1。Google 覆盖 HTTP/SSE、429/大小/截断/超时/取消、共享加密 Key 重开后两模型的实际 URL/请求头、本地摘要失败不提交/成功提交/后续聊天；四协议切换覆盖 12 个方向的文字/工具共 24 个回环场景，原样签名回传且日志不泄露。
+- [x] 最终桌面原生 `cargo check --offline --tests -j1`、生产库严格 Clippy (`-D warnings`)、新增模块 Rustfmt 与两仓库 diff 格式检查通过。初次前端断言仍按两供应商、Google 测试夹具方法写错，更新后通过；新增 Rust 图片夹具遗漏 detail / 渠道测试误读私有 RuntimeConfig.api_key 的编译错误已修正，凭据验证改为配置/解密成功及实际回环请求头，没有放开生产密钥访问。未将这些初轮错误记作通过。
+- 本地测试仅用临时数据库、测试 Key、回环模型与既有测试执行器，不访问真实 Google/用户 SSH。按 Tabbit 技能尝试浏览器可用页面查询返回路由不可用，未标记实际 GUI 视觉验收完成。Vertex OAuth、Interactions/Live、Google 原生文件上传/托管工具不在本次范围；PDF 仍使用既有文字提取。同步 `MODEL_PROTOCOLS.md`、`CODEX_AGENT_REFERENCE.md` 的历史快照说明、客户端 README 和模型配置文档。未全量回归、未打包或提交推送；退出托盘旧进程并重新运行 npm run tauri dev 载入新 Rust 库。
+
 ### 请求日志后缀调整为 .log（2026-10-19）
 
 - 按用户最新要求，新请求日志使用 `<traceId>.log`，仍逐行追加 JSON 对象。七天保留策略同时兼容 `.log`、旧 `.json` 和 `.jsonl`；既有文件不批量改名。同步两仓库日志路径测试和当前使用说明。
@@ -39,7 +87,7 @@
 - [x] 只读核对本地会话 `e83f53f1-a10e-4446-acd1-66c06480b4c0`：项目“凯平哥”、模型 `deepseek-flash`、Chat Completions。北京时间 17:10:47 开始，17:11:03 失败，保存错误为 `MODEL_HTTP_ERROR`；`ssh_execute` 已完成且退出码为 0，工具结果事件先于失败事件，失败发生于工具结果返回后的模型继续请求。
 - [x] 核对 `src/agent/provider/dispatch.rs` / `transport.rs` 和 `src/agent/chat.rs`：非成功 HTTP 返回仅临时保留状态码，持久会话归并为 `MODEL_HTTP_ERROR`，原始响应状态码与错误正文未持久保存，现有日志不能进一步区分 400 / 429 / 5xx。最新模型配置修订为 5、更新时间 17:18:52，晚于报错；本地留存信息不能完整恢复当时配置。
 - [x] 经用户分两次明确授权，使用当前已存 DeepSeek 凭据向原官方地址发起 3 次非流式及 3 次流式合成请求，均 HTTP 200；仅合成工具回合，不执行 SSH、不发送真实命令输出、不修改应用数据、不输出密钥。首个合成响应没有非空 `reasoning_content`，遗漏该字段仍成功，故不能将本次真实失败断定为缺少思考回传。官方文档虽要求思考工具回合回传该字段，但当前探测未复现这个错误。
-- [ ] 原始 HTTP 失败的具体状态/上游原因仍未证实。后续需补充安全的 HTTP 状态持久记录与界面提示，再对实际失败请求进行定位；`reasoning_content` 透传缺口仅为待验证兼容问题，不标为本次根因或已修复。
+- [ ] 原始 HTTP 失败的具体状态/上游原因仍未证实，旧请求丢失的信息不能由新代码补回。后续已完成安全 HTTP 状态日志、Trace ID 界面提示及供应商原生推理续接；再出现失败可按新 Trace 定位，但不能据此追认本次原始根因或声称其已复现修复。
 - 本轮仅排查并记录进度，未改产品代码、未重发用户请求或远端命令，未运行全量或打包。
 
 ### 模型地址编辑与全局 Toast 错误反馈（2026-10-19）
@@ -477,9 +525,9 @@
 - Rust ModelRepository::runtime 在 requireApiKey=false 时不解密、不返回运行密钥，确保关闭认证后 HTTP 请求不携带已保存的 Bearer token；加密凭据保留，重新启用时复用。未修改数据库结构。
 - 用户随后要求简单测试保存与认证：前端模型设置 9 项、Rust agent_models 21 项及 TypeScript 检查通过。使用虚拟密钥、临时数据库和本机 HTTP 服务确认留空保留、输入替换、关闭认证不发送 Authorization、重新启用恢复密钥、替换后重启仍使用新密钥；同时验证公开配置不回显密钥和变更地址必须显式处理原密钥。调整旧测试以匹配工具默认启用及禁用认证不解密的现行行为。未做构建或 GUI 验证；未提交。
 
-更新日期：2026-10-19。状态：A/B/C 当前文字阶段、D1–D5、E1–E3、E5 和 E6 已完成；schema 21。E4 已按用户要求取消，不再实施。E5 首次 A 17/18、B 18/18 的原始统计保留；E6 的回归、真实服务及压力复测结果和用户 GUI 确认见顶部验收记录。后续按用户需求优化产品，用户自行打包。
+当前状态已更新至文首 2026-10-20 总览（v0.2.2 / schema 24）；下述阶段状态与测试数字保留为历史证据。E4 已按用户要求取消，不再实施。E5 首次 A 17/18、B 18/18 的原始统计保留；E6 的回归、真实服务及压力复测结果和用户 GUI 确认见顶部验收记录。后续按用户需求优化产品，用户自行打包。
 最新桌面执行模式：工具使用绑定终端的当前 POSIX Shell（继承已完成的 sudo 切换），工具输出走每次调用专属的描述符/SSH 收集通道；终端展示真实命令、结果和真实提示符，隐藏内部协议。下文早期“独立 exec 不继承终端”记录属于历史阶段，以末尾最新章节为准。
-用户要求：参考 Codex CLI 优化上下文和工具决策；先列清单，每完成一项更新标记，供换窗口后续接。当前不打包。需要修改前端的阶段同步修改 test-rust-ui。
+用户要求：参考 Codex CLI 优化上下文和工具决策；先列清单，每完成一项更新标记，供换窗口后续接。当前不打包。前端按用户最新明确要求在 master 同步修改，覆盖早期 test-rust-ui 约定。
 源码参考与设计依据：[CODEX_AGENT_REFERENCE.md](CODEX_AGENT_REFERENCE.md)。本文件是进度唯一入口，完成标记必须有代码与验证证据，不以“已设计”替代“已实现”。
 
 ### 最新工作区：工具默认启用与统一授权入口（2026-10-15，未验证）
@@ -511,14 +559,14 @@ Rust 重构交接、已完成工作与运行方式见 [WORK_HANDOFF_2026-10-14.m
 
 ## 工作区与约束
 
-- 本轮 E2 基线：客户端 test-rust-ui/098df3b，Rust main/8097e04；本次 E2 前后端和文档保留在未提交工作区，schema 19，无安装包。旧完成记录中的“本轮未提交”描述对应当时状态。
+- 历史 E2 基线为客户端 test-rust-ui/098df3b、Rust main/8097e04（schema 19）；不是当前工作区状态。当前分支、schema 和已提交基线见文首总览。
 - 项目、参考源码和工具位置由本机环境决定；跨电脑续接时按实际位置核对 Cargo 依赖，不沿用旧电脑的绝对路径。
-- 当前源码未重新打包；已有 0.4.0 安装包不能代表最新功能。
+- 本轮不打包；已有安装包不代表本轮新增 Google 源码，v0.2.2 发布准备与实际包级验收分别记录。
 - 保留各仓库已有未提交变更；不连接用户远端、不执行实际变更命令来做测试。
 - 里程碑、测试结果和续接状态统一维护本文件，不再额外创建逐阶段验证文档；commit note 直接发给用户，不保存到文档。
 - SSH 任务绑定目标，切换 UI 页签不能改变在途任务目标。权限来自可信应用状态，模型摘要不产生权限。
 - 当前主要验证是临时数据库/回环协议测试；真实模型、完整 GUI 和用户远端验证单独记录。
-- 后续前端变更需要同时做好功能和样式，优先复用客户端 main 分支的设计系统、Select/Ui 控件与主题参数；相关界面需检查明暗主题、窄窗口和实际交互。
+- 后续前端变更需要同时做好功能和样式，优先复用客户端 master 分支的设计系统、Select/Ui 控件与主题参数；相关界面需检查明暗主题、窄窗口和实际交互。
 - 最新 UI 要求覆盖此前撤销布局时的约束：参考用户新截图，左侧上下分区放置会话历史和 SSH 连接，中央 Agent 对话，右侧终端；本地工作区、模型设置、外观和关于与“终端”同级放在左侧主导航，取消设置页内重复分类栏。只调整页面，沿用现有业务逻辑。
 
 ## 实施清单
@@ -565,11 +613,9 @@ Rust 重构交接、已完成工作与运行方式见 [WORK_HANDOFF_2026-10-14.m
 
 ## 当前进度与下一项
 
-A/B/C 当前文字阶段、D1–D5、E1 附件及 E2 长期记忆已完成本地产品接入与定向联验。本轮基于 Rust main/8097e04、客户端 test-rust-ui/098df3b，schema 19，包含长期记忆与对话标题元数据；没有新增独立服务或监听端口，改动未提交、未推送、未打包。
+以文首“当前状态总览”及最新功能记录为准：A/B/C、D1–D5、E1–E3、E5/E6 已完成，E4 取消；当前 schema 24，前端 master / Rust main。下一项为本轮 Google Gemini 原生协议接入与定向验证，不再重复实施 E1/E2。
 
-E2 已接通用户确认保存、跨会话/模型的全局偏好、精确服务器范围的经验、来源/更新时间及前台管理。记忆独立于原始事件和任务检查点，按范围和预算重新注入，不能产生执行权限或冒充实时状态。Rust 194 项通过、既有 POSIX 1 项忽略，前端 48、原生 IPC 专项 1 项通过；首轮旧夹具失败及复测过程见顶部 E2 记录，不冒充一次全项目或真实服务验收。
-
-E5 与 E6 已完成并勾选，报告保留 E5 首次 35/36 通过及唯一失败项的独立补测证据；E6 记录完整回归、真实服务、10/10 长历史压力复测和用户 GUI 确认。E4 已取消，后续按用户需求处理产品优化。E3 的单层子任务、MCP 与 Skills 已接通；Responses 工具协议、本机通用命令及后台/递归协作仍未开放；扫描 PDF/OCR/Office 和拖入上传尚未接通，剪贴板图片及 Windows 复制文件已在 E1 补充中实现。用户自行打包。
+已知产品边界：扫描 PDF/OCR/Office、拖入上传、本机通用命令、后台/递归子任务仍未开放；子任务/MCP/Skills 受现有授权与目标约束。Responses 工具续聊已经接入，不再按早期阶段视为只支持文字。用户自行打包；新供应商真实接口与包级升级验收单独记录。
 
 ## 验证与完成记录
 
