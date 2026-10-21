@@ -32,6 +32,9 @@ pub struct Stats {
     pub collectors: AtomicUsize,
     pub resource_output: Mutex<Option<Vec<u8>>>,
     pub resource_quiet: std::sync::atomic::AtomicBool,
+    pub echoes: Mutex<Vec<Option<u32>>>,
+    pub completion_restored: AtomicUsize,
+    pub completion_release: tokio::sync::Notify,
 }
 #[derive(Clone, Default)]
 pub struct Spec {
@@ -39,6 +42,9 @@ pub struct Spec {
     pub open_delay: Duration,
     pub reject_pty: bool,
     pub reject_shell: bool,
+    pub completion_unsupported: bool,
+    pub completion_wait_restore: bool,
+    pub completion_restore_failure: bool,
     pub max_sessions: Option<usize>,
 }
 struct TestServer {
@@ -58,6 +64,7 @@ impl server::Server for TestServer {
             channels: HashSet::new(),
             collectors: HashMap::new(),
             shell_users: HashMap::new(),
+            silent_channels: HashSet::new(),
         }
     }
 }
@@ -68,6 +75,7 @@ struct TestHandler {
     channels: HashSet<ChannelId>,
     collectors: HashMap<String, ChannelId>,
     shell_users: HashMap<ChannelId, String>,
+    silent_channels: HashSet<ChannelId>,
 }
 impl Drop for TestHandler {
     fn drop(&mut self) {
@@ -145,10 +153,13 @@ impl server::Handler for TestHandler {
         rows: u32,
         _: u32,
         _: u32,
-        _: &[(Pty, u32)],
+        modes: &[(Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         self.stats.sizes.lock().unwrap().push((cols, rows));
+        let echo=modes.iter().find(|(mode,_)|*mode==Pty::ECHO).map(|(_,value)|*value);
+        self.stats.echoes.lock().unwrap().push(echo);
+        if echo==Some(0){self.silent_channels.insert(channel);}
         if self.spec.reject_pty {
             session.channel_failure(channel)?;
         } else {
@@ -274,6 +285,36 @@ impl server::Handler for TestHandler {
     ) -> Result<(), Self::Error> {
         self.stats.inputs.lock().unwrap().push(data.to_vec());
         let text = String::from_utf8_lossy(data);
+        if text.starts_with(" if [ -n ") && text.contains("__spc_setup") {
+            let token=text.split("spc;").nth(1).unwrap().split(';').next().unwrap();
+            let kind=if self.spec.completion_unsupported {"U"}else{"R"};
+            let marker=format!("\x1b]777;spc;{token};{kind}\x07");
+            if !self.silent_channels.contains(&channel){session.data(channel,data.to_vec())?;}
+            session.data(channel,marker[..8].as_bytes().to_vec())?;
+            session.data(channel,marker[8..].as_bytes().to_vec())?;
+            if self.spec.completion_unsupported {
+                self.silent_channels.remove(&channel);self.stats.completion_restored.fetch_add(1,Ordering::SeqCst);
+                session.data(channel,format!("\x1b]777;spc;{token};A\x07").into_bytes())?;
+            }
+            return Ok(());
+        }
+        if let Some(token)=text.strip_prefix("__shellpilot_test_completion_nonce=").and_then(|s|s.split(';').next()) {
+            session.data(channel,format!("\x1b]777;spc;{token};I\x07\x1b]777;spc;{token};P;1\x07").into_bytes())?;
+            if self.spec.completion_restore_failure {
+                session.data(channel,format!("\x1b]777;spc;{token};F\x07").into_bytes())?;
+            } else if self.spec.completion_wait_restore {
+                let handle=session.handle();let stats=self.stats.clone();let token=token.to_string();
+                tokio::spawn(async move {
+                    stats.completion_release.notified().await;stats.completion_restored.fetch_add(1,Ordering::SeqCst);
+                    let _=handle.data(channel,format!("\x1b]777;spc;{token};A\x07").into_bytes()).await;
+                });
+            } else {
+                self.silent_channels.remove(&channel);self.stats.completion_restored.fetch_add(1,Ordering::SeqCst);
+                session.data(channel,format!("\x1b]777;spc;{token};A\x07").into_bytes())?;
+            }
+            return Ok(());
+        }
+
         if text == "sudo -i\r" || text == "sudo -i\n" {
             self.shell_users.insert(channel, "root".into());
         }

@@ -2,6 +2,7 @@ use super::*;
 
 pub(super) struct Qwen;
 impl SupplierPolicy for Qwen {
+    fn completion_effort(&self, _: &ProviderKind) -> Option<ReasoningEffort> { Some(ReasoningEffort::None) }
     fn requires_thinking_signature(&self) -> bool {
         false
     }

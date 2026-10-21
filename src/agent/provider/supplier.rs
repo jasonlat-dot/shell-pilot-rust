@@ -20,6 +20,10 @@ pub enum SupplierKind {
 }
 
 pub(super) trait SupplierPolicy: Sync {
+    /// Request-local low-latency preset; ordinary chat options are untouched.
+    fn completion_effort(&self, _provider: &ProviderKind) -> Option<ReasoningEffort> {
+        None
+    }
     fn normalize(&self, config: &mut ModelConfig) -> Result<()> {
         if config.reasoning_effort == Some(ReasoningEffort::Enabled) {
             return Err(ModelError::Invalid(
@@ -115,6 +119,7 @@ pub(super) fn canonical(supplier: Option<SupplierKind>) -> Option<SupplierKind> 
     })
 }
 impl SupplierPolicy for Glm {
+    fn completion_effort(&self, _: &ProviderKind) -> Option<ReasoningEffort> { Some(ReasoningEffort::None) }
     fn requires_thinking_signature(&self) -> bool {
         false
     }
@@ -159,6 +164,7 @@ impl SupplierPolicy for Glm {
     // configured origin, prefix and protocol authentication for model discovery.
 }
 impl SupplierPolicy for DeepSeek {
+    fn completion_effort(&self, _: &ProviderKind) -> Option<ReasoningEffort> { Some(ReasoningEffort::None) }
     fn requires_thinking_signature(&self) -> bool {
         false
     }

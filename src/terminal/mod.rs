@@ -1,4 +1,5 @@
 pub(crate) mod agent_exec;
+pub mod completion;
 mod host_key;
 mod http;
 mod output;
@@ -81,6 +82,8 @@ pub struct OpenResult {
     pub session_id: String,
     pub connection_id: String,
     pub initial_output: String,
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub completion_nonce: Option<String>,
 }
 
 // Close the actual wire if russh has spawned a handshake task and the
@@ -364,7 +367,11 @@ impl TerminalManager {
     }
 
     pub async fn connect(&self, request: OpenRequest) -> Result<OpenResult, Error> {
+        self.connect_with_completion(request, None).await
+    }
+    pub async fn connect_with_completion(&self, request: OpenRequest, integration: Option<completion::ShellIntegration>) -> Result<OpenResult, Error> {
         Self::validate_ids(&request.connection_id, &request.request_id)?;
+        if let Some(setup)=integration.as_ref(){setup.validate()?;}
         let cols = request.cols.unwrap_or(120);
         let rows = request.rows.unwrap_or(24);
         dimensions(cols, rows)?;
@@ -428,13 +435,24 @@ impl TerminalManager {
                 };
                 let mut initial = Vec::new();
                 let channel = opening.0.as_mut().unwrap();
+                let silent_completion = integration.is_some()
+                    && connection.startup_command.as_ref().is_none_or(|s| s.is_empty());
+                // Suppress kernel AND Readline echo from the first byte of a new Shell.
+                // The completion loader restores echo and acknowledges it before publishing.
+                let completion_modes = [(russh::Pty::ECHO, 0), (russh::Pty::ECHONL, 0)];
+                let modes = if silent_completion { &completion_modes[..] } else { &[] };
                 channel
-                    .request_pty(true, "xterm-256color", cols, rows, 0, 0, &[])
+                    .request_pty(true, "xterm-256color", cols, rows, 0, 0, modes)
                     .await
                     .map_err(|_| Error::Ssh)?;
                 confirmation(channel, &mut initial, self.settings.buffer_bytes).await?;
                 channel.request_shell(true).await.map_err(|_| Error::Ssh)?;
                 confirmation(channel, &mut initial, self.settings.buffer_bytes).await?;
+                let completion_nonce = if connection.startup_command.as_ref().is_none_or(|s|s.is_empty()) {
+                    if let Some(setup)=integration.as_ref() {
+                        if completion::install(channel,&mut initial,setup,self.settings.buffer_bytes).await? {Some(setup.nonce.clone())} else {None}
+                    } else {None}
+                } else {None};
                 if let Some(command) = connection
                     .startup_command
                     .as_ref()
@@ -509,6 +527,7 @@ impl TerminalManager {
                     session_id,
                     connection_id: request.connection_id.clone(),
                     initial_output,
+                    completion_nonce,
                 })
             };
             let result = tokio::time::timeout(

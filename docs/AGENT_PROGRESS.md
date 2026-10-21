@@ -2,6 +2,62 @@
 
 ## 当前状态总览（2026-10-21，以本节覆盖下方历史阶段描述）
 
+### 终端路径灰字重复修正（2026-10-21，前端定向验证）
+
+- [x] 复现截图条件：`cat get-docker.sh ` 尾随空格被视为下一参数，原路径候选未排除已输入文件，唯一匹配再次推荐同一文件。客户端 `src/state/terminalCompletionLocal.ts::pathQuery / pathSuffix` 在公共前缀计算前排除已有路径参数，按当前目录统一相对/绝对/家目录及转义/引号路径；只做字符串归一化，不解析符号链接、不读取文件正文，不限制手动重复输入。
+- [x] 客户端 `tests/terminal-completion-local.test.ts` 新增 2 项、`tests/terminal-completion.test.ts` 新增 1 项：旧实现均复现失败，修复后通过。覆盖完整文件/尾随空格/再输入片段、不同文件仍可补全、首次空参数、路径别名和空格、接受后缀与远端 Tab 后快照、缓存目录去重；没有剩余路径候选时不请求 AI 兜底。
+- [x] 前端相关回归 **62 项通过**，TypeScript、Vite 资源构建通过（既有大资源块提示），使用说明同步在客户端 `docs/terminal-completion.md`。本轮仅前端候选代码及测试/文档变更，Rust 生产代码和 IPC 不变，不重跑 Rust；未打包，保留各仓库已有修改。
+- 验证边界：本地合成目录、状态/DOM 测试与 Bash 内置函数，未使用用户 SSH 或真实模型；真实终端显示仍待更新前端后确认。
+
+### 自动接入初始化加载命令回显修正（2026-10-21，协议定向验证）
+
+- [x] 用户真实截图显示自动接入加载命令重复回显并出现显示错乱；原实现只静默读取完整载荷，加载命令仍在开启回显的 PTY 中发送。Rust `terminal/mod.rs::connect_with_completion` 现仅对启用自动补全且没有自定义 startup_command 的新会话，在 request_pty 时设置 ECHO=0 / ECHONL=0，抑制从 Shell 启动第一字节起的输入回显；普通连接、关闭补全及自定义启动流程保持默认模式，不通过清屏掩盖输出。
+- [x] `terminal/completion.rs::install` 加载结束显式 stty echo，并通过私有 A 标记确认已恢复后才发布会话；收到 I 不再提前交给用户。不支持的 Shell 同样等待恢复，恢复失败通过 F 标记返回连接错误并关闭通道，超时/失败不重放载荷，避免用户拿到关闭输入回显的终端。正常登录信息保留。
+- [x] `tests/support/mod.rs` 模拟 PTY 回显、延迟恢复和恢复失败；`tests/terminal.rs` **4 项 completion_ 回归通过**，覆盖自动/关闭/自定义启动的模式选择、登录输出保留且无加载代码、非 Bash 回退、必须等待恢复确认、恢复失败关闭通道且不重发。手动重试入口仍采用前端短命令，可能回显一行；本轮修复针对截图中的自动接入。
+- [x] 本轮生产库严格 Clippy（-D warnings）、新增 Rustfmt 与两仓库 diff 格式检查通过；未改前端生产代码和 IPC 字段，未打包。
+- 验证范围：回环 SSH 协议与模式/时序断言，不使用用户 SSH 凭据、不访问真实上游；真实服务器视觉效果仍待更新应用并重连后确认。前端生产代码与 IPC 签名未修改，本轮不重跑模型/前端全量测试、不打包；保留各仓库已有其他修改。
+
+### 终端补全隐私收敛与自动接入（2026-10-21，本地定向验收完成；真实联调待验收）
+
+- [x] 客户端 `TerminalCompletionSettings.tsx` / `terminalCompletionPreferences.ts` 将总开关、AI 续写、发送目录拆分；新设置 AI 默认关闭，目录默认不发送，已有已开启的 AI 选择保留。`terminalCompletionLocal.ts` / `terminalCompletion.ts` 实现路径与本次手动命令历史优先，AI 无需参与本地候选；不读取正文、.bash_history 或 AI 对话，不把历史清单/目录清单作为模型上下文。明显凭据过滤、候选转义与引号闭合、目录缓存 8 项/3 秒、手动历史 100 条且仅内存。验证：本地候选/隐私/设置/连续输入专项与相关终端回归共 **59 项前端测试通过**，包括真实 Bash 内置函数编码与 history 钩子；用户调出历史后成为当前输入时仍遵守 AI 当前输入发送设置，过滤不承诺完整脱敏。
+- [x] Rust `terminal/completion.rs` / `TerminalManager::connect_with_completion`、原生 `backend_ipc.rs` 和前端 `terminalApi.connect` / `RemoteTerminal` 接通总开关驱动的新 SSH 会话自动接入；已有会话不自动注入，开启后重连生效。支持 Bash 4.4+ emacs，私有 nonce / 静默读取确认后才发送脚本；不支持的 Shell 返回未接入。配置自定义 startup_command 的连接跳过自动安装，保留顶部“重新接入 Bash 补全”手动重试入口。验证：回环 SSH 自动接入/普通关闭/不支持回退/自定义启动跳过 **2 项 Rust 测试通过**，实际原生连接分发/认证前校验亦由 IPC 测试覆盖。
+- [x] Rust `terminal/completion.rs::completion_entries` 复用终端认证传输开受限 SFTP 通道，只枚举名称与类型；校验原会话、用户、连接状态和路径，受现有通道配额、256 条结果、1.5 秒总期限约束，不执行命令或自动提权。前端目录查询和 AI 请求均绑定终端创建时的原工作区。验证：回环 SFTP 目录权限/用户隔离/关闭后拒绝/不提权 **1 项 Rust 测试通过**，前端跨工作区请求绑定测试通过。
+- [x] `terminalCompletionView.ts` 使用 xterm 公共同步输出模式合并 Readline 快照重绘，返回后短暂等待输出稳定再释放，最长 1.3 秒保护；实际坐标未变不清空灰字。`terminalCompletion.ts::rendered` 对用户继续输入匹配建议的情况保留剩余灰字、回显后重定位，不重复调用模型。验证：DOM/状态专项通过，包括同步模式释放和重复解析不隐藏，真实视觉效果尚未验收。
+- [x] Rust `agent/completion.rs` 在未允许目录时省略 cwd 字段，继续采用无工具、无历史写入的短后缀请求。`backend_ipc_tests.rs` 实际 **2 项桌面 IPC 测试通过**：自动接入只安装一次/认证前参数检查/目录查询用户边界；模型上下文省略目录、拒绝 history 字段、原配置不变、预取消不请求和 Trace 只记元数据。四协议/DeepSeek/取消/超时模型回归 **3 项 Rust 测试通过**；本轮 Rust 专项合计 6 项，桌面 IPC 另 2 项。
+- [x] 最终 TypeScript、Vite 资源构建、生产库严格 Clippy（-D warnings）、新增 Rustfmt 与两个仓库 diff 格式检查通过。使用说明重写在客户端 `docs/terminal-completion.md`，模型设置文档追加新边界；版本 v0.2.4 / schema 24 不变，不打包、不提交或推送，保留既有和工作期间出现的其他文件变更。
+- 验证边界：仅本地 Bash 内置函数、模拟 DOM、回环 SSH / SFTP / 模型、测试 Key 和一次性数据库，未连接用户 SSH 或调用真实上游。最新完整载荷在本地 Windows ConPTY / Git Bash 实验中未在等待期限内确认，未计为通过；括号粘贴实验未改善，已撤回，保持现有静默加载方式。该实验不等于 Linux SSH 验收。Tabbit 创建任务后 Target.createTarget 无法派发，未打开页面/截图，已 finish；独立模拟 Vite 1432 已停止，用户开发进程未终止。真实 SSH 初始化、模型延迟与闪烁视觉效果仍待验收。
+
+### Bash 补全初始化回显修正（2026-10-21）
+
+- [x] 修正用户反馈的整段初始化函数铺满终端：客户端 `terminalCompletionBash.ts` 新增短加载命令，Bash `read -e -s` 私有 nonce 就绪确认后，`terminalCompletion.ts` 才发送完整载荷。静默读取最多 10 秒，Bash 在完成/超时/中断后恢复终端状态；前端 12 秒未确认时提示重试。普通输入在初始化期间拦截，Ctrl+C 允许取消，重复初始化/回执与迟到就绪不重复发送脚本。保留短命令本身的正常回显，不清空或隐藏既有终端内容。
+- [x] `RemoteTerminalView.tsx` 增加成功/失败/取消 Toast 和初始化说明，模拟夹具、状态及浮层测试更新；使用说明在客户端 `docs/terminal-completion.md`。服务端生产代码与凭据使用流程未修改。
+- 验证：本轮前端补全/菜单/复制/重连定向回归 31 项通过，TypeScript 通过；一次性本地 ConPTY + Git Bash 使用生产生成的完整脚本，成功、等待超时、Ctrl+C 三种路径均通过，脚本不回显且键盘回显恢复。最初普通 read 在 Git Bash 直接 EOF，改用 Readline 静默读取；慢速本地控制台约 8.5 秒，故等待设为 10 秒。未连接用户 SSH、未调用上游模型、未打包；真实 Linux SSH 和 WebView 视觉仍待验收，不能将本地结果标为远程联调通过。
+
+### 终端智能补全第一版（2026-10-21，本地定向验收；真实联调待验收）
+
+- [x] 前端 master 新增 `TerminalCompletionSettings.tsx` / `terminalCompletionPreferences.ts`：模型设置顶部可独立选择现有可用模型、默认关闭、300/500/800/1000ms 触发延迟、刷新模型及保存失败 Toast；不修改聊天配置、不保存 Key。`RustBackendSettingsDialog.tsx` 添加伸缩容器，保持原模型列表可滚动。
+- [x] `terminalCompletion.ts` 独立状态机管理每个终端的提示符/编辑快照、版本、计时器、取消与过期回执；`terminalCompletionView.ts` 使用 xterm 公共 parser / buffer / cursor 事件和独立 DOM 灰字层，不写入 xterm 缓冲区。右方向键只在有效建议时接受后缀，不追加回车；Esc 隐藏，Tab/复制/粘贴/重连及无建议时原键行为保持。失焦/隐藏、滚动/选区、输入法组合、备用缓冲区、行中/折行、断线时暂停或撤销建议。
+- [x] `terminalCompletionBash.ts` 提供显式初始化的会话级 Bash 4.4+ emacs 集成：保留原 PROMPT_COMMAND / PS0，私有 nonce、执行/提示符标记与 Readline 快照读取真实 READLINE_LINE / POINT 和 PWD；重装不重复挂钩、临时 REPLY 隔离，不修改启动配置或写脚本文件。通过顶部 `TerminalMenu.tsx` / `RemoteTerminalView.tsx` 在空命令提示符手动初始化；关闭补全停止请求，钩子保留到 Shell 结束。第一版不根据屏幕猜命令，不支持 Zsh/Fish/本地 CMD、多行/行中替换；Shell 查询 1.2 秒失联后停止探测并提示重装。
+- [x] Rust `agent/completion.rs` 与客户端 `agent/terminal_completion` IPC 接通受限无工具模型请求，复用原协议、用户隔离与已存加密 Key，不进入 Agent 工具循环、不执行 SSH 或写会话历史。`ModelClient::for_terminal_completion` / `SupplierPolicy::completion_effort` 按策略设置请求局部参数：64 输出 tokens、两秒总期限、64 KiB 响应、四并发；支持处关闭思考，其余不向未知模型强加档位。前缀/目录限制 512/1024 bytes，返回只允许最多 256 bytes 单行后缀，拒绝控制字符、代码围栏、截断响应；保留前导空格和原配置。
+- [x] 独立补全 Trace 贯穿 IPC 与模型请求，复用日期目录、级别和保留设置；仅记录元数据、耗时与状态，命令/目录/建议正文及 Key 不落补全日志。用户开启时明确当前命令和目录发送给所选模型，不读取整屏/历史/文件；明显凭据参数跳过，不能承诺检测全部敏感内容。
+- [x] 前端相关回归 **81 项通过**（新增状态/偏好/Bash 内置函数 8、设置 2、浮层适配 1、终端菜单 1，及模型设置/协议/复制/重连回归）；TypeScript 与 Vite 前端资源构建通过，未构建安装包。Rust `cargo test --lib completion` **6 项通过**（新增输入/输出和策略 3、既有相关 3），`tests/terminal_completion.rs` **3 项通过**，覆盖 Chat / Responses / Messages / Gemini、已存凭据、原配置不变、DeepSeek 禁用思考、拒绝多行、取消与超时不重试；原生 IPC `terminal_completion_ipc_is_stateless_cancelable_and_uses_metadata_only_trace` **1 项通过**，验证返回后缀、模型配置不变、用户隔离、预取消不请求、Trace 脱敏。最终生产库严格 Clippy（-D warnings）、新增 Rustfmt 和两仓库 diff 检查通过。
+- [x] 使用说明与后续优化写入客户端 `docs/terminal-completion.md`，模型文档增加入口；生产代码版本仍 v0.2.4 / schema 24，不做迁移。包含原生代码，需完全退出托盘后重新运行 npm run tauri dev，不能只刷新前端。
+- 验证边界：仅合成上下文、回环模型服务、一次性数据库/测试 Key 和本地 Bash 内置函数；未访问真实供应商/用户 SSH，未验收真实延迟、SSH Readline 和 WebView 视觉。Tabbit 已创建任务但 Target.createTarget 无法派发，已正常 finish；本地 WinPTY 全链路实验未得到输入回执，不计为通过。保留纯模拟浏览器夹具 `tests/fixtures/terminal-completion.html` 供后续独立端口验收。未全量回归、打包、提交或推送，保留客户端既有 Cargo.toml 换行差异。
+- 后续优化优先级：真实 SSH / 模型延迟联调；自动集成与卸载；Zsh/Fish；局部历史候选/版本化缓存和连接池；逐词接受、行中/多行补全。现有 E4 取消状态不变，不展开无关任务。
+
+
+### 本机拉取与当前任务同步（2026-10-21，以本节作为最新续接快照）
+
+- [x] 用户要求同步最新代码：前端保持 master，从 328742e 快进至 **68bf54f**（11 个提交），远程 origin/master；Rust 保持 main，从 0c05773 快进至 **3756e8f**（9 个提交），远程 github/main。拉取后两者相对跟踪分支 ahead/behind 均为 0/0，无合并提交、分支切换或代码覆盖。
+- [x] GitHub 直连失败后，读取 Windows 当前启用的本地代理 127.0.0.1:7890，仅通过本次命令 git -c http.proxy 使用并成功拉取；没有修改全局 Git、系统代理或网络安全设置。开始时两个仓库均干净；拉取后客户端 src-tauri/Cargo.toml 出现仅换行格式差异（规范化后与 HEAD 内容相同），保持原样；本轮仅另改本进度文档。
+- [x] 实际源码版本已为 **v0.2.4**：前端 package.json、src-tauri/tauri.conf.json、src-tauri/Cargo.toml 与 Rust Cargo.toml 一致；数据库仍为 schema 24。下方 v0.2.2/0.2.3、“计划随 v0.2.4 发布”及旧提交基线为当时记录；本次只确认源码与 docs/releases/v0.2.4.md，不推断 GitHub Release、安装包或当前运行二进制的版本。
+- [x] 供应商目录核对：原 OpenAI、Anthropic、Google、DeepSeek 之外，新增 GLM、Qwen、Kimi、Grok、Ollama，沿用独立策略与协议 adapter。代码位置：前端 api/modelProtocols.ts，Rust agent/provider/supplier.rs 及 supplier/{qwen,kimi,grok,ollama}.rs。模型异常隔离通过 ModelSettings.tsx 的 channelReport 和 repository/channels.rs::channel_report 接通，健康模型继续可用。
+- [x] 会话功能核对：App.tsx 与 state/conversationRuns.ts / nextConversationModels.ts 接通后台运行及下一轮模型选择；运行中编辑配置或更换模型不覆盖本轮，后续请求刷新绑定。agent/context_status.rs 与 AgentContextStatus.tsx 保留上次用量并标记 usageStale，首次新测量后替换；仅用于显示，不放宽实际预算。
+- [x] 终端与外观核对：components/TerminalResources.tsx、state/terminalResources.ts、Rust terminal/resources.rs / resources.sh 接通 Linux/WSL SSH 资源采样；state/themes.ts 提供柔光白、暮雾灰、夜幕黑，并有终端配色/壁纸代码块优化。既有顶部终端菜单与断线按键重连继续保留。
+- [x] 之前本对话改动已在最新源码中：Google 默认仍为 /v1beta，DeepSeek 默认 /v1；地址建议保留官方默认加最多 8 个已配置地址，未改成最近 10 个；自定义下拉字体/字重/阴影和 3px 滚动条保留。
+- 验证范围：本轮检查 Git 快进结果、跟踪差异、版本、入口源码和文档，并执行 diff 格式检查；未重新运行此前功能测试、类型检查、构建或真实供应商/SSH/桌面视觉验收。下方各阶段测试结果属于历史记录，不代表本次重新验收。当前没有继续实施的新功能，等待用户指定下一项；E4 继续取消，不打包、不提交或推送。
+
+
 ### 模型切换保留上下文用量显示（2026-10-21，计划随 v0.2.4 发布）
 
 - 切换不再删除上次 usage，保留 token/原容量/原比例并持久标记 usageStale；前端圆环继续显示用量，提示“待更新”，详情注明上次模型窗口。同供应商和跨供应商切换一致，未知会话不编造统计，旧容量不作为新模型超限结论。

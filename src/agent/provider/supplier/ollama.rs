@@ -2,6 +2,7 @@ use super::*;
 
 pub(super) struct Ollama;
 impl SupplierPolicy for Ollama {
+    fn completion_effort(&self, _: &ProviderKind) -> Option<ReasoningEffort> { Some(ReasoningEffort::None) }
     fn decode_chat(&self, bytes: &[u8], allowed: &std::collections::HashSet<String>) -> Result<Completion> {
         let mut raw: Value = serde_json::from_slice(bytes).map_err(|_| ModelError::Response)?;
         normalize_reasoning(&mut raw, "message")?;

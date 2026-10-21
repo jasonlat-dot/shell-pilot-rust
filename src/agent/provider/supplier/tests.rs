@@ -127,3 +127,15 @@ fn messages_catalog_strips_only_complete_known_segments_and_keeps_proxy_origin()
         assert_eq!(endpoint.path(), expected);
     }
 }
+
+
+#[test]
+fn completion_presets_are_owned_by_supplier_policies() {
+    for supplier in [SupplierKind::Deepseek, SupplierKind::Glm, SupplierKind::Qwen, SupplierKind::Ollama] {
+        assert_eq!(select(Some(&supplier)).completion_effort(&ProviderKind::OpenAiCompatible), Some(ReasoningEffort::None));
+    }
+    assert_eq!(select(Some(&SupplierKind::Kimi)).completion_effort(&ProviderKind::AnthropicMessages), None);
+    assert_eq!(select(Some(&SupplierKind::Grok)).completion_effort(&ProviderKind::OpenAiResponses), None);
+    assert_eq!(select(None).completion_effort(&ProviderKind::GoogleGemini), None);
+    assert_eq!(select(None).completion_effort(&ProviderKind::OpenAiCompatible), None);
+}

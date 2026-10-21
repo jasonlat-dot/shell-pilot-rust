@@ -837,3 +837,68 @@ async fn server_rejecting_all_channels_returns_specific_error_with_no_reauthenti
     manager.shutdown().await;
     eventually(|| fixture.stats.live_connections.load(Ordering::SeqCst) == 0).await;
 }
+
+#[tokio::test]
+async fn completion_auto_installs_only_on_new_opted_in_shell_and_skips_custom_startup() {
+    use shellpilot_server::terminal::completion::ShellIntegration;
+    let fixture=Fixture::new(Spec::default()).await;
+    let (store,connection)=fixture.saved(false);
+    let manager=TerminalManager::new(store.clone());
+    let nonce="a".repeat(32);
+    let setup=||ShellIntegration{nonce:nonce.clone(),script:format!("__shellpilot_test_completion_nonce={nonce}; :")};
+    let plain=manager.connect(open(&connection.connection_id)).await.unwrap();
+    assert!(plain.completion_nonce.is_none());assert!(fixture.stats.inputs.lock().unwrap().is_empty());
+    let integrated=manager.connect_with_completion(open(&connection.connection_id),Some(setup())).await.unwrap();
+    assert_eq!(integrated.completion_nonce.as_deref(),Some(nonce.as_str()));
+    assert_eq!(*fixture.stats.echoes.lock().unwrap(),vec![None,Some(0)]);
+    assert!(integrated.initial_output.contains("ready"));
+    assert!(!integrated.initial_output.contains("__spc_setup"));
+    assert!(!integrated.initial_output.contains("__shellpilot_test_completion_nonce="));
+    assert_eq!(fixture.stats.completion_restored.load(Ordering::SeqCst),1);
+    let inputs=fixture.stats.inputs.lock().unwrap().clone();assert_eq!(inputs.len(),2);
+    assert!(String::from_utf8_lossy(&inputs[0]).contains("read -erst 10"));
+    assert!(String::from_utf8_lossy(&inputs[1]).contains("__shellpilot_test_completion_nonce="));
+    manager.close(&plain.session_id);manager.close(&integrated.session_id);
+    let mut request=fixture.request(false);request.startup_command=Some("startup-test".into());
+    let custom=store.save(request,false).unwrap();
+    let skipped=manager.connect_with_completion(open(&custom.connection_id),Some(setup())).await.unwrap();
+    assert!(skipped.completion_nonce.is_none());
+    assert_eq!(fixture.stats.echoes.lock().unwrap().last(),Some(&None));
+    assert_eq!(fixture.stats.inputs.lock().unwrap().iter().filter(|v|String::from_utf8_lossy(v).contains("read -erst")).count(),1);
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn completion_unsupported_shell_falls_back_without_sending_payload() {
+    use shellpilot_server::terminal::completion::ShellIntegration;
+    let fixture=Fixture::new(Spec{completion_unsupported:true,..Default::default()}).await;
+    let (manager,connection)=fixture.manager(TerminalSettings::default());
+    let opened=manager.connect_with_completion(open(&connection.connection_id),Some(ShellIntegration{nonce:"b".repeat(32),script:"must-not-be-sent".into()})).await.unwrap();
+    assert!(opened.completion_nonce.is_none());assert_eq!(fixture.stats.inputs.lock().unwrap().len(),1);
+    assert!(manager.connected(&opened.session_id).connected);manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn completion_waits_for_echo_restoration_before_exposing_session() {
+    use shellpilot_server::terminal::completion::ShellIntegration;
+    let fixture=Fixture::new(Spec{completion_wait_restore:true,..Default::default()}).await;
+    let (manager,connection)=fixture.manager(TerminalSettings::default());
+    let worker=manager.clone();let pending=tokio::spawn(async move{worker.connect_with_completion(open(&connection.connection_id),Some(ShellIntegration{nonce:"d".repeat(32),script:format!("__shellpilot_test_completion_nonce={}; :","d".repeat(32))})).await});
+    eventually(||fixture.stats.inputs.lock().unwrap().len()==2).await;
+    assert!(!pending.is_finished());assert_eq!(fixture.stats.completion_restored.load(Ordering::SeqCst),0);
+    fixture.stats.completion_release.notify_one();
+    let opened=pending.await.unwrap().unwrap();assert!(opened.completion_nonce.is_some());assert_eq!(fixture.stats.completion_restored.load(Ordering::SeqCst),1);
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn completion_echo_restore_failure_closes_channel_without_replaying_script() {
+    use shellpilot_server::terminal::completion::ShellIntegration;
+    let fixture=Fixture::new(Spec{completion_restore_failure:true,..Default::default()}).await;
+    let (manager,connection)=fixture.manager(TerminalSettings::default());
+    let result=manager.connect_with_completion(open(&connection.connection_id),Some(ShellIntegration{nonce:"e".repeat(32),script:format!("__shellpilot_test_completion_nonce={}; :","e".repeat(32))})).await;
+    assert!(matches!(result,Err(Error::Invalid(message)) if message.contains("恢复终端输入回显")));
+    assert_eq!(fixture.stats.inputs.lock().unwrap().len(),2);
+    eventually(||fixture.stats.channels.load(Ordering::SeqCst)==0).await;
+    manager.shutdown().await;
+}

@@ -16,6 +16,7 @@ pub mod memory;
 mod projects;
 mod titles;
 pub mod provider;
+pub mod completion;
 mod repository;
 mod continuation_store;
 mod conversation_model;

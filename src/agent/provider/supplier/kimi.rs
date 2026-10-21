@@ -2,6 +2,7 @@ use super::*;
 
 pub(super) struct Kimi;
 impl SupplierPolicy for Kimi {
+    fn completion_effort(&self, provider: &ProviderKind) -> Option<ReasoningEffort> { (*provider == ProviderKind::OpenAiCompatible).then_some(ReasoningEffort::None) }
     fn requires_thinking_signature(&self) -> bool {
         false
     }

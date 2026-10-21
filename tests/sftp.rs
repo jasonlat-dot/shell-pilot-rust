@@ -1012,3 +1012,20 @@ async fn empty_directory_save_failure_can_be_confirmed_after_retry() {
     assert_eq!(manager.tasks(&id).unwrap().len(), 1);
     manager.shutdown();
 }
+
+#[tokio::test]
+async fn terminal_completion_lists_names_only_with_user_isolation_and_no_elevation() {
+    let fixture=Fixture::new().await;
+    fixture.file("/home/compose.yaml",b"PRIVATE_FILE_CONTENT_MUST_NOT_BE_READ");
+    std::fs::create_dir(fixture.root.path().join("home/scripts")).unwrap();
+    let (store,connection)=fixture.saved(false);let terminals=TerminalManager::new(store);
+    let terminal=terminals.connect(TerminalOpen{connection_id:connection.connection_id,request_id:uuid::Uuid::new_v4().to_string(),cols:None,rows:None}).await.unwrap();
+    let entries=terminals.completion_entries(&terminal.session_id,&connection.user_id,"/home").await.unwrap();
+    assert!(entries.iter().any(|e|e.name=="compose.yaml"&&!e.directory));assert!(entries.iter().any(|e|e.name=="scripts"&&e.directory));
+    assert!(!serde_json::to_string(&entries).unwrap().contains("PRIVATE_FILE_CONTENT"));
+    assert!(terminals.completion_entries(&terminal.session_id,"another-user","/home").await.is_err());
+    assert!(terminals.completion_entries(&terminal.session_id,&connection.user_id,"/root").await.is_err());
+    assert!(terminals.completion_entries(&terminal.session_id,&connection.user_id,"relative").await.is_err());
+    assert!(fixture.stats.root_commands.lock().unwrap().is_empty());
+    terminals.close(&terminal.session_id);assert!(terminals.completion_entries(&terminal.session_id,&connection.user_id,"/home").await.is_err());terminals.shutdown().await;
+}

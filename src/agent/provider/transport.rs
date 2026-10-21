@@ -21,6 +21,21 @@ pub(super) fn network(error: reqwest::Error) -> ModelError {
     }
 }
 impl ModelClient {
+    /// A short, stateless request preset using the supplier's own parameter policy.
+    pub fn for_terminal_completion(mut runtime: RuntimeConfig) -> Result<Self> {
+        let config = &mut runtime.config;
+        config.remote_compaction = false;
+        config.output_reserve = 64;
+        config.safety_reserve = config.safety_reserve.min(config.context_window / 8);
+        config.timeout_seconds = 2;
+        config.max_response_bytes = 65536;
+        config.temperature = None;
+        config.capabilities.temperature = false;
+        config.reasoning_effort = super::supplier::select(config.supplier.as_ref()).completion_effort(&config.provider);
+        config.capabilities.reasoning_effort = config.reasoning_effort.is_some();
+        Self::new(runtime)
+    }
+
     /// The normalized configuration actually used by this transport.
     pub fn config(&self) -> &ModelConfig {
         &self.config
