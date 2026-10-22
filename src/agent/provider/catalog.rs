@@ -212,7 +212,7 @@ pub struct CatalogClient {
     adapter: &'static dyn CatalogAdapter,
 }
 impl CatalogClient {
-    pub(super) fn new(request: &CatalogRequest, key: Option<SecretKey>) -> Result<Self> {
+    pub(super) fn new(request: &CatalogRequest, key: Option<SecretKey>, proxy: &crate::network::ProxyConfig) -> Result<Self> {
         let base = super::config::normalize_base_url(&request.base_url)?;
         if request.require_api_key && key.is_none() {
             return Err(ModelError::KeyMissing);
@@ -224,17 +224,11 @@ impl CatalogClient {
         } else {
             None
         })?;
-        let mut builder = Client::builder()
+        let builder = Client::builder()
             .redirect(Policy::none())
             .retry(reqwest::retry::never())
             .connect_timeout(Duration::from_secs(10));
-        if base.host().is_some_and(|host| match host {
-            url::Host::Domain(host) => host == "localhost",
-            url::Host::Ipv4(ip) => ip.is_loopback(),
-            url::Host::Ipv6(ip) => ip.is_loopback(),
-        }) {
-            builder = builder.no_proxy();
-        }
+        let builder = proxy.http_client(builder, &base).map_err(|_|ModelError::Invalid("代理配置不可用，请检查其他设置中的网络代理"))?;
         Ok(Self {
             provider: request.provider.clone(),
             supplier: super::supplier::canonical(request.supplier.clone()),

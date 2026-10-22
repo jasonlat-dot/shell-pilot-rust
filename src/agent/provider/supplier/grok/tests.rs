@@ -86,6 +86,7 @@ async fn local_response_measurement_covers_tools_images_and_reasoning_and_honors
     use tokio_util::sync::CancellationToken;
     let c = config(ProviderKind::OpenAiResponses).normalized().unwrap();
     let client = ModelClient::new(RuntimeConfig {
+        proxy: Default::default(),
         config: c,
         api_key: None,
     })

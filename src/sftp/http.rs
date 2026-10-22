@@ -211,7 +211,8 @@ async fn events(
         let mut previous=String::new();
         loop {
             if session.stop.is_cancelled(){
-                yield Ok::<Event,Infallible>(Event::default().event("session-closed").data(r#"{"code":"SFTP_NOT_FOUND","message":"文件管理会话已关闭"}"#));break;
+                let error = session.terminal_error().unwrap_or_else(|| super::Error::new("SFTP_NOT_FOUND", "文件管理会话已关闭", axum::http::StatusCode::NOT_FOUND));
+                yield Ok::<Event,Infallible>(Event::default().event("session-closed").data(serde_json::json!({"code":error.code,"message":error.message}).to_string()));break;
             }
             if stop.is_cancelled(){break}
             let snapshot=session.tasks.lock().unwrap().values().map(|t|t.view().progress).collect::<Vec<_>>();

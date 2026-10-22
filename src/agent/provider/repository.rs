@@ -11,6 +11,7 @@ pub struct ModelRepository {
 /// Native-only runtime settings. Never serialize this into IPC or the event log.
 #[derive(Clone)]
 pub struct RuntimeConfig {
+    pub(crate) proxy: crate::network::ProxyConfig,
     pub config: ModelConfig,
     pub(crate) api_key: Option<SecretKey>,
 }
@@ -232,6 +233,7 @@ impl ModelRepository {
     pub fn runtime(&self, id: &str, user: &str) -> Result<RuntimeConfig> {
         checked_id(id)?;
         checked_id(user)?;
+        let proxy = crate::network::load(&self.store).map_err(|_|ModelError::Invalid("代理设置无法读取"))?.ai;
         let db = self
             .store
             .database
@@ -257,6 +259,7 @@ impl ModelRepository {
             return Err(ModelError::KeyMissing);
         }
         Ok(RuntimeConfig {
+            proxy,
             config: profile.config,
             api_key,
         })

@@ -5,7 +5,7 @@ mod transfer;
 mod wire;
 use crate::{
     store::Store,
-    terminal::{authenticate, Transport},
+    terminal::{authenticate, TerminalFileAccess, Transport},
 };
 use axum::{
     http::StatusCode,
@@ -53,6 +53,20 @@ impl Error {
             "SFTP_NOT_FOUND",
             "连接、会话、任务或文件不存在",
             StatusCode::NOT_FOUND,
+        )
+    }
+    fn identity_changed() -> Self {
+        Self::new(
+            "SFTP_IDENTITY_CHANGED",
+            "终端访问身份已切换，重新打开文件管理即可使用当前身份",
+            StatusCode::CONFLICT,
+        )
+    }
+    fn terminal_closed() -> Self {
+        Self::new(
+            "SFTP_TERMINAL_CLOSED",
+            "当前终端已关闭，关联的文件会话已结束",
+            StatusCode::CONFLICT,
         )
     }
     fn busy() -> Self {
@@ -175,6 +189,7 @@ pub struct Manager {
 pub(crate) struct Session {
     pub view: SessionView,
     pub transport: Arc<Transport>,
+    pub terminal_access: Option<TerminalFileAccess>,
     // Session-only secret. Never serialized, logged, or written to saved connections.
     pub sudo_password: Mutex<Option<String>>,
     pub connect_timeout: Duration,
@@ -189,6 +204,12 @@ pub(crate) struct Session {
     _slot: OwnedSemaphorePermit,
 }
 impl Session {
+    fn terminal_error(&self) -> Option<Error> {
+        let access = self.terminal_access.as_ref()?;
+        if access.client_closed() { Some(Error::terminal_closed()) }
+        else if access.identity_changed() { Some(Error::identity_changed()) }
+        else { None }
+    }
     fn begin(self: &Arc<Self>) -> Active {
         self.active.fetch_add(1, Ordering::SeqCst);
         *self.touched.lock().unwrap() = Instant::now();
@@ -200,7 +221,7 @@ impl Session {
         for task in self.tasks.lock().unwrap().values() {
             task.cancel();
         }
-        self.transport.shutdown();
+        if self.terminal_access.is_none() { self.transport.shutdown(); }
     }
 }
 pub(crate) struct Active(Arc<Session>);
@@ -267,6 +288,17 @@ impl Manager {
         }
     }
     pub async fn open(&self, request: OpenRequest) -> Result<SessionView> {
+        self.open_access(request, None).await
+    }
+    pub async fn open_terminal(&self, request: OpenRequest, access: TerminalFileAccess) -> Result<SessionView> {
+        self.open_access(request, Some(access)).await
+    }
+    async fn open_access(&self, mut request: OpenRequest, terminal_access: Option<TerminalFileAccess>) -> Result<SessionView> {
+        if let Some(access) = &terminal_access {
+            if request.sudo_password.is_some() || access.connection_id() != request.connection_id { return Err(Error::invalid("终端文件访问身份无效")); }
+            if !access.valid() { return Err(if access.client_closed() { Error::terminal_closed() } else if access.identity_changed() { Error::identity_changed() } else { Error::missing() }); }
+            request.access_mode = if access.elevated() { AccessMode::SudoRoot } else { AccessMode::Login };
+        }
         if request
             .sudo_password
             .as_ref()
@@ -289,40 +321,51 @@ impl Manager {
             .map_err(|_| Error::busy())?;
         let store = self.store.clone();
         let id = request.connection_id;
-        let (connection, credentials) = tokio::task::spawn_blocking(move || {
+        let authenticate_saved = terminal_access.is_none();
+        let (connection, credentials, proxy) = tokio::task::spawn_blocking(move || {
             let connection = store.get(&id)?;
             if connection.user_id != "default" {
                 return Err(crate::error::Error::NotFound);
             }
-            Ok((connection, store.credentials(&id)?))
+            let credentials = if authenticate_saved { Some(store.credentials(&id)?) } else { None };
+            let proxy = if authenticate_saved { crate::network::load(&store)?.ssh } else { Default::default() };
+            Ok((connection, credentials, proxy))
         })
         .await
         .map_err(|_| Error::io("读取连接失败"))?
         .map_err(Error::ssh)?;
         let timeout = Duration::from_secs(u64::from(connection.connect_timeout));
-        let transport = tokio::select! {biased;_=self.stop.cancelled()=>return Err(Error::cancelled()),result=tokio::time::timeout(timeout,authenticate(&connection,credentials))=>result.map_err(|_|Error::timeout())?.map_err(Error::ssh)?};
+        let transport = if let Some(access) = &terminal_access { access.transport.clone() }
+        else {
+            let credentials = credentials.ok_or_else(|| Error::invalid("连接认证参数无效"))?;
+            let route = proxy.resolve(&connection.host, connection.port, "ssh").map_err(Error::ssh)?;
+            Arc::new(tokio::select! {biased;_=self.stop.cancelled()=>return Err(Error::cancelled()),result=tokio::time::timeout(timeout,authenticate(&connection,credentials,route))=>result.map_err(|_|Error::timeout())?.map_err(Error::ssh)?})
+        };
+        let stop = terminal_access.as_ref().map(|a| a.stop()).unwrap_or_else(|| self.stop.child_token());
+        let login_username = terminal_access.as_ref().map(|a| a.username()).unwrap_or(&connection.username).to_owned();
         let provisional = Arc::new(Session {
             view: SessionView {
                 sftp_session_id: uuid::Uuid::new_v4().to_string(),
                 connection_id: connection.connection_id,
                 root_path: "/".into(),
-                login_username: connection.username.clone(),
+                login_username: login_username.clone(),
                 access_username: if request.access_mode == AccessMode::SudoRoot {
                     "root".into()
                 } else {
-                    connection.username.clone()
+                    login_username
                 },
                 access_mode: request.access_mode,
                 created_at: chrono::Utc::now(),
             },
-            transport: Arc::new(transport),
+            transport,
+            terminal_access,
             sudo_password: Mutex::new(request.sudo_password.filter(|value| !value.is_empty())),
             connect_timeout: timeout,
             openings: self.openings.clone(),
             slots: Arc::new(Semaphore::new(2)),
             metadata: Semaphore::new(1),
             tasks: Mutex::new(HashMap::new()),
-            stop: self.stop.child_token(),
+            stop,
             subscription: Mutex::new(None),
             touched: Mutex::new(Instant::now()),
             active: AtomicUsize::new(0),
@@ -361,6 +404,10 @@ impl Manager {
             return Err(Error::cancelled());
         }
         sessions.insert(view.sftp_session_id.clone(), session);
+        let session = sessions.get(&view.sftp_session_id).unwrap().clone();
+        if let Some(access) = session.terminal_access.clone() {
+            tokio::spawn(async move { tokio::select! { _ = access.invalidated() => session.close(), _ = session.stop.cancelled() => {} } });
+        }
         Ok(view)
     }
     pub(crate) fn session(&self, id: &str) -> Result<Arc<Session>> {
@@ -371,6 +418,7 @@ impl Manager {
             .get(id)
             .cloned()
             .ok_or_else(Error::missing)?;
+        if let Some(error) = session.terminal_error() { return Err(error); }
         if session.stop.is_cancelled() || session.transport.is_closed() {
             return Err(Error::missing());
         }

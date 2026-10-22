@@ -127,6 +127,7 @@ fn native_thoughts_signatures_and_optional_call_ids_replay_without_becoming_visi
             .contains("opaque-signature"));
         reply.message.continuation.as_mut().unwrap().seal(
             &super::super::responses::Binding::from_runtime(&RuntimeConfig {
+                proxy: Default::default(),
                 config: c.clone(),
                 api_key: None,
             })

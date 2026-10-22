@@ -4,6 +4,7 @@ pub mod error;
 pub mod files;
 mod http;
 pub mod model;
+pub mod network;
 mod secrets;
 pub mod services;
 pub mod sftp;

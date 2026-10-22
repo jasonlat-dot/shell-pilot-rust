@@ -50,18 +50,11 @@ impl ModelClient {
         let adapter = super::adapter::select(&config.provider);
         let headers = super::supplier::select(config.supplier.as_ref()).headers(&config.provider, runtime.api_key.as_ref())?;
         let endpoint = config.endpoint()?;
-        let mut builder = Client::builder()
+        let builder = Client::builder()
             .redirect(Policy::none())
             .retry(reqwest::retry::never())
             .connect_timeout(Duration::from_secs(config.timeout_seconds.min(30)));
-        // Local test/model services should not go through environment HTTP proxies.
-        if endpoint.host().is_some_and(|host| match host {
-            url::Host::Domain(host) => host == "localhost",
-            url::Host::Ipv4(ip) => ip.is_loopback(),
-            url::Host::Ipv6(ip) => ip.is_loopback(),
-        }) {
-            builder = builder.no_proxy();
-        }
+        let builder = runtime.proxy.http_client(builder, &endpoint).map_err(|_|ModelError::Invalid("代理配置不可用，请检查其他设置中的网络代理"))?;
         let client = builder.build().map_err(network)?;
         Ok(Self {
             binding,
