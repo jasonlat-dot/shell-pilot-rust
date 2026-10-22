@@ -64,6 +64,7 @@ impl Store {
         database.execute_batch(include_str!("../migrations/023_conversation_state.sql"))?;
         database.execute_batch(include_str!("../migrations/024_model_channels.sql"))?;
         database.execute_batch(include_str!("../migrations/025_network_settings.sql"))?;
+        database.execute_batch(include_str!("../migrations/026_model_channel_states.sql"))?;
         Ok(Self {
             database: Mutex::new(database),
             data_directory: None,

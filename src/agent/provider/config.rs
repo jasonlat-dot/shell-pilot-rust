@@ -252,10 +252,20 @@ pub struct ModelProfile {
     pub config: ModelConfig,
     pub api_key_configured: bool,
     pub ready: bool,
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_name: Option<String>,
+}
+
+impl ModelProfile {
+    pub fn require_available(&self) -> Result<()> {
+        if !self.enabled {return Err(ModelError::Disabled);}
+        if !self.ready {return Err(ModelError::KeyMissing);}
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]

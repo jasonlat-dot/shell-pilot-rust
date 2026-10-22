@@ -47,7 +47,7 @@ impl Manager {
         let _slot=self.slot(&user,&session)?;
         let store=self.store.clone();
         worker(move || {
-            if !ModelRepository::new(store.clone()).get(&next,&user)?.ready {return Err(ModelError::KeyMissing.into());}
+            ModelRepository::new(store.clone()).get(&next,&user)?.require_available()?;
             Repository::new(store).change_model(&user,&session,&previous,&next,revision).map_err(Error::from)
         }).await
     }

@@ -24,6 +24,22 @@ fn channel_view(db: &Connection, id: &str, user: &str) -> Result<ModelChannel> {
 }
 
 impl ModelRepository {
+    /// Toggle a whole channel without rewriting its models, credentials or history.
+    pub fn set_channel_enabled(&self,id:&str,user:&str,expected_revision:u64,enabled:bool)->Result<ModelChannel> {
+        checked_id(id)?;checked_id(user)?;
+        let mut db=self.store.database.lock().map_err(|_|ModelError::Database)?;
+        let tx=db.transaction()?;
+        let channel=channel_view(&tx,id,user)?;
+        if channel.profile.revision!=expected_revision {return Err(ModelError::Stale);}
+        if channel.profile.enabled==enabled {return Ok(channel);}
+        let next=expected_revision.checked_add(1).filter(|n|*n<=i64::MAX as u64).ok_or(ModelError::Stale)?;
+        let updated=tx.execute("UPDATE agent_model_channels SET revision=?3 WHERE user_id=?1 AND id=?2",params![user,id,next])?;
+        if updated==0 {tx.execute("UPDATE agent_model_profiles SET revision=?3 WHERE user_id=?1 AND id=?2",params![user,id,next])?;}
+        tx.execute("INSERT INTO agent_model_channel_states(user_id,channel_id,enabled) VALUES(?1,?2,?3) ON CONFLICT(user_id,channel_id) DO UPDATE SET enabled=excluded.enabled",params![user,id,enabled])?;
+        let result=channel_view(&tx,id,user)?;
+        tx.commit()?;Ok(result)
+    }
+
     pub fn channels(&self,user:&str)->Result<Vec<ModelChannel>> {
         Ok(self.channel_report(user)?.items)
     }
@@ -127,6 +143,7 @@ impl ModelRepository {
         if ids.is_empty(){ids.push(id.into());}
         tx.execute("DELETE FROM agent_model_channel_members WHERE user_id=?1 AND channel_id=?2",params![user,id])?;
         tx.execute("DELETE FROM agent_model_channels WHERE user_id=?1 AND id=?2",params![user,id])?;
+        tx.execute("DELETE FROM agent_model_channel_states WHERE user_id=?1 AND channel_id=?2",params![user,id])?;
         for profile in ids {
             tx.execute("DELETE FROM agent_model_names WHERE user_id=?1 AND profile_id=?2",params![user,profile])?;
             tx.execute("DELETE FROM agent_model_profiles WHERE user_id=?1 AND id=?2",params![user,profile])?;

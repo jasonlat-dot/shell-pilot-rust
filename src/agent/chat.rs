@@ -100,6 +100,7 @@ impl Error {
             Self::Model(ModelError::RemoteUnsupported) => "MODEL_RESPONSES_UNSUPPORTED",
             Self::Model(ModelError::BudgetExceeded) => "MODEL_CONTEXT_LIMIT",
             Self::Model(ModelError::KeyMissing | ModelError::Credentials) => "MODEL_CREDENTIALS",
+            Self::Model(ModelError::Disabled) => "MODEL_DISABLED",
             Self::Model(ModelError::ResponseTooLarge) => "MODEL_RESPONSE_LIMIT",
             Self::Model(ModelError::Response) => "MODEL_PROTOCOL_FAILED",
             Self::Model(ModelError::ToolProtocol) => "MODEL_TOOL_PROTOCOL_FAILED",
@@ -143,7 +144,7 @@ impl Error {
             Self::Invalid | Self::Attachment(_) | Self::Memory(_) => 400,
             Self::Unsupported => 501,
             Self::Stopped => 503,
-            Self::Model(ModelError::Cancelled) => 409,
+            Self::Model(ModelError::Cancelled | ModelError::Disabled) => 409,
             Self::Model(ModelError::Timeout) => 504,
             Self::HistoryLimit | Self::Model(ModelError::BudgetExceeded) => 413,
             Self::Model(ModelError::ResponseTooLarge) => 413,
@@ -156,6 +157,7 @@ impl Error {
                 "MODEL_TIMEOUT" => 504,
                 "AGENT_INTERRUPTED"
                 | "AGENT_CANCELLED"
+                | "MODEL_DISABLED"
                 | "AGENT_CONTEXT_CHANGED"
                 | "AGENT_TARGET_UNAVAILABLE" => 409,
                 "MODEL_RESPONSE_LIMIT" | "MODEL_CONTEXT_LIMIT" | "AGENT_HISTORY_LIMIT" => 413,
@@ -456,12 +458,7 @@ impl Manager {
             if stop.is_cancelled() {
                 return Err(Error::Stopped);
             }
-            if !ModelRepository::new(store.clone())
-                .get(&agent, &user)?
-                .ready
-            {
-                return Err(ModelError::KeyMissing.into());
-            }
+            ModelRepository::new(store.clone()).get(&agent, &user)?.require_available()?;
             Ok(Repository::new(store).create_session(&agent, &user)?.id)
         })
         .await
@@ -485,12 +482,7 @@ impl Manager {
         }
         let store = self.store.clone();
         worker(move || {
-            if !ModelRepository::new(store.clone())
-                .get(&agent, &user)?
-                .ready
-            {
-                return Err(ModelError::KeyMissing.into());
-            }
+            ModelRepository::new(store.clone()).get(&agent, &user)?.require_available()?;
             Repository::new(store)
                 .create_general_session_with_policy(&agent, &user, policy)
                 .map_err(Error::from)
@@ -606,12 +598,7 @@ impl Manager {
         let source = self.live.clone();
         let store = self.store.clone();
         worker(move || {
-            if !ModelRepository::new(store.clone())
-                .get(&agent, &user)?
-                .ready
-            {
-                return Err(ModelError::KeyMissing.into());
-            }
+            ModelRepository::new(store.clone()).get(&agent, &user)?.require_available()?;
             let (connection, identity) = source.server_identity(&terminal, &user)?;
             Repository::new(store)
                 .create_project_chat(

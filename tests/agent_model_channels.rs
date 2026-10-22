@@ -7,6 +7,67 @@ fn config()->ModelConfig {serde_json::from_value(json!({"provider":"openAiCompat
 fn update(config:ModelConfig)->ModelConfigUpdate {ModelConfigUpdate{config,api_key:KeyChange::Keep}}
 fn ids(values:&[&str])->Vec<String>{values.iter().map(|v|(*v).into()).collect()}
 
+#[tokio::test]
+async fn channel_enabled_state_hides_every_member_and_blocks_new_sessions_without_losing_history() {
+    let dir=tempfile::tempdir().unwrap();let path=dir.path().join("enabled.sqlite");
+    let store=Arc::new(Store::open(&path).unwrap());let repo=ModelRepository::new(store.clone());
+    let channel=repo.save_channel("channel","u",0,update(config()),"Enabled channel",ids(&["one","two"])).unwrap();
+    repo.save_channel("other","u",0,update(config()),"Other",ids(&["one"])).unwrap();
+    let manager=Manager::new(store.clone(),CancellationToken::new());
+    let session=manager.create_general_session(channel.models[1].id.clone(),"u".into()).await.unwrap();
+    assert_eq!(manager.list("u".into()).await.unwrap().len(),3);
+    let disabled=repo.set_channel_enabled("channel","u",channel.profile.revision,false).unwrap();
+    assert!(!disabled.profile.enabled);assert!(!disabled.profile.ready);assert_eq!(disabled.models.len(),2);
+    for member in &channel.models {
+        assert!(!repo.get(&member.id,"u").unwrap().enabled);assert!(matches!(repo.runtime(&member.id,"u"),Err(ModelError::Disabled)));
+        let error=manager.create_general_session(member.id.clone(),"u".into()).await.err().unwrap();assert_eq!(error.code(),"MODEL_DISABLED");assert_eq!(error.status(),409);
+    }
+    assert_eq!(manager.list("u".into()).await.unwrap()[0].agent_id,"other");
+    assert_eq!(repo.channel_report("u").unwrap().items.len(),2);assert_eq!(Repository::new(store.clone()).session(&session.id,"u").unwrap().agent_id,channel.models[1].id);
+    drop(manager);drop(repo);drop(store);
+    let store=Arc::new(Store::open(&path).unwrap());let repo=ModelRepository::new(store.clone());assert!(!repo.channels("u").unwrap()[0].profile.enabled);
+    let enabled=repo.set_channel_enabled("channel","u",disabled.profile.revision,true).unwrap();assert!(enabled.profile.enabled);assert!(enabled.profile.ready);assert_eq!(enabled.models[1].id,channel.models[1].id);
+    for member in enabled.models {assert!(repo.runtime(&member.id,"u").is_ok());}
+    assert!(Repository::new(store).session(&session.id,"u").is_ok());
+}
+
+#[test]
+fn channel_toggle_is_scoped_revision_checked_and_does_not_rewrite_secrets_or_models() {
+    let dir=tempfile::tempdir().unwrap();let path=dir.path().join("toggle.sqlite");let store=Arc::new(Store::open(&path).unwrap());let repo=ModelRepository::new(store);
+    let mut configured=config();configured.require_api_key=true;
+    let channel=repo.save_channel("channel","u",0,ModelConfigUpdate{config:configured.clone(),api_key:KeyChange::Set{value:SecretKey::new("toggle-secret").unwrap()}},"Channel",ids(&["one","two"])).unwrap();
+    let db=rusqlite::Connection::open(&path).unwrap();
+    let payloads=||{let mut query=db.prepare("SELECT id,config_json,api_key,revision FROM agent_model_profiles ORDER BY id").unwrap();query.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Vec<u8>>(2)?,row.get::<_,u64>(3)?))).unwrap().collect::<std::result::Result<Vec<_>,_>>().unwrap()};
+    let before=payloads();
+    assert!(repo.set_channel_enabled("channel","other",channel.profile.revision,false).is_err());assert!(repo.set_channel_enabled(&channel.models[1].id,"u",channel.profile.revision,false).is_err());
+    let disabled=repo.set_channel_enabled("channel","u",channel.profile.revision,false).unwrap();assert_eq!(payloads(),before);assert!(disabled.profile.api_key_configured);
+    assert!(matches!(repo.set_channel_enabled("channel","u",channel.profile.revision,true),Err(ModelError::Stale)));
+    assert!(matches!(repo.save_channel("channel","u",channel.profile.revision,update(configured.clone()),"stale",ids(&["one"])),Err(ModelError::Stale)));
+    let edited=repo.save_channel("channel","u",disabled.profile.revision,update(configured),"Edited",ids(&["two","one","three"])).unwrap();assert!(!edited.profile.enabled);assert!(edited.profile.api_key_configured);assert_eq!(edited.models[0].id,channel.models[1].id);
+    let enabled=repo.set_channel_enabled("channel","u",edited.profile.revision,true).unwrap();assert!(enabled.profile.ready);
+    repo.delete_channel("channel","u",enabled.profile.revision).unwrap();let recreated=repo.save_channel("channel","u",0,update(config()),"Recreated",ids(&["one"])).unwrap();assert!(recreated.profile.enabled);
+}
+
+#[test]
+fn legacy_profiles_default_enabled_and_keep_disabled_state_when_converted_to_channels() {
+    let store=Arc::new(Store::in_memory().unwrap());let repo=ModelRepository::new(store);
+    let legacy=repo.save_named("legacy","u",0,update(config()),Some("Legacy")).unwrap();assert!(legacy.enabled);
+    let disabled=repo.set_channel_enabled("legacy","u",legacy.revision,false).unwrap();assert!(!disabled.profile.enabled);
+    let converted=repo.save_channel("legacy","u",disabled.profile.revision,update(config()),"Converted",ids(&["one","two"])).unwrap();assert!(!converted.profile.enabled);assert!(!repo.get(&converted.models[1].id,"u").unwrap().ready);
+    let enabled=repo.set_channel_enabled("legacy","u",converted.profile.revision,true).unwrap();assert!(enabled.profile.ready);
+    assert_eq!(repo.set_channel_enabled("legacy","u",enabled.profile.revision,true).unwrap().profile.revision,enabled.profile.revision);
+    repo.save_named("single","u",0,update(config()),None).unwrap();let disabled=repo.set_channel_enabled("single","u",1,false).unwrap();repo.delete("single","u",disabled.profile.revision).unwrap();assert!(repo.save_named("single","u",0,update(config()),None).unwrap().enabled);
+}
+
+#[test]
+fn upgrade_creates_channel_state_table_without_disabling_existing_profiles() {
+    let dir=tempfile::tempdir().unwrap();let path=dir.path().join("upgrade.sqlite");
+    let repo=ModelRepository::new(Arc::new(Store::open(&path).unwrap()));repo.save_channel("existing","u",0,update(config()),"Existing",ids(&["one","two"])).unwrap();drop(repo);
+    let db=rusqlite::Connection::open(&path).unwrap();db.execute_batch("DROP TABLE agent_model_channel_states; PRAGMA user_version=24;").unwrap();drop(db);
+    let repo=ModelRepository::new(Arc::new(Store::open(&path).unwrap()));let channel=repo.channels("u").unwrap().remove(0);assert!(channel.profile.enabled);assert_eq!(channel.models.len(),2);for member in channel.models {assert!(repo.runtime(&member.id,"u").is_ok());}
+    let db=rusqlite::Connection::open(path).unwrap();assert_eq!(db.query_row("PRAGMA user_version",[],|r|r.get::<_,u64>(0)).unwrap(),26);
+}
+
 #[test]
 fn unreadable_configurations_are_isolated_preserved_and_reported_without_private_data() {
     let dir=tempfile::tempdir().unwrap();let path=dir.path().join("isolated.sqlite");

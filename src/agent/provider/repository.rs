@@ -61,6 +61,7 @@ fn view(id: &str, row: Row, display_name: String) -> Result<ModelProfile> {
         display_name,
         revision,
         ready: !config.require_api_key || key.is_some(),
+        enabled: true,
         config,
         api_key_configured: key.is_some(),
         channel_id: None,
@@ -71,6 +72,8 @@ fn profile_view(db: &Connection, id: &str, user: &str, row: Row) -> Result<Model
     let mut profile = view(id, row, display_name(db,id,user)?)?;
     let channel: Option<(String,String,bool)> = db.query_row("SELECT c.id,c.display_name,m.active FROM agent_model_channel_members m JOIN agent_model_channels c ON c.user_id=m.user_id AND c.id=m.channel_id WHERE m.user_id=?1 AND m.profile_id=?2",params![user,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     if let Some((id,name,active)) = channel { profile.channel_id=Some(id);profile.channel_name=Some(name);profile.ready &= active; }
+    profile.enabled=db.query_row("SELECT enabled FROM agent_model_channel_states WHERE user_id=?1 AND channel_id=?2",params![user,profile.channel_id.as_deref().unwrap_or(id)],|r|r.get(0)).optional()?.unwrap_or(true);
+    profile.ready &= profile.enabled;
     Ok(profile)
 }
 fn channel_count(db: &Connection, user: &str) -> Result<usize> {
@@ -219,6 +222,7 @@ impl ModelRepository {
         if previous.0 != expected_revision {
             return Err(ModelError::Stale);
         }
+        tx.execute("DELETE FROM agent_model_channel_states WHERE user_id=?1 AND channel_id=?2",params![user,id])?;
         tx.execute(
             "DELETE FROM agent_model_names WHERE user_id=?1 AND profile_id=?2",
             params![user, id],
@@ -241,7 +245,7 @@ impl ModelRepository {
             .map_err(|_| ModelError::Database)?;
         let (revision, json, key) = row(&db, id, user)?.ok_or(ModelError::NotFound)?;
         let profile = profile_view(&db, id, user, (revision, json, key.clone()))?;
-        if !profile.ready { return Err(ModelError::KeyMissing); }
+        profile.require_available()?;
         // Disabling authentication preserves the encrypted credential but never
         // decrypts or sends it. Re-enabling can reuse the saved key.
         let api_key = if profile.config.require_api_key {

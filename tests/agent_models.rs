@@ -354,7 +354,7 @@ fn schema_upgrade_preserves_existing_agent_sessions() {
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        24
+        26
     );
     assert_eq!(
         db.query_row("SELECT count(*) FROM agent_sessions", [], |r| r
@@ -737,6 +737,17 @@ async fn local_model_request_and_usage_round_trip() {
     assert_eq!(requests[0].2["model"], "test-model");
     assert_eq!(requests[0].2["stream"], false);
     assert_eq!(requests[0].2["max_completion_tokens"], 512);
+}
+#[tokio::test]
+async fn captured_model_client_finishes_after_channel_is_disabled_and_new_requests_are_rejected() {
+    let mock=MockModel::start(reply().to_string(),StatusCode::OK,Duration::from_millis(40),None).await;
+    let mut configured=config();configured.base_url=mock.base.clone();
+    let repo=ModelRepository::new(Arc::new(Store::in_memory().unwrap()));let channel=repo.save_channel("channel","alice",0,update(configured,KeyChange::Keep),"Channel",vec!["test-model".into()]).unwrap();
+    let client=ModelClient::new(repo.runtime("channel","alice").unwrap()).unwrap();
+    let started=tokio::spawn(async move{client.complete(&request(),&CancellationToken::new()).await.unwrap()});
+    tokio::time::timeout(Duration::from_secs(2),async{while mock.count()==0{tokio::task::yield_now().await;}}).await.unwrap();
+    repo.set_channel_enabled("channel","alice",channel.profile.revision,false).unwrap();
+    assert_eq!(started.await.unwrap().message.content.as_deref(),Some("你好"));assert!(matches!(repo.runtime("channel","alice"),Err(ModelError::Disabled)));assert_eq!(mock.count(),1);
 }
 #[cfg(windows)]
 #[tokio::test]

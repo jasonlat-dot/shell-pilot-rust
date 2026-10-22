@@ -32,6 +32,8 @@ pub enum ModelError {
     Stale,
     #[error("Model API key is not configured")]
     KeyMissing,
+    #[error("此模型渠道已禁用，请在模型设置中启用，或选择其他模型。")]
+    Disabled,
     #[error("Model API key protection or decryption failed")]
     Credentials,
     #[error("Model database operation failed")]
