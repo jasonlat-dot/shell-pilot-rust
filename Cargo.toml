@@ -1,6 +1,6 @@
 [package]
 name = "shellpilot-server"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 license = "Apache-2.0"
 description = "ShellPilot embedded Rust backend"
@@ -20,7 +20,7 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 russh = { version = "0.64.1", default-features = false, features = ["flate2", "ring", "rsa"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
-reqwest = { version = "0.12.28", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "stream", "rustls-tls-native-roots", "socks"] }
 sha1 = "0.11"
 sha2 = "0.11"
 getrandom = "0.4"
@@ -38,7 +38,7 @@ base64 = "0.22.1"
 lopdf = { version = "0.45", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
+windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_Networking_WinHttp"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["fs", "io-util"] }
