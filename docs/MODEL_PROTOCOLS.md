@@ -1,6 +1,6 @@
 # 模型协议策略
 
-原生模型层通过策略工厂支持 `openAiCompatible`、`openAiResponses`、`anthropicMessages` 和 `googleGemini`。当前 schema 24（原生续接状态表在 schema 22 引入）；本轮 Google 接入不新增迁移。旧模型配置和加密 Key 保持原值，已有数据库启动时自动升级。
+原生模型层通过策略工厂支持 `openAiCompatible`、`openAiResponses`、`anthropicMessages` 和 `googleGemini`。当前版本 **v0.2.5**，最新迁移为 025（网络代理配置）；原生续接状态在 schema 22 引入，多模型渠道在 schema 24 引入。旧模型配置和加密 Key 保持原值，已有数据库启动时自动升级。发布说明见 [v0.2.5](releases/v0.2.5.md)。
 
 ## 分层与扩展
 

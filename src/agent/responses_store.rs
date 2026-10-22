@@ -150,6 +150,7 @@ mod tests {
             "temperature":null,"reasoningEffort":null,"timeoutSeconds":3,"maxResponseBytes":65536,"requireApiKey":false})).unwrap();
         let window = ResponseWindow {
             binding: Binding::from_runtime(&RuntimeConfig {
+                proxy: Default::default(),
                 config,
                 api_key: None,
             })

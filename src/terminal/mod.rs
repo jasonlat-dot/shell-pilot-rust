@@ -1,5 +1,9 @@
 pub(crate) mod agent_exec;
 pub mod completion;
+mod directory;
+mod directory_access;
+mod files_access;
+pub use files_access::TerminalFileAccess;
 mod host_key;
 mod http;
 mod output;
@@ -95,6 +99,7 @@ impl Drop for NetworkGuard {
     }
 }
 pub(crate) struct Transport {
+    network_route: crate::network::Route,
     _network: NetworkGuard,
     handle: Option<client::Handle<HostVerifier>>,
     identity: AgentIdentity,
@@ -287,11 +292,13 @@ impl TerminalManager {
         credentials: &Credentials,
         fresh: bool,
     ) -> Result<Arc<PooledTransport>, Error> {
+        let proxy = self.blocking(|store| Ok(crate::network::load(store)?.ssh)).await?;
+        let route = proxy.resolve(&connection.host, connection.port, "ssh")?;
         runtime
             .transports
             .retain(|entry| !entry.transport.is_closed() && entry.active() > 0);
         if let Some(entry) = runtime.transports.iter().find(|entry| {
-            !fresh && entry.available() && entry.transport.matches_profile(connection)
+            !fresh && entry.available() && entry.transport.matches_profile(connection) && entry.transport.network_route == route
         }) {
             return Ok(entry.clone());
         }
@@ -299,7 +306,7 @@ impl TerminalManager {
             return Err(Error::Busy);
         }
         let entry = Arc::new(PooledTransport {
-            transport: Arc::new(authenticate(connection, credentials.clone()).await?),
+            transport: Arc::new(authenticate(connection, credentials.clone(), route).await?),
             slots: Arc::new(Semaphore::new(self.settings.channels_per_transport)),
             total_slots: self.settings.channels_per_transport,
             observed_limit: AtomicUsize::new(self.settings.channels_per_transport),
@@ -482,6 +489,7 @@ impl TerminalManager {
                     shell_uncertain: std::sync::atomic::AtomicBool::new(false),
                     shell_probe: Mutex::new(None),
                     shell_display: Mutex::new(None),
+                    directory_access: Mutex::new(directory_access::Reports::new(completion_nonce.clone())),
                     terminal_size: Mutex::new((cols, rows)),
                     size_changed: Notify::new(),
                     output: Mutex::new(Output::new()),
@@ -494,6 +502,7 @@ impl TerminalManager {
                     .lock()
                     .unwrap()
                     .append(&initial, self.settings.buffer_bytes);
+                session.directory_access.lock().unwrap().feed(&initial);
                 // Match lock order in prune: sessions -> attempts. Publishing and
                 // cancel lookup are atomic with respect to the request record.
                 {
@@ -803,6 +812,7 @@ fn dimensions(cols: u32, rows: u32) -> Result<(), Error> {
 pub(crate) async fn authenticate(
     connection: &Connection,
     credentials: Credentials,
+    route: crate::network::Route,
 ) -> Result<Transport, Error> {
     let verifier = HostVerifier::new(connection)?;
     let rejected = verifier.rejected.clone();
@@ -846,10 +856,7 @@ pub(crate) async fn authenticate(
         channel_buffer_size: 32,
         ..Default::default()
     });
-    let socket =
-        tokio::net::TcpStream::connect((connection.host.trim_matches(['[', ']']), connection.port))
-            .await
-            .map_err(|_| Error::Ssh)?;
+    let socket = crate::network::connect(&connection.host, connection.port, &route).await?;
     socket.set_nodelay(true).map_err(|_| Error::Ssh)?;
     let socket = socket.into_std().map_err(|_| Error::Ssh)?;
     let network = NetworkGuard(socket.try_clone().map_err(|_| Error::Ssh)?);
@@ -864,6 +871,7 @@ pub(crate) async fn authenticate(
             }
         })?;
     let mut transport = Transport {
+        network_route: route,
         _network: network,
         handle: Some(handle),
         identity: AgentIdentity {
@@ -1000,6 +1008,7 @@ async fn run_reader(
             }
             message = reader.wait() => match message {
                 Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
+                    session.directory_access.lock().unwrap().feed(&data);
                     shared_shell::display_pty(&session, &data, settings.buffer_bytes);
                     session.changed.notify_waiters();
                     if let Some(probe) = session.shell_probe.lock().unwrap().as_ref() {

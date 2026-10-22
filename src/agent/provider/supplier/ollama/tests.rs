@@ -51,7 +51,7 @@ fn ollama_identity_persists_and_continuation_bindings_are_specific_to_the_deploy
 fn ollama_reasoning_field_is_private_and_replayed_verbatim_for_json_and_text_streams() {
     use std::collections::HashSet;
     let c=config("qwen3:8b").normalized().unwrap();
-    let runtime=RuntimeConfig{config:c.clone(),api_key:None};
+    let runtime=RuntimeConfig{config:c.clone(),api_key:None,proxy:Default::default()};
     let binding=super::super::super::responses::Binding::from_runtime(&runtime).unwrap();
     let raw=json!({"choices":[{"index":0,"message":{"role":"assistant","content":"answer","reasoning":"private-思考"},"finish_reason":"stop"}]});
     let mut completions=vec![Ollama.decode_chat(&serde_json::to_vec(&raw).unwrap(),&HashSet::new()).unwrap()];

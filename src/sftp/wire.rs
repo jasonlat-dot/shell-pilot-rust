@@ -19,7 +19,9 @@ impl Wire {
             .clone()
             .try_acquire_owned()
             .map_err(|_| Error::busy())?;
-        let stream = if session.view.access_mode == super::model::AccessMode::SudoRoot {
+        let stream = if let Some(access) = &session.terminal_access {
+            access.stream(session.connect_timeout, permit).await.map_err(Error::ssh)?
+        } else if session.view.access_mode == super::model::AccessMode::SudoRoot {
             let password = session.sudo_password.lock().unwrap().clone();
             session
                 .transport
@@ -232,5 +234,20 @@ pub(crate) async fn operation<T>(
     session: &Arc<Session>,
     future: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
-    tokio::select! { biased;_ =session.stop.cancelled()=>Err(Error::cancelled()),value=tokio::time::timeout(Duration::from_secs(30),future)=>value.map_err(|_|Error::timeout())? }
+    let invalidated = async {
+        if let Some(access) = &session.terminal_access { access.invalidated().await }
+        else { std::future::pending::<()>().await }
+    };
+    tokio::select! { biased;
+        _ = session.stop.cancelled() => {
+            Err(session.terminal_error().unwrap_or_else(Error::cancelled))
+        },
+        _ = invalidated => {
+            Err(session.terminal_error().unwrap_or_else(Error::missing))
+        },
+        value = tokio::time::timeout(Duration::from_secs(30),future) => {
+            if let Some(error) = session.terminal_error() { return Err(error); }
+            value.map_err(|_|Error::timeout())?
+        }
+    }
 }

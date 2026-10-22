@@ -156,6 +156,7 @@ impl ModelRepository {
                 }
             }
         }};
-        CatalogClient::new(&request,key)
+        let proxy = crate::network::load(&self.store).map_err(|_|ModelError::Invalid("代理设置无法读取"))?.ai;
+        CatalogClient::new(&request,key,&proxy)
     }
 }

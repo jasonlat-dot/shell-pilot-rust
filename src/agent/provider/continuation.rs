@@ -164,7 +164,7 @@ impl AssistantReply {
 pub(crate) mod tests {
     use super::*;
     pub(crate) fn runtime() -> RuntimeConfig {
-        RuntimeConfig { api_key: Some(SecretKey::new("test-only-key").unwrap()), config: serde_json::from_value(json!({
+        RuntimeConfig { proxy: Default::default(), api_key: Some(SecretKey::new("test-only-key").unwrap()), config: serde_json::from_value(json!({
             "provider":"openAiCompatible","baseUrl":"https://example.invalid/v1/","completionsPath":"chat/completions",
             "model":"arbitrary-name","outputTokenParameter":"maxTokens","capabilities":{"developerRole":false,"temperature":false,"reasoningEffort":false},"requireApiKey":true
         })).unwrap() }

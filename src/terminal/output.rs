@@ -147,6 +147,7 @@ pub(super) struct Session {
     pub shell_uncertain: std::sync::atomic::AtomicBool,
     pub shell_probe: Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>,
     pub shell_display: Mutex<Option<super::shared_shell::ShellDisplay>>,
+    pub directory_access: Mutex<super::directory_access::Reports>,
     pub terminal_size: Mutex<(u32, u32)>,
     pub size_changed: Notify,
     pub output: Mutex<Output>,

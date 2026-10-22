@@ -1,6 +1,6 @@
 # ShellPilot Rust 业务库
 
-当前版本 **v0.2.4**，与同版本桌面客户端配套；发布与升级说明见 [v0.2.4](docs/releases/v0.2.4.md)。
+当前版本 **v0.2.5**，与同版本桌面客户端配套；发布与升级说明见 [v0.2.5](docs/releases/v0.2.5.md)。
 
 内置 IPC 交互说明见兄弟客户端 [docs/ipc-transport.md](../ai-ssh-terminal-client/docs/ipc-transport.md)。桌面业务仅使用 invoke/Channel，应用不提供远程后端配置；本项目仅提供 Rust 库，没有独立 HTTP 程序入口。
 当前模型协议支持 Chat Completions、Anthropic Messages 和 Responses 的文字、图片与工具续聊，按协议保存推理字段、思考签名和原生输出项。续接状态与 schema 22 的持久化说明见 [MODEL_PROTOCOLS.md](docs/MODEL_PROTOCOLS.md)。
@@ -8,7 +8,7 @@
 
 Agent 重构当前进度与新窗口续接：见 [docs/AGENT_PROGRESS.md](docs/AGENT_PROGRESS.md)。
 
-当前已支持 SSH / SFTP、本地附件、带审批的工具与子任务、MCP / Skills、长期记忆、上下文整理及原生历史。模型层支持多模型渠道、同会话模型切换和协议原生续接状态，数据库最新为 schema 24。早期 Preview 安装包及阶段验收记录仅用于历史追溯，不代表当前发布状态。
+当前已支持 SSH / SFTP、终端目录跟随与认证复用、网络代理及直连白名单、本地附件、带审批的工具与子任务、MCP / Skills、长期记忆、上下文整理及原生历史。模型层支持多模型渠道、同会话模型切换和协议原生续接状态，数据库最新迁移为 025（网络代理配置）。早期 Preview 安装包及阶段验收记录仅用于历史追溯，不代表当前发布状态。
 
 ## 开发与使用
 

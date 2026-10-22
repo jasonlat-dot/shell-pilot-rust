@@ -46,6 +46,8 @@ pub struct Fixture {
     pub client: PrivateKey,
     pub stats: Arc<Stats>,
     pub delay: Arc<Mutex<Duration>>,
+    #[allow(dead_code)] // Used by the terminal sidebar cancellation fixture.
+    pub directory_delay: Arc<Mutex<Duration>>,
     pub root_access: Arc<Mutex<RootAccess>>,
     stop: CancellationToken,
 }
@@ -58,6 +60,7 @@ impl Fixture {
         let client = PrivateKey::random(&mut safe_rng(), Algorithm::Ed25519).unwrap();
         let stats = Arc::new(Stats::default());
         let delay = Arc::new(Mutex::new(Duration::ZERO));
+        let directory_delay = Arc::new(Mutex::new(Duration::ZERO));
         let root_access = Arc::new(Mutex::new(RootAccess::default()));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -65,6 +68,7 @@ impl Fixture {
             root: Arc::new(root.path().to_path_buf()),
             stats: stats.clone(),
             delay: delay.clone(),
+            directory_delay: directory_delay.clone(),
             client: client.public_key().clone(),
             root_access: root_access.clone(),
         };
@@ -92,6 +96,7 @@ impl Fixture {
             client,
             stats,
             delay,
+            directory_delay,
             root_access,
             stop,
         }
@@ -157,6 +162,7 @@ struct Server {
     root: Arc<PathBuf>,
     stats: Arc<Stats>,
     delay: Arc<Mutex<Duration>>,
+    directory_delay: Arc<Mutex<Duration>>,
     client: PublicKey,
     root_access: Arc<Mutex<RootAccess>>,
 }
@@ -169,12 +175,15 @@ impl server::Server for Server {
             root: self.root.clone(),
             stats: self.stats.clone(),
             delay: self.delay.clone(),
+            directory_delay: self.directory_delay.clone(),
             client: self.client.clone(),
             channels: HashMap::new(),
             ids: HashSet::new(),
             sftp: HashSet::new(),
             root_access: self.root_access.clone(),
             password_pending: HashMap::new(),
+            integration: HashMap::new(),
+            installing: HashSet::new(),
         }
     }
 }
@@ -182,12 +191,15 @@ struct Ssh {
     root: Arc<PathBuf>,
     stats: Arc<Stats>,
     delay: Arc<Mutex<Duration>>,
+    directory_delay: Arc<Mutex<Duration>>,
     client: PublicKey,
     channels: HashMap<ChannelId, Channel<server::Msg>>,
     ids: HashSet<ChannelId>,
     sftp: HashSet<ChannelId>,
     root_access: Arc<Mutex<RootAccess>>,
     password_pending: HashMap<ChannelId, Vec<u8>>,
+    integration: HashMap<ChannelId, String>,
+    installing: HashSet<ChannelId>,
 }
 impl Ssh {
     fn start_sftp(
@@ -196,9 +208,20 @@ impl Ssh {
         session: &mut Session,
         elevated: bool,
     ) -> Result<(), russh::Error> {
+        self.start_sftp_ready(id, session, elevated, false)
+    }
+    fn start_sftp_ready(
+        &mut self,
+        id: ChannelId,
+        session: &mut Session,
+        elevated: bool,
+        terminal: bool,
+    ) -> Result<(), russh::Error> {
         self.sftp.insert(id);
         let channel = self.channels.remove(&id).unwrap();
-        if elevated {
+        if terminal {
+            session.data(id, b"SHELLPILOT_TERMINAL_SFTP_READY\n".to_vec())?;
+        } else if elevated {
             // Fragmented readiness and password prompts exercise incremental parsing.
             session.data(id, b"SHELLPILOT_ROOT_".to_vec())?;
             session.data(id, b"SFTP_READY\n".to_vec())?;
@@ -206,6 +229,7 @@ impl Ssh {
         let handler = Fs {
             root: self.root.clone(),
             delay: self.delay.clone(),
+            directory_delay: self.directory_delay.clone(),
             handles: HashMap::new(),
             elevated,
         };
@@ -307,6 +331,29 @@ impl server::Handler for Ssh {
             .lock()
             .unwrap()
             .push(command.clone());
+        if command.starts_with("# ShellPilot terminal SFTP\n") {
+            session.channel_success(id)?;
+            self.start_sftp_ready(id, session, true, true)?;
+            return Ok(());
+        }
+        if command.starts_with("# ShellPilot directory metadata\n") {
+            session.channel_success(id)?;
+            let handle = session.handle();
+            let delay = *self.directory_delay.lock().unwrap();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let _ = handle
+                    .data(
+                        id,
+                        b"OK\x00/root\x00private.txt\x00f\x0012\x00folder\x00d\x000\x00".to_vec(),
+                    )
+                    .await;
+                let _ = handle.exit_status_request(id, 0).await;
+                let _ = handle.eof(id).await;
+                let _ = handle.close(id).await;
+            });
+            return Ok(());
+        }
         if !command.starts_with("sudo ")
             || !command.contains("test \"$(id -u)\" = 0")
             || !command.contains("sftp-server")
@@ -362,6 +409,38 @@ impl server::Handler for Ssh {
         bytes: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        let text = String::from_utf8_lossy(bytes);
+        if text.contains("read -erst 10") {
+            if let Some(nonce) = text
+                .split("spc;")
+                .nth(1)
+                .map(|s| &s[..s.len().min(32)])
+                .filter(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            {
+                self.integration.insert(id, nonce.to_owned());
+                self.installing.insert(id);
+                session.data(id, format!("\x1b]777;spc;{nonce};R\x07").into_bytes())?;
+                return Ok(());
+            }
+        }
+        if self.installing.remove(&id) {
+            let nonce = &self.integration[&id];
+            session.data(id, format!("\x1b]777;spc;{nonce};I\x07\x1b]777;spc;{nonce};A\x07\x1b]777;spc;{nonce};F;1000;1000;\x07").into_bytes())?;
+            return Ok(());
+        }
+        if let Some(nonce) = self.integration.get(&id) {
+            let frame = match text.as_ref() {
+                "TEST_ROOT" => Some(format!(
+                    "\x1b]777;spc;{nonce};F;0;1000;/tmp/shellpilot-files.{nonce}.abcdefgh12\x07"
+                )),
+                "TEST_LOGIN" => Some(format!("\x1b]777;spc;{nonce};F;1000;1000;\x07")),
+                _ => None,
+            };
+            if let Some(frame) = frame {
+                session.data(id, frame.into_bytes())?;
+                return Ok(());
+            }
+        }
         if let Some(password) = self.password_pending.get_mut(&id) {
             // russh delivers data both to this callback and the channel receiver.
             // Consume sudo's input before handing that receiver to the SFTP server.
@@ -396,6 +475,7 @@ enum Handle {
 struct Fs {
     root: Arc<PathBuf>,
     delay: Arc<Mutex<Duration>>,
+    directory_delay: Arc<Mutex<Duration>>,
     handles: HashMap<String, Handle>,
     elevated: bool,
 }
@@ -606,6 +686,8 @@ impl russh_sftp::server::Handler for Fs {
         Ok(ok(id))
     }
     async fn opendir(&mut self, id: u32, path: String) -> Result<p::Handle, Self::Error> {
+        let delay = *self.directory_delay.lock().unwrap();
+        tokio::time::sleep(delay).await;
         let mut listing = tokio::fs::read_dir(self.path(&path)?).await.map_err(io)?;
         let mut entries = Vec::new();
         while let Some(entry) = listing.next_entry().await.map_err(io)? {
