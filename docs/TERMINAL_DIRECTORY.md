@@ -1,5 +1,7 @@
 # 终端侧栏目录读取
 
+适用于 **v0.2.5**，与同版本桌面客户端配套；发布说明见 [v0.2.5](releases/v0.2.5.md)。
+
 `TerminalManager::directory_list(session_id, user_id, path)` 向桌面 `GET ssh/terminal/directory` IPC 返回目录元数据。空字符串解析为登录账号的 SFTP 家目录，非空要求绝对路径。返回 `path`、`entries` 和 `truncated`；条目只含名称、目录/符号链接标记及大小，没有文件正文。
 
 请求核对原终端的用户身份与连接状态，复用该终端创建时的 SSH transport。普通身份使用 SFTP `realpath`、`opendir`、`readdir` 和句柄关闭；已接入的 sudo root Shell 使用下述会话通道。不创建新的认证连接、不向 PTY 注入读取命令、不重复 sudo。不访问二次 SSH 的其他目标。
@@ -8,7 +10,7 @@
 
 当前目录由客户端会话级 Bash 钩子上报，具体接入与界面说明见 [客户端终端文件浏览](../../ai-ssh-terminal-client/docs/terminal-files.md)。客户端在路径变化或提示符返回时刷新，可见时每次读取完成 5 秒后更新；隐藏和切换目录时取消旧请求，迟到结果不会跨服务器或路径覆盖。没有有效报告时只展示登录目录并提示，不通过额外 exec 猜测当前 Shell 的 cwd。
 
-本功能不增加数据库迁移、供应商参数或模型请求。需要配套重编译桌面客户端及 Rust 库。
+目录功能本身不增加数据库表、供应商参数或模型请求；v0.2.5 的网络代理另有第 25 号迁移。需要配套重编译桌面客户端及 Rust 库。
 
 ## 复用终端 root 认证
 
