@@ -3,6 +3,8 @@ use crate::{agent::model::identifier, secrets, store::Store};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::Arc;
 mod channels;
+mod channel_copy;
+pub use channel_copy::{ChannelCopyChanges, ChannelCopyDraft};
 
 #[derive(Clone)]
 pub struct ModelRepository {

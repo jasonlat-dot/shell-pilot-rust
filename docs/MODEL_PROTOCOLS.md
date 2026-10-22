@@ -95,6 +95,12 @@ ModelConfig.reasoningEffort 复用已保存的可选强度配置。Messages 策�
 
 ## 多模型渠道与配置身份
 
+渠道支持 `ModelRepository::copy_channel(source_id,user,expected_revision,new_id)`，由桌面原生 `POST agent/model_channel_copy` 调用。复制当前启用成员的完整配置 JSON 和模型顺序（含各模型独立推理参数），为渠道及成员分配新身份，继承渠道 enabled 状态，名称生成“（副本）”及编号后缀。旧单模型配置同样可复制；inactive 历史身份和会话不复制。
+
+桌面端点击复制只打开内存草稿；取消、关闭或离开页面不调用写入接口。确认保存时，`POST agent/model_channel_copy` 可携带 `draft: {displayName, changes?: {update: {config, apiKey}, modelIds}}`，通过 `ModelRepository::copy_channel_draft` 在同一事务内完成副本创建和草稿修改。省略 changes 保留各成员原始参数，只修改名称；apiKey=keep 继承来源密钥，set 只替换副本密钥。来源 revision 在保存时重查，失败保留前端草稿并回滚全部新增记录，不先创建再补保存。
+
+源校验、容量检查、配置写入、凭据重新加密及状态写入在同一事务内完成。DPAPI 熵包含用户与 profile ID，密钥必须用源身份解密再用新身份加密，不能直接复制密文；IPC 只返回 apiKeyConfigured，不返回密钥。无鉴权但保留密钥的配置也完整复制。副本与原配置互不引用，可独立编辑、轮换密钥和删除；源 revision 过期、目标已存在、容量不足或任一密钥不可解密时不产生部分副本。
+
 schema 24 增加 agent_model_channels 和 agent_model_channel_members，旧配置无需批量重写。渠道编辑在同一事务内验证版本、保存公共参数/密钥和模型成员；最多 32 个渠道、每渠道 64 个启用模型，总配置（含移除后保留的身份）上限 4096。相同模型 ID 可属于不同渠道，运行时始终使用用户范围内独立的稳定 profile ID。
 
 原有单模型 ID 在升级后保持不变；排序和移除/重加不产生新身份。移除模型设为 inactive，模型目录及新请求排除它，历史不删除。删除渠道会原子删除全部成员配置和名称，不删除对话记录。密钥始终使用原 profile ID 的 DPAPI 熵加密，渠道保存时统一应用；HTTP 请求选择的实际模型名仍是单个 config.model。

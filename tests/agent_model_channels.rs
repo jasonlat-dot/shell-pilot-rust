@@ -7,6 +7,121 @@ fn config()->ModelConfig {serde_json::from_value(json!({"provider":"openAiCompat
 fn update(config:ModelConfig)->ModelConfigUpdate {ModelConfigUpdate{config,api_key:KeyChange::Keep}}
 fn ids(values:&[&str])->Vec<String>{values.iter().map(|v|(*v).into()).collect()}
 
+#[test]
+fn copying_channels_preserves_per_model_configs_order_state_and_independent_identities() {
+    let repo=ModelRepository::new(Arc::new(Store::in_memory().unwrap()));
+    let mut configured=config();configured.capabilities.reasoning_effort=true;configured.reasoning_effort=Some(ReasoningEffort::High);
+    let original=repo.save_channel("original","u",0,update(configured),"My channel",ids(&["one","two"])).unwrap();
+    let second=repo.get(&original.models[1].id,"u").unwrap();let mut settings=second.config;settings.reasoning_effort=Some(ReasoningEffort::Low);
+    repo.save(&second.id,"u",second.revision,update(settings)).unwrap();
+    let original=repo.channels("u").unwrap().remove(0);
+    let original=repo.set_channel_enabled("original","u",original.profile.revision,false).unwrap();
+    let before=serde_json::to_value(&original).unwrap();
+    let copied=repo.copy_channel("original","u",original.profile.revision,"copy").unwrap();
+    assert_eq!(copied.profile.display_name,"My channel（副本）");assert!(!copied.profile.enabled);assert_eq!(copied.profile.revision,1);
+    assert_eq!(copied.models.iter().map(|m|m.model.clone()).collect::<Vec<_>>(),ids(&["one","two"]));
+    for (source,target) in original.models.iter().zip(&copied.models) {
+        assert_ne!(source.id,target.id);
+        assert_eq!(serde_json::to_value(repo.get(&source.id,"u").unwrap().config).unwrap(),serde_json::to_value(repo.get(&target.id,"u").unwrap().config).unwrap());
+    }
+    assert_eq!(serde_json::to_value(repo.channels("u").unwrap().remove(0)).unwrap(),before);
+    let next=repo.copy_channel("original","u",original.profile.revision,"copy-two").unwrap();assert_eq!(next.profile.display_name,"My channel（副本 2）");
+    let enabled=repo.set_channel_enabled("copy","u",copied.profile.revision,true).unwrap();
+    repo.delete_channel("original","u",original.profile.revision).unwrap();
+    assert!(repo.runtime(&enabled.models[1].id,"u").is_ok());
+}
+
+#[test]
+fn copying_legacy_channels_checks_ownership_revision_destination_capacity_and_name_length() {
+    let repo=ModelRepository::new(Arc::new(Store::in_memory().unwrap()));
+    let legacy=repo.save_named("legacy","u",0,update(config()),Some(&"模".repeat(64))).unwrap();
+    assert!(repo.copy_channel("legacy","other",legacy.revision,"copy").is_err());
+    assert!(matches!(repo.copy_channel("legacy","u",legacy.revision+1,"copy"),Err(ModelError::Stale)));
+    assert!(repo.copy_channel("legacy","u",legacy.revision,"legacy").is_err());
+    let copied=repo.copy_channel("legacy","u",legacy.revision,"copy").unwrap();assert_eq!(copied.profile.display_name.chars().count(),64);
+    assert_eq!(copied.models.len(),1);assert!(copied.profile.enabled);
+    assert!(repo.copy_channel("legacy","u",legacy.revision,"copy").is_err());
+    assert_eq!(repo.channels("u").unwrap().len(),2);
+    let channel=repo.save_channel("multi","u",0,update(config()),"Multi",ids(&["one","two"])).unwrap();
+    assert!(repo.copy_channel(&channel.models[1].id,"u",1,"member-copy").is_err());
+    for index in 3..32 {repo.save_named(&format!("profile-{index}"),"u",0,update(config()),None).unwrap();}
+    assert!(repo.copy_channel("legacy","u",legacy.revision,"over-capacity").is_err());assert_eq!(repo.channels("u").unwrap().len(),32);
+}
+
+#[test]
+fn credential_failure_rolls_back_the_entire_channel_copy() {
+    let dir=tempfile::tempdir().unwrap();let path=dir.path().join("copy.sqlite");let repo=ModelRepository::new(Arc::new(Store::open(&path).unwrap()));
+    let original=repo.save_channel("original","u",0,update(config()),"Original",ids(&["one","two"])).unwrap();
+    let db=rusqlite::Connection::open(&path).unwrap();db.execute("UPDATE agent_model_profiles SET api_key=X'000102' WHERE user_id='u' AND id=?1",[&original.models[1].id]).unwrap();
+    assert!(matches!(repo.copy_channel("original","u",original.profile.revision,"copy"),Err(ModelError::Credentials)));
+    assert_eq!(repo.channels("u").unwrap().len(),1);assert!(repo.get("copy","u").is_err());
+    assert_eq!(db.query_row("SELECT COUNT(*) FROM agent_model_profiles WHERE user_id='u'",[],|r|r.get::<_,u64>(0)).unwrap(),2);
+}
+
+#[test]
+fn copy_draft_is_committed_with_edits_and_invalid_drafts_leave_no_copy() {
+    let repo=ModelRepository::new(Arc::new(Store::in_memory().unwrap()));
+    let source=repo.save_channel("source","u",0,update(config()),"Source",ids(&["one","two"])).unwrap();
+    let source=repo.set_channel_enabled("source","u",source.profile.revision,false).unwrap();
+    for (id,name,models) in [("bad-name"," ",ids(&["one"])),("bad-models","Copy",ids(&["same","same"])),("empty-models","Copy",vec![])] {
+        let draft=ChannelCopyDraft{display_name:name.into(),changes:Some(ChannelCopyChanges{update:update(config()),model_ids:models})};
+        assert!(repo.copy_channel_draft("source","u",source.profile.revision,id,Some(draft)).is_err());
+        assert!(repo.get(id,"u").is_err());assert_eq!(repo.channels("u").unwrap().len(),1);
+    }
+    let mut edited=config();edited.timeout_seconds=240;
+    let draft=ChannelCopyDraft{display_name:"Edited copy".into(),changes:Some(ChannelCopyChanges{update:update(edited),model_ids:ids(&["three","four"])})};
+    let copied=repo.copy_channel_draft("source","u",source.profile.revision,"copy",Some(draft)).unwrap();
+    assert_eq!(copied.profile.display_name,"Edited copy");assert!(!copied.profile.enabled);
+    assert_eq!(copied.models.iter().map(|m|m.model.clone()).collect::<Vec<_>>(),ids(&["three","four"]));
+    for model in &copied.models {assert_eq!(repo.get(&model.id,"u").unwrap().config.timeout_seconds,240);}
+    assert_eq!(repo.get("source","u").unwrap().config.timeout_seconds,source.profile.config.timeout_seconds);
+    assert_eq!(repo.channels("u").unwrap().len(),2);
+    let renamed=repo.copy_channel_draft("source","u",source.profile.revision,"renamed",Some(ChannelCopyDraft{display_name:"Custom name".into(),changes:None})).unwrap();
+    assert_eq!(renamed.profile.display_name,"Custom name");assert_eq!(serde_json::to_value(&renamed.profile.config).unwrap(),serde_json::to_value(&source.profile.config).unwrap());
+}
+
+#[tokio::test]
+async fn copied_credentials_work_for_every_model_and_stay_independent_after_source_changes() {
+    use axum::{extract::State,http::HeaderMap,routing::post,Json,Router};
+    type Calls=Arc<Mutex<Vec<(String,String)>>>;
+    async fn reply(State(calls):State<Calls>,headers:HeaderMap,Json(body):Json<serde_json::Value>)->Json<serde_json::Value>{
+        calls.lock().unwrap().push((headers["authorization"].to_str().unwrap().to_owned(),body["model"].as_str().unwrap().to_owned()));
+        Json(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}))
+    }
+    let calls:Calls=Arc::default();let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config=config();config.base_url=format!("http://{}/v1/",listener.local_addr().unwrap());config.require_api_key=true;
+    let app=Router::new().route("/v1/chat/completions",post(reply)).with_state(calls.clone());
+    let task=tokio::spawn(async move{axum::serve(listener,app).await.unwrap()});
+    let repo=ModelRepository::new(Arc::new(Store::in_memory().unwrap()));
+    let original=repo.save_channel("source","u",0,ModelConfigUpdate{config:config.clone(),api_key:KeyChange::Set{value:SecretKey::new("copy-test-secret").unwrap()}},"Source",ids(&["one","two"])).unwrap();
+    let original=repo.save_channel("source","u",original.profile.revision,update(config.clone()),"Source",ids(&["two","three"])).unwrap();
+    assert_ne!(original.models[0].id,"source","copy from the active member, even if the original anchor was retired");
+    let copied=repo.copy_channel("source","u",original.profile.revision,"copy").unwrap();
+    assert!(copied.profile.api_key_configured);assert!(!serde_json::to_string(&copied).unwrap().contains("copy-test-secret"));
+    let rotated=repo.save_channel("source","u",original.profile.revision,ModelConfigUpdate{config:config.clone(),api_key:KeyChange::Set{value:SecretKey::new("rotated-test-secret").unwrap()}},"Source",ids(&["two","three"])).unwrap();
+    let request=ChatRequest{messages:vec![ChatMessage::User{content:"test".into()}],tools:vec![]};
+    for model in &copied.models {ModelClient::new(repo.runtime(&model.id,"u").unwrap()).unwrap().complete(&request,&CancellationToken::new()).await.unwrap();}
+    ModelClient::new(repo.runtime(&rotated.models[0].id,"u").unwrap()).unwrap().complete(&request,&CancellationToken::new()).await.unwrap();
+    repo.delete_channel("source","u",rotated.profile.revision).unwrap();
+    ModelClient::new(repo.runtime(&copied.models[1].id,"u").unwrap()).unwrap().complete(&request,&CancellationToken::new()).await.unwrap();
+    assert_eq!(*calls.lock().unwrap(),vec![("Bearer copy-test-secret".into(),"two".into()),("Bearer copy-test-secret".into(),"three".into()),("Bearer rotated-test-secret".into(),"two".into()),("Bearer copy-test-secret".into(),"three".into())]);
+    config.require_api_key=false;
+    let optional=repo.save_named("optional","u",0,ModelConfigUpdate{config:config.clone(),api_key:KeyChange::Set{value:SecretKey::new("optional-test-secret").unwrap()}},Some("Optional")).unwrap();
+    let copied=repo.copy_channel("optional","u",optional.revision,"optional-copy").unwrap();assert!(copied.profile.api_key_configured);assert!(!copied.profile.config.require_api_key);
+    config.require_api_key=true;
+    let enabled=repo.save_channel("optional-copy","u",copied.profile.revision,update(config),"Optional",ids(&["one"])).unwrap();
+    ModelClient::new(repo.runtime(&enabled.models[0].id,"u").unwrap()).unwrap().complete(&request,&CancellationToken::new()).await.unwrap();
+    assert_eq!(calls.lock().unwrap().last().unwrap().0,"Bearer optional-test-secret");
+    for (id,key,expected) in [("draft-kept",KeyChange::Keep,"Bearer copy-test-secret"),("draft-new",KeyChange::Set{value:SecretKey::new("draft-new-test-secret").unwrap()},"Bearer draft-new-test-secret")] {
+        let draft=ChannelCopyDraft{display_name:"Saved draft".into(),changes:Some(ChannelCopyChanges{update:ModelConfigUpdate{config:repo.get("copy","u").unwrap().config,api_key:key},model_ids:ids(&["four"])})};
+        // Use the original copied channel: it remains independent after source deletion.
+        let created=repo.copy_channel_draft("copy","u",1,id,Some(draft)).unwrap();
+        ModelClient::new(repo.runtime(&created.models[0].id,"u").unwrap()).unwrap().complete(&request,&CancellationToken::new()).await.unwrap();
+        assert_eq!(calls.lock().unwrap().last().unwrap(),&(expected.into(),"four".into()));
+    }
+    task.abort();
+}
+
 #[tokio::test]
 async fn channel_enabled_state_hides_every_member_and_blocks_new_sessions_without_losing_history() {
     let dir=tempfile::tempdir().unwrap();let path=dir.path().join("enabled.sqlite");

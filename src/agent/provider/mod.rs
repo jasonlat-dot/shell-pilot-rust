@@ -19,7 +19,7 @@ pub use config::*;
 pub use catalog::{CatalogClient, CatalogModel, CatalogRequest};
 pub use continuation::Continuation;
 pub use protocol::*;
-pub use repository::{ModelRepository, RuntimeConfig};
+pub use repository::{ChannelCopyChanges, ChannelCopyDraft, ModelRepository, RuntimeConfig};
 pub use transport::ModelClient;
 
 #[derive(Clone, Debug, thiserror::Error)]
