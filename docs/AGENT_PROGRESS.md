@@ -8,6 +8,30 @@
 - 最新迁移为 **025_network_settings.sql**，幂等创建加密网络配置表；不重写原有模型、会话或附件。升级需退出托盘并备份实际工作区，重编译桌面程序并重连 SSH 以加载新 Bash 集成。
 - 此次更新版本与文档，不生成签名安装包、不上传 Release、不提交或推送；源码版本不用于推断已安装二进制和线上发布状态。
 
+### 上传下载后台执行与单条通知（2026-10-22，覆盖此前自动打开行为）
+
+- [x] 客户端 `App.tsx::queueSidebarTransfer / confirmTerminalUpload` 入队后不再设置 visibleFiles；`components/Sidebar.tsx` 的快捷传输、等待其他身份任务、箭头上传/下载及双向拖拽不再自动打开传输抽屉。隐藏的 SessionFiles 仍挂载并处理原队列，传输和失败回执不依赖窗口可见。openFiles 和队列按钮保留手动入口，不强制关闭用户已打开的窗口。
+- [x] 移除“正在准备上传”额外 Toast，成功只保留一条“已创建 N 个上传/下载任务，可在传输队列查看进度”；异常只通知、不弹窗。等待其他文件会话的任务按请求 ID 仅提示一次，React 重放或进度更新不重复通知。
+- [x] `tests/terminal-upload-queue.test.mjs` 验证侧栏上传/下载、终端拖入确认和等待时不打开窗口/队列且继续入队；`tests/file-manager-drag.test.mjs` 覆盖双向拖拽成功及失败不自动弹出、上传只有一条结果通知和手动入口保留。连同侧栏、身份和生命周期回归 **46 项通过**，TypeScript、Vite 前端资源构建及两仓库 diff 检查通过（既有大资源块提示）。使用说明同步在客户端 `docs/terminal-files.md`。
+- 验证边界：本轮仅前端状态与通知调整，未修改原生/业务 Rust，未重复原生编译；不触发真实文件传输，实际 WebView 待用户刷新确认。无版本/数据库变更，未打包、提交或推送，保留已有改动。
+
+### 文件侧栏快捷上传下载（2026-10-22，前端与原生接入）
+
+- [x] 客户端 `components/TerminalFileSidebar.tsx / .css` 标题行加入小号上传/下载箭头，蓝/青主题色与刷新并排。上传原生选择多个本地文件，下载先选列表文件再选本地目录；未连接、本地终端、目录未就绪或无下载选择时禁用。自由浏览使用侧栏显示目录，不替换成 Shell cwd；同名冲突默认 FAIL。
+- [x] `state/terminalUpload.ts::createSidebarTransfer / runTerminalTransfer`、`App.tsx::queueSidebarTransfer` 与 `Sidebar.tsx::SessionFiles` 共用原文件会话与队列，支持双向任务，自动打开管理窗口和传输队列；已有兼容会话保留任务，其他身份仍忙时等待。旧终端拖入上传和确认流程保持。选择取消无任务，选择期间换目录/终端/身份/文件或卸载则作废；入队和连接前继续检查原 session / accessKey，任务目标固定。
+- [x] `src-tauri/src/sftp_commands.rs::sftp_pick_local` / `lib.rs`、`api/sftp.ts::pickLocal` 新增原生路径选择入口，复用已有 rfd，只返回用户选中的路径，正文仍由既有 SFTP worker 处理，不进入 WebView 或 AI。Rust 业务库和 SSH 协议不变，无版本/迁移变更。
+- [x] 前端侧栏、实际 App 入队与文件窗口效果回调、上传/下载目标、原拖拽、身份撤销及文件会话生命周期定向回归 **45 项通过**；TypeScript、Vite 前端资源构建通过（既有大资源块提示）；说明同步在客户端 `docs/terminal-files.md`。
+- [x] 桌面原生 `cargo check --offline --lib -j1` 通过（3m09s，先等待已有构建锁，未终止开发进程），新增命令格式与两仓库 diff 检查通过。未触发真实系统选择器、连接用户 SSH 或传输用户文件，实际 WebView 视觉尚待验收。未打包、提交或推送，保留原 Cargo / 图标及文档改动；使用新增选择器需完全退出托盘后重启开发版。
+
+### 本机拉取与任务同步（2026-10-22，最新续接快照）
+
+- [x] 前端保持 master，由 bbb060e 快进到 **0b32dd3**（远端 origin/master，2 个提交）；Rust 保持 main，由 10bd029 快进到 **819d565**（远端 github/main，4 个提交，包含远端既有 merge）。两仓库拉取后 ahead/behind 均 **0/0**，未创建额外合并提交或切换分支。
+- [x] GitHub 直连重置；使用 Windows 当前启用且已有监听的本机代理 127.0.0.1:7890，通过单次 git -c http.proxy 完成 fetch / pull --ff-only，未改全局 Git 或系统网络设置。Rust 原有未提交的“终端标签右键新建”7 行记录已临时保存并自动合并恢复，内容完整保留。
+- [x] 已核对远端基线两仓库源码 **v0.2.5**、配套发布说明，以及 store.rs 接入 **025_network_settings.sql** 的 client_network_settings 表。未启动应用或迁移正式工作区；不据此推断已安装版本、Release 发布或签名包状态。前端拉取期间出现 Cargo.toml 仅换行差异及 Cargo.lock 将 shellpilot-server 0.2.5 回写为 0.2.4 的本地差异，保持原样；Rust Cargo.toml 已为 0.2.5，后续开发编译需核对锁文件。
+- [x] 文件功能已按实际接线核对：客户端 App.tsx / TerminalFileSidebar.tsx / terminalDirectory.ts / terminalUpload.ts 与 Rust terminal/directory.rs / directory_access.rs / files_access.rs、sftp::Manager::open_terminal 接通。支持目录跟随、当前终端 sudo 身份复用、终端拖入确认上传和文件管理双向拖拽；文件窗口按逻辑终端隔离，身份变更及关闭终端撤销关联传输。
+- [x] 设置与补全接线核对：RustBackendSettingsDialog.tsx 的 other 页加载 OtherSettings / NetworkSettings；补全迁入“其他设置”，复用两级渠道/模型选择，修复 sudo 子 Shell 序号恢复及自动初始化 Toast。网络配置经 client/network IPC 接入 Rust network.rs / system.rs / tunnel.rs / bypass.rs，分别控制模型与 SSH，支持直连、本机、自定义 HTTP CONNECT / SOCKS5 及直连白名单；原终端菜单、右键新建与路径候选去重继续保留。
+- 验证范围：本轮仅 Git 快进/跟踪状态、版本与迁移、产品入口源码和文档检查及 diff 格式检查，未重跑历史测试、类型检查、构建或真实 SSH/模型/WebView 验收。当前无新开发项，E4 继续取消；不打包、不提交或推送。需要使用新原生能力时须退出托盘后重启开发版并重连 SSH。
+
 ## 历史实现与验证记录
 
 ### 两个文件管理入口定位当前终端目录与身份（2026-10-21）
@@ -28,6 +52,13 @@
 - 复用当前 Bash 会话集成的私有 nonce 上报目录，支持 UTF-8/分包与重装 nonce；同路径提示符返回也刷新。跟随默认开启，新建/重连且没有自定义启动命令时接入；补全和 AI 开关独立，目录清单不发送给模型。未接入、命令运行或子 Shell 未上报时明确显示登录目录/上次位置，不执行 pwd 或猜提示符。
 - 新增 `TerminalManager::directory_list` 与原生 `GET ssh/terminal/directory`：核对用户和原终端，通过原 SSH transport 读取规范路径和元数据；普通身份使用 SFTP，已认证 root 使用上述只读通道，不读正文、不重认证。请求最多 5 秒、4096 项/1 MiB 名称；超限显式截断，取消释放通道而不关闭 Shell。详见 `docs/TERMINAL_DIRECTORY.md`。
 - 使用 Git Bash、模拟 React、一次性数据库及本机 SSH/SFTP 回环验证；目录及补全、会话历史、权限隔离、取消、原生 IPC、类型检查与资源构建通过，Rust 严格 Clippy 通过。未连接真实用户 SSH/模型；桌面视觉尚未目视验收。版本仍为 0.2.4，无数据库迁移，未提交、推送或打包；需要重编译桌面并重连 SSH。
+
+### 终端标签右键新建（2026-10-21，前端定向验证）
+
+- [x] 客户端 `components/Workspace.tsx` / `TerminalTabContextMenu.tsx` 新增标签右键菜单“新建终端”，绑定右键来源标签，不先切换或重排当前会话；支持菜单键 / Shift+F10、Esc 关闭回到来源、外部点击/失焦/滚动/窗口变化关闭及窗口边界定位。菜单复用 `TerminalMenu.css` 的配色、字体与阴影。
+- [x] 客户端 `App.tsx::TerminalWorkspace.addFromTab` 按来源类型复用既有流程：SSH 调用 selectHost 为同一已保存主机创建独立会话，本地调用 openNewTerminal 新建 CMD；原“新建终端”按钮仍打开本地 CMD，已移除来源不发起创建，SSH 并发去重与失败提示沿用原流程。
+- [x] 客户端 `tests/terminal-layout.test.mjs` 补充未激活标签右键绑定/不切换/不拖动和 SSH/本地/已移除来源路由验证；与既有标签排序、分屏、顶部菜单定向回归共 **24 项通过**。TypeScript、Vite 前端资源构建（既有大资源块提示）与 diff 格式检查通过。Rust 生产代码不变，版本不变，未打包或提交。
+- 验证边界：本地组件/回调模拟与资源构建，未发起用户 SSH 或真实本地 CMD；桌面右键视觉与真实新会话仍待用户更新前端后验收。
 
 ### 终端路径灰字重复修正（2026-10-21，前端定向验证）
 
