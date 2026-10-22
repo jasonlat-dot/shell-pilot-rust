@@ -1,4 +1,5 @@
 mod http;
+mod entry_operations;
 pub mod model;
 mod path;
 mod transfer;

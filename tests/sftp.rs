@@ -400,6 +400,67 @@ async fn directory_operations_reject_traversal_links_permissions_and_recursive_d
     manager.shutdown();
 }
 #[tokio::test]
+async fn interactive_rename_and_move_preserve_contents_and_never_replace_targets() {
+    let fixture = Fixture::new().await;
+    fixture.file("/home/source/中文.txt", b"original");
+    fixture.file("/home/existing.txt", b"keep");
+    let (manager, _, id) = fixture.manager(Settings::default()).await;
+    manager.rename_entry(&id, "/home/source/中文.txt", "/home/source/new.txt").await.unwrap();
+    assert_eq!(manager.rename_entry(&id, "/home/source/new.txt", "/home/existing.txt").await.unwrap_err().code, "SFTP_CONFLICT");
+    assert_eq!(std::fs::read(fixture.root.path().join("home/existing.txt")).unwrap(), b"keep");
+    manager.rename_entry(&id, "/home/source", "/home/moved").await.unwrap();
+    assert_eq!(std::fs::read(fixture.root.path().join("home/moved/new.txt")).unwrap(), b"original");
+    for (from, to) in [("/home/moved", "/home/moved/nested"), ("/home", "/home/renamed"), ("/home/moved", "/outside"), ("/home/link/escape", "/home/escape"), ("/home/moved/new.txt", "/home/../escape")] {
+        assert!(manager.rename_entry(&id, from, to).await.is_err());
+    }
+    assert!(fixture.root.path().join("home/moved/new.txt").exists());
+    manager.shutdown();
+}
+
+#[tokio::test]
+async fn recursive_delete_requires_explicit_call_and_preserves_siblings_and_root() {
+    let fixture = Fixture::new().await;
+    fixture.file("/home/tree/nested/中文.txt", b"delete");
+    fixture.file("/home/keep.txt", b"keep");
+    std::fs::create_dir_all(fixture.root.path().join("home/tree/empty")).unwrap();
+    let (manager, _, id) = fixture.manager(Settings::default()).await;
+    assert!(manager.change_entry(&id, "/home/tree", "delete").await.is_err());
+    for path in ["/home", "/", "/outside", "/home/link/escape", "/home/../outside"] {
+        assert!(manager.delete_tree(&id, path).await.is_err());
+    }
+    manager.delete_tree(&id, "/home/tree").await.unwrap();
+    assert!(!fixture.root.path().join("home/tree").exists());
+    assert_eq!(std::fs::read(fixture.root.path().join("home/keep.txt")).unwrap(), b"keep");
+    manager.delete_tree(&id, "/home/keep.txt").await.unwrap();
+    assert!(manager.delete_tree(&id, "/home/keep.txt").await.is_err());
+    manager.shutdown();
+}
+
+#[tokio::test]
+async fn recursive_delete_preflights_item_limits_before_deleting_anything() {
+    let fixture = Fixture::new().await;
+    fixture.file("/home/tree/one", b"one");
+    fixture.file("/home/tree/two", b"two");
+    let (manager, _, id) = fixture.manager(Settings { max_items: 2, ..Settings::default() }).await;
+    assert_eq!(manager.delete_tree(&id, "/home/tree").await.unwrap_err().code, "SFTP_LIMIT");
+    assert!(fixture.root.path().join("home/tree/one").exists());
+    assert!(fixture.root.path().join("home/tree/two").exists());
+    manager.shutdown();
+}
+
+#[tokio::test]
+async fn interactive_delete_unlinks_symlink_leaf_without_following_its_target() {
+    let fixture = Fixture::new().await;
+    fixture.file("/home/link", b"virtual-symlink");
+    fixture.file("/outside/keep", b"outside");
+    let (manager, _, id) = fixture.manager(Settings::default()).await;
+    manager.delete_tree(&id, "/home/link").await.unwrap();
+    assert!(!fixture.root.path().join("home/link").exists());
+    assert_eq!(std::fs::read(fixture.root.path().join("outside/keep")).unwrap(), b"outside");
+    manager.shutdown();
+}
+
+#[tokio::test]
 async fn nested_upload_and_download_include_empty_files_and_directories() {
     let fixture = Fixture::new().await;
     let (manager, _, id) = fixture.manager(Settings::default()).await;
@@ -905,6 +966,14 @@ async fn http_contract_and_sse_snapshot_replacement_close_notification() {
     assert_eq!(status, StatusCode::OK);
     let session = opened["data"]["sftpSessionId"].as_str().unwrap();
     let uri = format!("/api/v1/sftp/sessions/{session}");
+    fixture.file("/home/menu-tree/item", b"interactive");
+    let (status, _) = json(&app, "POST", &format!("{uri}/rename"), Some(serde_json::json!({"from":"/home/menu-tree","to":"/home/renamed-tree"}))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = json(&app, "DELETE", &format!("{uri}/entries?path=/home/renamed-tree"), None).await;
+    assert_ne!(status, StatusCode::OK);
+    let (status, _) = json(&app, "DELETE", &format!("{uri}/entries?path=/home/renamed-tree&recursive=true"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!fixture.root.path().join("home/renamed-tree").exists());
     let (_, view) = json(&app, "GET", &uri, None).await;
     assert_eq!(view["data"]["rootPath"], "/home");
     let events = app

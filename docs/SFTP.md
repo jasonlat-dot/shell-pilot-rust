@@ -23,6 +23,8 @@ Rust Preview 0.3.0 使用 russh-sftp 3.0.1，兼容既有客户端 HTTP 和 Taur
 | POST | /sessions | connectionId、可选 rootPath / accessMode / sudoPassword -> 会话 |
 | GET / DELETE | /sessions/{id} | 查询 / 关闭会话，关闭时取消任务和断开独立 SSH 连接 |
 | GET / DELETE | /sessions/{id}/entries?path=... | 列目录 / 删除普通文件或空目录 |
+| DELETE | /sessions/{id}/entries?path=...&recursive=true | 显式递归删除文件或目录，禁止删除会话根目录 |
+| POST | /sessions/{id}/rename | from、to，重命名或移动文件/目录，不覆盖目标 |
 | POST | /sessions/{id}/directories | path，新建目录 |
 | POST | /sessions/{id}/files | path，新建空文件，不覆盖 |
 | GET | /sessions/{id}/transfers | 任务完整快照 |
@@ -43,9 +45,10 @@ saved:false 将未完成条目标记 FAILED，可重新下载；目录重新创�
 ## 文件和路径规则
 
 - 远程采用 POSIX 绝对路径；会话根目录留空使用账号默认目录。路径逐级 lstat 检查并校验 realpath，不跟随符号链接。
-- 拒绝越级片段、反斜杠、通配符和控制字符。符号链接/特殊文件可列出，但不允许传输、跟随或删除。
+- 拒绝越级片段、反斜杠、通配符和控制字符。符号链接/特殊文件可列出，但不允许传输或跟随。显式递归删除及 rename 允许处理末级符号链接本身，逐级检查父路径，绝不遍历链接目标；特殊文件不允许删除。
 - 上传补齐缺失父目录，目录准备失败时直接返回错误，不发布无法重试的目录条目。目录下载包含顶层名称、嵌套文件、零字节文件及空目录。
-- 不递归删除，不删除会话根目录；新建空文件使用独占 OPEN，不覆盖同名条目。
+- 默认 DELETE 仍仅删除普通文件或空目录；显式 `recursive=true` 才递归删除。先读取完整且受 max_items / 路径深度限制的清单，再逆序删除，操作中重新检查父路径和类型。不删除会话根目录；并发变化、权限或网络错误可能造成部分完成，不提供回滚。
+- rename 支持文件和目录，不允许移动到自身或子目录；目标存在时返回 SFTP_CONFLICT，使用不覆盖目标的 SFTP v3 RENAME，不使用 posix-rename 覆盖扩展。跨文件系统移动由服务器决定是否支持，不回退复制删除。新建空文件使用独占 OPEN，不覆盖同名条目。
 - 上传先以独占 OPEN 创建目标同目录的随机 .sftp-*.part，分块写入、检查实际字节数及远端大小，关闭文件后提交。
 - FAIL/SKIP 保留同名文件；提交时再次检查冲突。支持 hardlink 扩展时以不覆盖的硬链接提交，否则使用协议标准要求拒绝现有目标的 SFTP v3 RENAME。
 - 显式 REPLACE 仅在服务器支持 posix-rename@openssh.com 时可用，检查目标类型/大小/修改时间后原子替换；不使用删除旧文件再写入的方式。当前客户端 UI 提供 FAIL 和 SKIP。

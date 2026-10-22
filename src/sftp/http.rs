@@ -29,6 +29,7 @@ pub(crate) fn routes() -> Router<AppState> {
         )
         .route("/api/v1/sftp/sessions/{id}/directories", post(mkdir))
         .route("/api/v1/sftp/sessions/{id}/files", post(file))
+        .route("/api/v1/sftp/sessions/{id}/rename", post(rename))
         .route("/api/v1/sftp/sessions/{id}/transfers", get(tasks))
         .route("/api/v1/sftp/sessions/{id}/events", get(events))
         .route("/api/v1/sftp/transfers", post(create))
@@ -75,6 +76,20 @@ async fn close(
 #[derive(Deserialize)]
 struct PathQuery {
     path: Option<String>,
+    #[serde(default)]
+    recursive: bool,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenameRequest { from: String, to: String }
+async fn rename(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<RenameRequest>, JsonRejection>,
+) -> Result<Json<Envelope<()>>> {
+    let request = json(body)?;
+    state.sftp.rename_entry(&id, &request.from, &request.to).await?;
+    Ok(success(()))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -119,6 +134,10 @@ async fn delete(
     params: std::result::Result<Query<PathQuery>, QueryRejection>,
 ) -> Result<Json<Envelope<()>>> {
     let params = query(params)?;
+    if params.recursive {
+        state.sftp.delete_tree(&id, &params.path.ok_or_else(|| Error::invalid("缺少 path"))?).await?;
+        return Ok(success(()));
+    }
     state
         .sftp
         .change_entry(

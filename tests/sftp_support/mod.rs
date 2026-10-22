@@ -742,6 +742,11 @@ impl russh_sftp::server::Handler for Fs {
     ) -> Result<p::Status, Self::Error> {
         let old = self.path(&old)?;
         let new = self.path(&new)?;
+        if new.exists() { return Err(StatusCode::Failure); }
+        if old.is_dir() {
+            tokio::fs::rename(old, new).await.map_err(io)?;
+            return Ok(ok(id));
+        }
         tokio::fs::hard_link(&old, &new).await.map_err(io)?;
         tokio::fs::remove_file(old).await.map_err(io)?;
         Ok(ok(id))
